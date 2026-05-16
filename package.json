@@ -1,0 +1,10 @@
+{
+  "name": "codex-native-agent-pool-advisor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check hooks/native-agent-pool-advisor.mjs && node --check scripts/install.mjs && node --check scripts/reset-pool.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}
