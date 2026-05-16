@@ -5,6 +5,7 @@
 - Active user hook config: `~/.codex/hooks.json`.
 - Active advisor path: `~/.codex/hooks/native-agent-pool-advisor.mjs`.
 - Advisor state: `~/.codex/state/native-agent-pool-advisor.json`.
+- Optional advisor config: `~/.codex/native-agent-pool-advisor.config.json`.
 - Native Desktop state: `~/.codex/state_5.sqlite`, especially `thread_spawn_edges`.
 - Native cap: `~/.codex/config.toml` `[agents].max_threads`.
 
@@ -24,6 +25,7 @@
 - General evidence collection does not repair native edges. Only successful `PostToolUse(close_agent)` can mark a native edge closed.
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
+- Explorer model routing is an allow-list, not a single hard-coded model. The default is Spark plus mini fallback; installations can override model names in config or env.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
 - Native SQLite `open` edges whose child transcript has `task_complete` are stale terminal-open edges: they are excluded from occupied capacity and surfaced with explicit `close_agent target=<id>` or reset guidance.
 - If the advisor state lock or native edge query is unavailable during `PreToolUse(spawn_agent)`, the hook blocks conservatively.

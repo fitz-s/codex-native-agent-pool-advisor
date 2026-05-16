@@ -28,9 +28,20 @@ const NATIVE_EDGE_REPAIR_BATCH = 50;
 const NATIVE_EDGE_MAINTENANCE_TTL_MS = 6 * 60 * 60 * 1000;
 const ADVISOR_SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const COMMAND_NAME = "native-agent-pool-advisor";
+const DEFAULT_STATE_DB_NAME = "state_5.sqlite";
 const DEFAULT_EXPLORER_MODEL = "gpt-5.3-codex-spark";
+const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.4-mini";
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
+let runtimeOptionsCache = {
+  defaultAgentCap: DEFAULT_AGENT_CAP,
+  warnRemaining: DEFAULT_WARN_REMAINING,
+  stateDbName: DEFAULT_STATE_DB_NAME,
+  stateDbPathOverride: "",
+  explorerPreferredModel: DEFAULT_EXPLORER_MODEL,
+  explorerFallbackModel: DEFAULT_EXPLORER_FALLBACK_MODEL,
+  explorerAllowedModels: [DEFAULT_EXPLORER_MODEL, DEFAULT_EXPLORER_FALLBACK_MODEL],
+};
 
 function safeString(value) {
   return typeof value === "string" ? value : "";
@@ -81,12 +92,17 @@ function configPath() {
   return join(codexHome(), "config.toml");
 }
 
+function advisorConfigPath() {
+  return join(codexHome(), "native-agent-pool-advisor.config.json");
+}
+
 function sessionsRoot() {
   return join(codexHome(), "sessions");
 }
 
 function stateDbPath() {
-  return join(codexHome(), "state_5.sqlite");
+  if (runtimeOptionsCache.stateDbPathOverride) return runtimeOptionsCache.stateDbPathOverride;
+  return join(codexHome(), runtimeOptionsCache.stateDbName || DEFAULT_STATE_DB_NAME);
 }
 
 function advisorLogPath() {
@@ -113,10 +129,116 @@ async function readText(path) {
   }
 }
 
+function parseStringList(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => safeString(item).trim()).filter(Boolean);
+  }
+  return safeString(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.map((value) => safeString(value).trim()).filter(Boolean))];
+}
+
+function readFirstString(...values) {
+  for (const value of values) {
+    const text = safeString(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function readFirstPositiveInteger(fallback, ...values) {
+  for (const value of values) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  }
+  return fallback;
+}
+
+async function readAdvisorConfig() {
+  const raw = await readText(advisorConfigPath());
+  if (!raw.trim()) return {};
+  try {
+    return safeObject(JSON.parse(raw)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+async function loadRuntimeOptions() {
+  const config = await readAdvisorConfig();
+  const models = safeObject(config.models) ?? {};
+  const defaults = safeObject(config.defaults) ?? {};
+  const paths = safeObject(config.paths) ?? {};
+
+  const explicitExplorerModels = parseStringList(
+    process.env.NATIVE_AGENT_POOL_EXPLORER_MODELS
+      ?? models.explorer_models
+      ?? models.explorerModels
+      ?? models.allowedExplorerModels
+      ?? models.explorer,
+  );
+  const preferred = readFirstString(
+    process.env.NATIVE_AGENT_POOL_EXPLORER_MODEL,
+    models.explorer_preferred,
+    models.explorerPreferred,
+    models.preferredExplorer,
+    explicitExplorerModels[0],
+    DEFAULT_EXPLORER_MODEL,
+  );
+  const fallback = readFirstString(
+    process.env.NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL,
+    models.explorer_fallback,
+    models.explorerFallback,
+    models.fallbackExplorer,
+    explicitExplorerModels[1],
+    explicitExplorerModels[0],
+    DEFAULT_EXPLORER_FALLBACK_MODEL,
+  );
+
+  runtimeOptionsCache = {
+    defaultAgentCap: readFirstPositiveInteger(
+      DEFAULT_AGENT_CAP,
+      process.env.NATIVE_AGENT_POOL_DEFAULT_CAP,
+      defaults.agent_cap,
+      defaults.agentCap,
+      defaults.defaultAgentCap,
+    ),
+    warnRemaining: readFirstPositiveInteger(
+      DEFAULT_WARN_REMAINING,
+      process.env.NATIVE_AGENT_POOL_WARN_REMAINING,
+      defaults.warn_remaining,
+      defaults.warnRemaining,
+    ),
+    stateDbName: readFirstString(
+      process.env.NATIVE_AGENT_POOL_STATE_DB_NAME,
+      paths.state_db_name,
+      paths.stateDbName,
+      DEFAULT_STATE_DB_NAME,
+    ),
+    stateDbPathOverride: readFirstString(
+      process.env.NATIVE_AGENT_POOL_STATE_DB_PATH,
+      paths.state_db_path,
+      paths.stateDbPath,
+    ),
+    explorerPreferredModel: preferred,
+    explorerFallbackModel: fallback,
+    explorerAllowedModels: uniqueStrings([
+      ...explicitExplorerModels,
+      preferred,
+      fallback,
+    ]),
+  };
+}
+
 async function readAgentCap() {
   const raw = await readText(configPath());
   let inAgentsSection = false;
-  let parsed = DEFAULT_AGENT_CAP;
+  let parsed = runtimeOptionsCache.defaultAgentCap;
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
     const section = trimmed.match(/^\[([^\]]+)\]\s*$/);
@@ -131,11 +253,28 @@ async function readAgentCap() {
       break;
     }
   }
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_AGENT_CAP;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : runtimeOptionsCache.defaultAgentCap;
 }
 
 function explorerModel() {
-  return safeString(process.env.NATIVE_AGENT_POOL_EXPLORER_MODEL).trim() || DEFAULT_EXPLORER_MODEL;
+  return runtimeOptionsCache.explorerPreferredModel || DEFAULT_EXPLORER_MODEL;
+}
+
+function explorerFallbackModel() {
+  return runtimeOptionsCache.explorerFallbackModel || DEFAULT_EXPLORER_FALLBACK_MODEL;
+}
+
+function explorerModels() {
+  const models = runtimeOptionsCache.explorerAllowedModels ?? [];
+  return models.length > 0 ? models : [DEFAULT_EXPLORER_MODEL, DEFAULT_EXPLORER_FALLBACK_MODEL];
+}
+
+function explorerModelListText() {
+  return explorerModels().join(", ");
+}
+
+function warnRemaining() {
+  return Math.max(0, runtimeOptionsCache.warnRemaining ?? DEFAULT_WARN_REMAINING);
 }
 
 function emptyState() {
@@ -967,7 +1106,7 @@ function isExplorerSpawnInput(payload) {
 
 function hasExplorerModelRouteViolation(payload) {
   if (!isExplorerSpawnInput(payload)) return false;
-  return requestedModel(payload) !== explorerModel();
+  return !explorerModels().includes(requestedModel(payload));
 }
 
 function operationAgentType(operation) {
@@ -992,7 +1131,7 @@ function hasExplorerModelRouteViolationInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
     if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    return operationModel(operation) !== explorerModel();
+    return !explorerModels().includes(operationModel(operation));
   });
 }
 
@@ -1276,7 +1415,7 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
   const criticalPressure = Boolean(
     promptSummary
       && (
-        remainingSpawnBudget(promptSummary, cap) <= DEFAULT_WARN_REMAINING
+        remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
         || promptSummary.cap_hit_after_last_close
       ),
   );
@@ -1407,7 +1546,7 @@ function buildCapacityGuidance(eventName, cap, summary = null) {
 function buildDelegationGuidance(cap) {
   return [
     `Codex context hygiene delegation protocol: treat native subagents as the default context-isolation layer for broad repo lookup, file/symbol mapping, grep-like scans, lightweight review probes, and bounded verification; the leader should preserve main-thread context for judgment, integration, and final decisions.`,
-    `Before doing multiple broad rg/sed/cat reads in the leader context, reuse a compatible existing explorer lane with send_input; if no useful lane exists, launch one bounded explorer subagent when that lookup can be isolated. Native explorer spawns must set agent_type=explorer, model=${explorerModel()}, and reasoning_effort=low. If Spark disappears from the native tool schema, treat that as model-catalog drift to repair, not as permission to inherit gpt-5.5 for grep work.`,
+    `Before doing multiple broad rg/sed/cat reads in the leader context, reuse a compatible existing explorer lane with send_input; if no useful lane exists, launch one bounded explorer subagent when that lookup can be isolated. Native explorer spawns must set agent_type=explorer, model=${explorerModel()} when available, or fallback model=${explorerFallbackModel()} when the preferred model is unavailable; allowed explorer models are: ${explorerModelListText()}. Do not inherit a frontier model for read-only lookup.`,
     "Explorer prompts must be narrow and self-contained: exact cwd, search target, allowed read-only scope, requested evidence format, and a concise return cap; ask for file:line evidence and a short synthesis, not raw dumps.",
     "For implementation, destructive actions, architectural decisions, or final approval, the leader remains responsible; subagents gather evidence and run bounded checks only.",
     `Respect the native child-agent cap (${cap}) by reusing relevant lanes first and launching at most one new native subagent at a time unless confirmed free slots and true independence justify another.`,
@@ -1555,7 +1694,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   if (ops.length === 0) return false;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
-  const threshold = Math.max(1, cap - DEFAULT_WARN_REMAINING);
+  const threshold = Math.max(1, cap - warnRemaining());
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
 }
 
@@ -1579,7 +1718,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const context = [
     parts.join(", ") + ".",
     explorerModelRouteViolation
-      ? `Explorer native spawn is blocked until tool input explicitly sets model=${explorerModel()} and reasoning_effort=low. Do not inherit gpt-5.5 for read-only lookup; Spark is the configured explorer/fast model.`
+      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}) and reasoning_effort=low. Prefer ${explorerModel()}; use ${explorerFallbackModel()} as the fallback when the preferred model is unavailable. Do not inherit a frontier model for read-only lookup.`
       : null,
     blockSpawn && isChildSession
       ? "Nested native spawn is blocked: child sessions must not create subagents. Finish the assigned slice locally and report any needed follow-up delegation to the parent leader."
@@ -1676,6 +1815,7 @@ async function main() {
     const eventName = hookEventName(payload);
     const name = toolName(payload);
     if (!eventName) return;
+    await loadRuntimeOptions();
     const operations = agentOperations(payload, name);
     if (safeString(process.env.NATIVE_AGENT_POOL_ADVISOR_DEBUG).trim() === "1") {
       await appendAdvisorLog({

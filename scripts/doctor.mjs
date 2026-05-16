@@ -13,6 +13,18 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceHook = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
 const EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse"];
 
+function safeObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function readFirstString(...values) {
+  for (const value of values) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text) return text;
+  }
+  return "";
+}
+
 function codexHome() {
   const explicit = typeof process.env.CODEX_HOME === "string" ? process.env.CODEX_HOME.trim() : "";
   if (explicit) return explicit;
@@ -40,6 +52,27 @@ async function readJson(path) {
   } catch {
     return null;
   }
+}
+
+async function readAdvisorConfig(home) {
+  return safeObject(await readJson(join(home, "native-agent-pool-advisor.config.json"))) ?? {};
+}
+
+function stateDbPath(home, config) {
+  const paths = safeObject(config.paths) ?? {};
+  const override = readFirstString(
+    process.env.NATIVE_AGENT_POOL_STATE_DB_PATH,
+    paths.state_db_path,
+    paths.stateDbPath,
+  );
+  if (override) return override;
+  const name = readFirstString(
+    process.env.NATIVE_AGENT_POOL_STATE_DB_NAME,
+    paths.state_db_name,
+    paths.stateDbName,
+    "state_5.sqlite",
+  );
+  return join(home, name);
 }
 
 async function sha256(path) {
@@ -72,10 +105,11 @@ async function sqliteCount(dbPath) {
 
 async function main() {
   const home = codexHome();
+  const advisorConfig = await readAdvisorConfig(home);
   const installedHook = join(home, "hooks", "native-agent-pool-advisor.mjs");
   const hooksPath = join(home, "hooks.json");
   const statePath = join(home, "state", "native-agent-pool-advisor.json");
-  const dbPath = join(home, "state_5.sqlite");
+  const dbPath = stateDbPath(home, advisorConfig);
   const hooksConfig = await readJson(hooksPath);
   const command = hookCommand(home);
   const installedHash = await sha256(installedHook);
@@ -92,6 +126,7 @@ async function main() {
     installed_hook_matches_repo: Boolean(installedHash && sourceHash && installedHash === sourceHash),
     registrations,
     state_file_exists: await pathExists(statePath),
+    state_db_path: dbPath,
     state_db_exists: Boolean(dbStats),
     state_db_bytes: dbStats?.size ?? 0,
     thread_spawn_edges_count: dbStats ? await sqliteCount(dbPath) : null,

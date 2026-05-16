@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Codex Native Agent Pool Advisor</title>
+    <meta
+      name="description"
+      content="A Codex Desktop hook that prevents invisible native subagent pool exhaustion, long failed prompts, and stale completed-agent accounting."
+    >
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #172026;
+        --muted: #53626d;
+        --line: #d8e1e8;
+        --panel: #ffffff;
+        --wash: #f4f7f9;
+        --accent: #0f766e;
+        --accent-strong: #134e4a;
+        --alert: #b42318;
+        --code: #101828;
+        --code-soft: #1d2939;
+        --code-line: #344054;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: var(--wash);
+        line-height: 1.5;
+      }
+
+      a {
+        color: var(--accent-strong);
+        font-weight: 650;
+      }
+
+      .shell {
+        min-height: 100vh;
+      }
+
+      .nav {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+        padding: 18px clamp(20px, 5vw, 72px);
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.88);
+        backdrop-filter: blur(12px);
+        position: sticky;
+        top: 0;
+        z-index: 10;
+      }
+
+      .brand {
+        font-size: 15px;
+        font-weight: 760;
+        letter-spacing: 0;
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        font-size: 14px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.02fr) minmax(360px, 0.98fr);
+        gap: clamp(28px, 5vw, 72px);
+        align-items: center;
+        padding: clamp(44px, 7vw, 92px) clamp(20px, 5vw, 72px) clamp(36px, 5vw, 64px);
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.98), rgba(244,247,249,0.94)),
+          repeating-linear-gradient(90deg, rgba(15,118,110,0.09) 0 1px, transparent 1px 96px);
+      }
+
+      .eyebrow {
+        color: var(--accent-strong);
+        font-size: 13px;
+        font-weight: 760;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin: 0 0 14px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(40px, 6vw, 74px);
+        line-height: 0.98;
+        letter-spacing: 0;
+        max-width: 900px;
+      }
+
+      .lead {
+        color: var(--muted);
+        font-size: clamp(18px, 2vw, 22px);
+        margin: 24px 0 0;
+        max-width: 760px;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 30px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        min-height: 44px;
+        padding: 10px 16px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--ink);
+        text-decoration: none;
+        border-radius: 7px;
+        font-weight: 720;
+      }
+
+      .button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: white;
+      }
+
+      .terminal {
+        background: var(--code);
+        color: #f8fafc;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 24px 60px rgba(16, 24, 40, 0.22);
+        border: 1px solid #0b1220;
+      }
+
+      .terminal-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 14px;
+        background: var(--code-soft);
+        border-bottom: 1px solid var(--code-line);
+        color: #cbd5e1;
+        font-size: 13px;
+      }
+
+      .dots {
+        display: flex;
+        gap: 7px;
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #94a3b8;
+      }
+
+      .dot.red { background: #f87171; }
+      .dot.yellow { background: #fbbf24; }
+      .dot.green { background: #34d399; }
+
+      pre {
+        margin: 0;
+        padding: 18px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        font-size: clamp(12px, 1.45vw, 14px);
+        line-height: 1.55;
+      }
+
+      .bad {
+        color: #fca5a5;
+      }
+
+      .good {
+        color: #86efac;
+      }
+
+      .dim {
+        color: #94a3b8;
+      }
+
+      section {
+        padding: clamp(34px, 6vw, 76px) clamp(20px, 5vw, 72px);
+      }
+
+      .band {
+        background: #ffffff;
+        border-block: 1px solid var(--line);
+      }
+
+      .section-heading {
+        max-width: 820px;
+        margin-bottom: 28px;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: clamp(28px, 3.4vw, 44px);
+        line-height: 1.08;
+        letter-spacing: 0;
+      }
+
+      .section-heading p {
+        color: var(--muted);
+        font-size: 18px;
+        margin: 14px 0 0;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 20px;
+      }
+
+      .card h3 {
+        margin: 0 0 8px;
+        font-size: 18px;
+      }
+
+      .card p {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .code-block {
+        background: var(--code);
+        color: #e5e7eb;
+        border-radius: 8px;
+        border: 1px solid #0b1220;
+        overflow: hidden;
+      }
+
+      .code-block pre {
+        font-size: 14px;
+      }
+
+      .split {
+        display: grid;
+        grid-template-columns: minmax(0, 0.95fr) minmax(360px, 1.05fr);
+        gap: 24px;
+        align-items: start;
+      }
+
+      .config-table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        display: table;
+      }
+
+      .config-table th,
+      .config-table td {
+        text-align: left;
+        padding: 13px 14px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+        font-size: 14px;
+      }
+
+      .config-table tr:last-child th,
+      .config-table tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .config-table th {
+        width: 34%;
+        color: var(--ink);
+        font-weight: 720;
+      }
+
+      code {
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 0.95em;
+      }
+
+      footer {
+        padding: 28px clamp(20px, 5vw, 72px);
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      @media (max-width: 880px) {
+        .hero,
+        .split {
+          grid-template-columns: 1fr;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .nav {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <nav class="nav">
+        <div class="brand">Codex Native Agent Pool Advisor</div>
+        <div class="nav-links">
+          <a href="#install">Install</a>
+          <a href="#configure">Configure</a>
+          <a href="https://github.com/fitz-s/codex-native-agent-pool-advisor">GitHub</a>
+        </div>
+      </nav>
+
+      <main>
+        <section class="hero">
+          <div>
+            <p class="eyebrow">Subagent capacity guardrail for Codex Desktop</p>
+            <h1>Stop losing long prompts to invisible native subagent limits.</h1>
+            <p class="lead">
+              Has your Codex agent ever written a careful 900-word reviewer prompt, then failed because it did not know there were only six native subagent slots? This hook makes the pool visible before the agent wastes the turn.
+            </p>
+            <div class="actions">
+              <a class="button primary" href="#install">Install the hook</a>
+              <a class="button" href="https://github.com/fitz-s/codex-native-agent-pool-advisor/releases">View releases</a>
+            </div>
+          </div>
+
+          <div class="terminal" aria-label="Example terminal transcript">
+            <div class="terminal-top">
+              <div class="dots">
+                <span class="dot red"></span>
+                <span class="dot yellow"></span>
+                <span class="dot green"></span>
+              </div>
+              <span>before and after</span>
+            </div>
+            <pre><span class="dim">agent:</span> I will spawn reviewer, verifier, and critic...
+<span class="bad">runtime:</span> unable to create 1 agent
+<span class="bad">runtime:</span> native subagent pool is full
+<span class="dim">agent:</span> closing six old agents, retrying long prompt...
+
+<span class="good">advisor:</span> occupied=5/6, remaining_spawn_budget=1
+<span class="good">advisor:</span> requested_spawns=2 would exceed cap
+<span class="good">advisor:</span> reuse an existing lane or close one first</pre>
+          </div>
+        </section>
+
+        <section class="band">
+          <div class="section-heading">
+            <h2>What it prevents</h2>
+            <p>The hook does not decide whether to delegate. It only keeps Codex from colliding with native pool reality.</p>
+          </div>
+          <div class="grid">
+            <article class="card">
+              <h3>Invisible cap hits</h3>
+              <p>Reads per-parent native edge state and injects current budget before launch-heavy turns.</p>
+            </article>
+            <article class="card">
+              <h3>Batch spawn failures</h3>
+              <p>Counts nested wrapper calls so two requested spawns consume two slots before approval.</p>
+            </article>
+            <article class="card">
+              <h3>Stale open rows</h3>
+              <p>Excludes native open edges only when the child transcript has structured completion evidence.</p>
+            </article>
+            <article class="card">
+              <h3>Recursive delegation</h3>
+              <p>Blocks child agents from spawning their own reviewers, verifiers, or explorers.</p>
+            </article>
+            <article class="card">
+              <h3>Wrong explorer model</h3>
+              <p>Requires read-only explorer work to use a configured fast model lane instead of inheriting a frontier model.</p>
+            </article>
+            <article class="card">
+              <h3>Destructive reset drift</h3>
+              <p>Uses dry-run force tokens before clearing native edge state.</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="install">
+          <div class="split">
+            <div class="section-heading">
+              <h2>Install</h2>
+              <p>Run tests first, install into your Codex home, then verify the live hook registration with doctor.</p>
+            </div>
+            <div class="code-block">
+              <pre>git clone https://github.com/fitz-s/codex-native-agent-pool-advisor.git
+cd codex-native-agent-pool-advisor
+npm test
+node scripts/install.mjs
+node scripts/doctor.mjs</pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="configure" class="band">
+          <div class="section-heading">
+            <h2>Configure the non-universal parts</h2>
+            <p>Model catalogs, state DB names, and fallback policies vary by Codex install. Keep them outside the hook logic.</p>
+          </div>
+          <div class="split">
+            <table class="config-table">
+              <tbody>
+                <tr>
+                  <th><code>models.explorer</code></th>
+                  <td>Allowed read-only explorer models. Defaults to Spark plus mini fallback. If this is the only model setting, the first entry is preferred and the second is fallback.</td>
+                </tr>
+                <tr>
+                  <th><code>defaults.agentCap</code></th>
+                  <td>Fallback cap when <code>[agents].max_threads</code> is absent.</td>
+                </tr>
+                <tr>
+                  <th><code>defaults.warnRemaining</code></th>
+                  <td>How early advisory context appears near the native cap.</td>
+                </tr>
+                <tr>
+                  <th><code>paths.stateDbName</code></th>
+                  <td>Codex native state DB filename when it is not <code>state_5.sqlite</code>.</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="code-block">
+              <pre>{
+  "models": {
+    "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
+    "explorerPreferred": "gpt-5.3-codex-spark",
+    "explorerFallback": "gpt-5.4-mini"
+  },
+  "defaults": {
+    "agentCap": 6,
+    "warnRemaining": 1
+  },
+  "paths": {
+    "stateDbName": "state_5.sqlite"
+  }
+}</pre>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>Safety boundary</h2>
+            <p>Normal hook execution writes advisor JSON state and logs. SQLite mutation is limited to successful close-agent evidence or the explicit reset script.</p>
+          </div>
+          <div class="code-block">
+            <pre>node scripts/reset-pool.mjs --parent &lt;thread_id&gt; --dry-run
+node scripts/reset-pool.mjs --parent &lt;thread_id&gt; --force &lt;token_from_dry_run&gt;</pre>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        MIT licensed. Built for Codex Desktop native subagent pool visibility.
+      </footer>
+    </div>
+  </body>
+</html>

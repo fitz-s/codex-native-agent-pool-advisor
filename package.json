@@ -1,6 +1,6 @@
 {
   "name": "codex-native-agent-pool-advisor",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Codex Desktop hook that prevents native subagent pool cap drift and stale-open edge exhaustion.",
   "type": "module",
   "author": "Fitz",
@@ -12,7 +12,7 @@
   "bugs": {
     "url": "https://github.com/fitz-s/codex-native-agent-pool-advisor/issues"
   },
-  "homepage": "https://github.com/fitz-s/codex-native-agent-pool-advisor#readme",
+  "homepage": "https://fitz-s.github.io/codex-native-agent-pool-advisor/",
   "packageManager": "npm@11.8.0",
   "engines": {
     "node": ">=22"

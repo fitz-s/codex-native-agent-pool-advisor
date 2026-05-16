@@ -1,6 +1,8 @@
 # Codex Native Agent Pool Advisor
 
-Guardrail hook for Codex Desktop native subagents. It keeps the parent-thread subagent budget visible, blocks capacity-collision spawns, blocks recursive child-agent spawning, and forces read-only explorer lanes onto `gpt-5.3-codex-spark`.
+Guardrail hook for Codex Desktop native subagents. It keeps the parent-thread subagent budget visible, blocks capacity-collision spawns, blocks recursive child-agent spawning, and routes read-only explorer lanes onto configured fast models.
+
+Project page: <https://fitz-s.github.io/codex-native-agent-pool-advisor/>
 
 ## Runtime Model
 
@@ -11,7 +13,8 @@ Guardrail hook for Codex Desktop native subagents. It keeps the parent-thread su
 - A native SQLite edge that is still `open` but whose child transcript ended in `task_complete` is treated as a stale terminal-open edge: it is excluded from occupied capacity and surfaced as a cleanup/reset candidate.
 - The hook only mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence.
 - Empty `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
-- The default explorer model is `gpt-5.3-codex-spark`. Override it with `NATIVE_AGENT_POOL_EXPLORER_MODEL` only if your Codex model catalog uses a different fast explorer lane.
+- The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
+- Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
 
@@ -31,6 +34,37 @@ node scripts/doctor.mjs
 The installer copies `hooks/native-agent-pool-advisor.mjs` to `~/.codex/hooks/` and registers it for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
 
 The installer is idempotent: repeated installs should leave one registration per hook event.
+
+## Configuration
+
+Create `~/.codex/native-agent-pool-advisor.config.json` when your Codex install uses different model names, a different fallback cap, or a different native state DB name.
+If only `models.explorer` is set, the first model is treated as preferred and the second as fallback.
+
+```json
+{
+  "models": {
+    "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
+    "explorerPreferred": "gpt-5.3-codex-spark",
+    "explorerFallback": "gpt-5.4-mini"
+  },
+  "defaults": {
+    "agentCap": 6,
+    "warnRemaining": 1
+  },
+  "paths": {
+    "stateDbName": "state_5.sqlite"
+  }
+}
+```
+
+Environment overrides are also supported:
+
+- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated explorer allow-list.
+- `NATIVE_AGENT_POOL_EXPLORER_MODEL`: preferred explorer model.
+- `NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL`: fallback explorer model.
+- `NATIVE_AGENT_POOL_DEFAULT_CAP`: fallback cap when `[agents].max_threads` is absent.
+- `NATIVE_AGENT_POOL_WARN_REMAINING`: advisory threshold near the cap.
+- `NATIVE_AGENT_POOL_STATE_DB_PATH` or `NATIVE_AGENT_POOL_STATE_DB_NAME`: native DB override.
 
 ## Update
 

@@ -75,17 +75,17 @@ async function writeFalseTaskCompleteTranscript(home, id) {
   return path;
 }
 
-async function runScript(scriptPath, home, args = []) {
+async function runScript(scriptPath, home, args = [], envOverrides = {}) {
   return execFileAsync(process.execPath, [scriptPath, ...args], {
-    env: { ...process.env, CODEX_HOME: home },
+    env: { ...process.env, CODEX_HOME: home, ...envOverrides },
     timeout: 8000,
     maxBuffer: 4 * 1024 * 1024,
   });
 }
 
-async function runHook(home, payload) {
+async function runHook(home, payload, envOverrides = {}) {
   const child = spawn(process.execPath, [hookPath], {
-    env: { ...process.env, CODEX_HOME: home },
+    env: { ...process.env, CODEX_HOME: home, ...envOverrides },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
@@ -165,6 +165,71 @@ test("blocks wrapped explorer spawn that would inherit the frontier model", asyn
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /gpt-5\.3-codex-spark/);
+    assert.match(output.reason, /gpt-5\.4-mini/);
+  });
+});
+
+test("allows mini fallback model for explorer spawns by default", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.notEqual(output?.decision, "block");
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
+    assert.equal(reservations.length, 1);
+    assert.equal(reservations[0].count, 1);
+  });
+});
+
+test("explorer model allow-list can be customized by advisor config", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await writeFile(
+      join(home, "native-agent-pool-advisor.config.json"),
+      JSON.stringify({
+        models: {
+          explorer: ["local-scan", "local-mini"],
+        },
+      }),
+    );
+
+    const allowed = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "local-mini",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+    assert.notEqual(allowed?.decision, "block");
+
+    const blocked = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent2",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+    assert.equal(blocked.decision, "block");
+    assert.match(blocked.reason, /local-scan, local-mini/);
   });
 });
 

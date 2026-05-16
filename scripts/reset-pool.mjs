@@ -21,6 +21,18 @@ function sqlString(value) {
   return `'${String(value ?? "").replace(/'/g, "''")}'`;
 }
 
+function safeObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function readFirstString(...values) {
+  for (const value of values) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text) return text;
+  }
+  return "";
+}
+
 async function pathExists(path) {
   try {
     await access(path, constants.F_OK);
@@ -44,6 +56,27 @@ async function writeJsonAtomic(path, value) {
   const tmp = `${path}.${process.pid}.tmp`;
   await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`);
   await rename(tmp, path);
+}
+
+async function readAdvisorConfig(home) {
+  return readJsonOrDefault(join(home, "native-agent-pool-advisor.config.json"), {});
+}
+
+function stateDbPath(home, config) {
+  const paths = safeObject(config.paths) ?? {};
+  const override = readFirstString(
+    process.env.NATIVE_AGENT_POOL_STATE_DB_PATH,
+    paths.state_db_path,
+    paths.stateDbPath,
+  );
+  if (override) return override;
+  const name = readFirstString(
+    process.env.NATIVE_AGENT_POOL_STATE_DB_NAME,
+    paths.state_db_name,
+    paths.stateDbName,
+    "state_5.sqlite",
+  );
+  return join(home, name);
 }
 
 function parseArgs(argv) {
@@ -137,7 +170,8 @@ async function main() {
   }
 
   const home = codexHome();
-  const dbPath = join(home, "state_5.sqlite");
+  const advisorConfig = await readAdvisorConfig(home);
+  const dbPath = stateDbPath(home, advisorConfig);
   if (!(await pathExists(dbPath))) throw new Error(`missing Codex state DB: ${dbPath}`);
 
   const where = args.parent ? `where parent_thread_id=${sqlString(args.parent)}` : "";
