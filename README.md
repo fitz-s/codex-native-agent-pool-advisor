@@ -14,7 +14,7 @@ Guardrail hook for Codex Desktop native subagents. It keeps the parent-thread su
 ## Install
 
 ```bash
-cd /Users/leofitz/codex-native-agent-pool-advisor
+cd codex-native-agent-pool-advisor
 npm test
 node scripts/install.mjs
 ```

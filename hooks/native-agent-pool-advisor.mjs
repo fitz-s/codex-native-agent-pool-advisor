@@ -66,7 +66,8 @@ function codexHome() {
   const explicit = safeString(process.env.CODEX_HOME).trim();
   if (explicit) return explicit;
   const home = safeString(process.env.HOME).trim();
-  return home ? join(home, ".codex") : "/Users/leofitz/.codex";
+  if (home) return join(home, ".codex");
+  throw new Error("CODEX_HOME or HOME must be set for native-agent-pool-advisor");
 }
 
 function statePath() {

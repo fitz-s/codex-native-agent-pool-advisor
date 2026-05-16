@@ -2,17 +2,17 @@
 
 ## Live Surfaces
 
-- Active user hook config: `/Users/leofitz/.codex/hooks.json`.
-- Active advisor path: `/Users/leofitz/.codex/hooks/native-agent-pool-advisor.mjs`.
-- Advisor state: `/Users/leofitz/.codex/state/native-agent-pool-advisor.json`.
-- Native Desktop state: `/Users/leofitz/.codex/state_5.sqlite`, especially `thread_spawn_edges`.
-- Native cap: `/Users/leofitz/.codex/config.toml` `[agents].max_threads`.
+- Active user hook config: `~/.codex/hooks.json`.
+- Active advisor path: `~/.codex/hooks/native-agent-pool-advisor.mjs`.
+- Advisor state: `~/.codex/state/native-agent-pool-advisor.json`.
+- Native Desktop state: `~/.codex/state_5.sqlite`, especially `thread_spawn_edges`.
+- Native cap: `~/.codex/config.toml` `[agents].max_threads`.
 
 ## Hidden Branches
 
-- `/Users/leofitz/.codex/hooks/quiet-omx-status-self-heal.mjs` runs on `SessionStart` and can normalize live hook registration.
-- `/Users/leofitz/.codex/hooks.json.backup.*` and `/Users/leofitz/.codex/hooks.json.preprobe` contain older hook layouts and matchers.
-- `/Users/leofitz/.omx/backups/setup/**/.codex/hooks.json` can replay old setup-time hook stacks.
+- `~/.codex/hooks/quiet-omx-status-self-heal.mjs` runs on `SessionStart` and can normalize live hook registration.
+- `~/.codex/hooks.json.backup.*` and `~/.codex/hooks.json.preprobe` contain older hook layouts and matchers.
+- `~/.omx/backups/setup/**/.codex/hooks.json` can replay old setup-time hook stacks.
 - `oh-my-codex` setup currently strips legacy `codex-native-hook.js` managed entries, but setup/restore behavior still depends on user-scope config and backups.
 - Backup DBs such as `state_5.sqlite.backup-*` are not read by the advisor unless manually restored over `state_5.sqlite`.
 

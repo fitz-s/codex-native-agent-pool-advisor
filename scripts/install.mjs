@@ -12,7 +12,8 @@ function codexHome() {
   const explicit = typeof process.env.CODEX_HOME === "string" ? process.env.CODEX_HOME.trim() : "";
   if (explicit) return explicit;
   const home = typeof process.env.HOME === "string" ? process.env.HOME.trim() : "";
-  return home ? join(home, ".codex") : "/Users/leofitz/.codex";
+  if (home) return join(home, ".codex");
+  throw new Error("CODEX_HOME or HOME must be set");
 }
 
 function hookCommand(home) {
