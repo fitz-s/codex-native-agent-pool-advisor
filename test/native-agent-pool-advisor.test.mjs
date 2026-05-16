@@ -10,12 +10,16 @@ import test from "node:test";
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const hookPath = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
+const installPath = join(repoRoot, "scripts", "install.mjs");
+const resetPath = join(repoRoot, "scripts", "reset-pool.mjs");
+const doctorPath = join(repoRoot, "scripts", "doctor.mjs");
+const uninstallPath = join(repoRoot, "scripts", "uninstall.mjs");
 
-async function withHome(work) {
+async function withHome(work, configText = "[agents]\nmax_threads = 6\n") {
   const home = await mkdtemp(join(tmpdir(), "native-agent-pool-advisor-test-"));
   try {
     await mkdir(join(home, "state"), { recursive: true });
-    await writeFile(join(home, "config.toml"), "[agents]\nmax_threads = 6\n");
+    await writeFile(join(home, "config.toml"), configText);
     return await work(home);
   } finally {
     await rm(home, { recursive: true, force: true });
@@ -59,6 +63,26 @@ async function writeTaskCompleteTranscript(home, id) {
   return path;
 }
 
+async function writeFalseTaskCompleteTranscript(home, id) {
+  const path = join(home, `${id}.jsonl`);
+  await writeFile(
+    path,
+    [
+      `{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"${id}"}}`,
+      '{"timestamp":"2026-05-16T08:00:02.000Z","type":"response_item","payload":{"type":"message","text":"quoted string: \\"task_complete\\""}}',
+    ].join("\n"),
+  );
+  return path;
+}
+
+async function runScript(scriptPath, home, args = []) {
+  return execFileAsync(process.execPath, [scriptPath, ...args], {
+    env: { ...process.env, CODEX_HOME: home },
+    timeout: 8000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+}
+
 async function runHook(home, payload) {
   const child = spawn(process.execPath, [hookPath], {
     env: { ...process.env, CODEX_HOME: home },
@@ -79,7 +103,7 @@ async function runHook(home, payload) {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error("hook timed out"));
-    }, 5000);
+    }, 8000);
     child.on("error", reject);
     child.on("close", (exitCode) => {
       clearTimeout(timer);
@@ -144,6 +168,47 @@ test("blocks wrapped explorer spawn that would inherit the frontier model", asyn
   });
 });
 
+test("blocks wrapped multi-spawn when requested spawn count exceeds remaining capacity", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','a1','open'),('parent1','a2','open'),('parent1','a3','open'),('parent1','a4','open'),('parent1','a5','open');",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "multi_tool_use.parallel",
+      session_id: "parent1",
+      tool_input: {
+        tool_uses: [
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.3-codex-spark",
+              reasoning_effort: "low",
+              message: "map files",
+            },
+          },
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.3-codex-spark",
+              reasoning_effort: "low",
+              message: "map tests",
+            },
+          },
+        ],
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /requested_spawns=2/);
+  });
+});
+
 test("native open edges with task_complete transcripts are stale and do not exhaust capacity", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -181,6 +246,70 @@ test("native open edges with task_complete transcripts are stale and do not exha
     });
     assert.notEqual(spawnOutput?.decision, "block");
     assert.match(spawnOutput.hookSpecificOutput.additionalContext, /Native agent pool advisory: 1\/6/);
+  });
+});
+
+test("task_complete text in non-event transcript records does not mark native edge stale", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const values = [];
+    for (let index = 1; index <= 6; index += 1) {
+      const id = `child${index}`;
+      const path = await writeFalseTaskCompleteTranscript(home, id);
+      values.push(`('parent1','${id}','open')`);
+      await sqlite(
+        home,
+        `insert into threads values ('${id}','${path}','live ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',1778920000);`,
+      );
+    }
+    await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /native_current=open=6, terminal_open=0/);
+  });
+});
+
+test("native authoritative state is not vetoed by stale transcript fallback count", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+    const transcript = join(home, "parent.jsonl");
+    const lines = ['{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"parent1"}}'];
+    for (let index = 1; index <= 6; index += 1) {
+      lines.push(`{"timestamp":"2026-05-16T08:00:0${index}.000Z","type":"event_msg","payload":{"type":"collab_agent_spawn_end","sender_thread_id":"parent1","new_thread_id":"stale${index}"}}`);
+    }
+    await writeFile(transcript, lines.join("\n"));
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      transcript_path: transcript,
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.notEqual(output?.decision, "block");
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
+    assert.equal(reservations.length, 1);
+    assert.equal(reservations[0].count, 1);
   });
 });
 
@@ -226,6 +355,27 @@ test("empty native table falls back to transcripts unless an explicit reset mark
   });
 });
 
+test("fresh lock contention blocks spawn conservatively", async () => {
+  await withHome(async (home) => {
+    await mkdir(join(home, "state", "native-agent-pool-advisor.lock"), { recursive: true });
+    await writeFile(join(home, "state", "native-agent-pool-advisor.lock", "owner"), "test lock\n");
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /state lock is unavailable/);
+  });
+});
+
 test("successful close_agent is the only automatic native edge release", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -243,7 +393,92 @@ test("successful close_agent is the only automatic native edge release", async (
   });
 });
 
-test("reset script backs up DB, clears selected parent, and writes reset marker", async () => {
+test("wrapped close_agent post-tool evidence repairs native edge state", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "multi_tool_use.parallel",
+      session_id: "parent1",
+      tool_input: {
+        tool_uses: [
+          {
+            recipient_name: "functions.close_agent",
+            parameters: { target: "child1" },
+          },
+        ],
+      },
+      tool_response: [{ recipient_name: "functions.close_agent", output: { status: "closed" } }],
+    });
+
+    assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "closed|1");
+  });
+});
+
+test("max_threads is read from the agents TOML section only", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','a1','open'),('parent1','a2','open'),('parent1','a3','open'),('parent1','a4','open');",
+    );
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /4\/4/);
+  }, "[unrelated]\nmax_threads = 99\n\n[agents]\nmax_threads = 4\n");
+});
+
+test("installer is idempotent for existing hooks.json", async () => {
+  await withHome(async (home) => {
+    await runScript(installPath, home);
+    await runScript(installPath, home);
+    const config = JSON.parse(await readFile(join(home, "hooks.json"), "utf-8"));
+    for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+      const count = config.hooks[eventName]
+        .flatMap((entry) => entry.hooks ?? [])
+        .filter((hook) => hook.command.includes("native-agent-pool-advisor.mjs")).length;
+      assert.equal(count, 1, eventName);
+    }
+  });
+});
+
+test("doctor validates install and uninstall removes advisor registrations", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await runScript(installPath, home);
+    const doctor = JSON.parse((await runScript(doctorPath, home)).stdout);
+    assert.equal(doctor.ok, true);
+    assert.equal(doctor.checks.registrations.UserPromptSubmit, 1);
+
+    const dryRun = JSON.parse((await runScript(uninstallPath, home, ["--dry-run"])).stdout);
+    assert.equal(dryRun.removed_registrations, 3);
+
+    const removed = JSON.parse((await runScript(uninstallPath, home)).stdout);
+    assert.equal(removed.removed_registrations, 3);
+    const config = JSON.parse(await readFile(join(home, "hooks.json"), "utf-8"));
+    for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+      const entries = Array.isArray(config.hooks?.[eventName]) ? config.hooks[eventName] : [];
+      const count = entries
+        .flatMap((entry) => entry.hooks ?? [])
+        .filter((hook) => hook.command.includes("native-agent-pool-advisor.mjs")).length;
+      assert.equal(count, 0, eventName);
+    }
+  });
+});
+
+test("reset script requires dry-run force token before mutation", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -251,11 +486,22 @@ test("reset script backs up DB, clears selected parent, and writes reset marker"
       "insert into thread_spawn_edges values ('parent1','child1','open'),('parent2','child2','open');",
     );
 
-    const { stdout } = await execFileAsync(process.execPath, [join(repoRoot, "scripts", "reset-pool.mjs"), "--parent", "parent1"], {
-      env: { ...process.env, CODEX_HOME: home },
-      timeout: 5000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
+    await assert.rejects(
+      runScript(resetPath, home, ["--parent", "parent1"]),
+      /requires --force/,
+    );
+
+    const dryRun = await runScript(resetPath, home, ["--parent", "parent1", "--dry-run"]);
+    const dryRunResult = JSON.parse(dryRun.stdout);
+    assert.equal(dryRunResult.dry_run, true);
+    assert.ok(dryRunResult.force_token);
+
+    const { stdout } = await runScript(resetPath, home, [
+      "--parent",
+      "parent1",
+      "--force",
+      dryRunResult.force_token,
+    ]);
     const result = JSON.parse(stdout);
     assert.equal(result.parent, "parent1");
     assert.equal(result.changed, 1);
@@ -263,5 +509,31 @@ test("reset script backs up DB, clears selected parent, and writes reset marker"
 
     const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
     assert.equal(state.native_pool_reset_threads.parent1, result.reset_at);
+  });
+});
+
+test("global reset requires explicit global confirmation and force token", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open'),('parent2','child2','open');");
+
+    const dryRun = await runScript(resetPath, home, ["--global", "--dry-run"]);
+    const dryRunResult = JSON.parse(dryRun.stdout);
+    assert.equal(dryRunResult.scope, "global");
+    await assert.rejects(
+      runScript(resetPath, home, ["--global", "--force", dryRunResult.force_token]),
+      /requires --confirm-global-reset/,
+    );
+
+    const { stdout } = await runScript(resetPath, home, [
+      "--global",
+      "--confirm-global-reset",
+      "--force",
+      dryRunResult.force_token,
+    ]);
+    const result = JSON.parse(stdout);
+    assert.equal(result.parent, null);
+    assert.equal(result.changed, 2);
+    assert.equal(await sqliteReadonly(home, "select count(*) from thread_spawn_edges;"), "0");
   });
 });

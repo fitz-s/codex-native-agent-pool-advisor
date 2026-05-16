@@ -6,15 +6,24 @@ on:
 
 jobs:
   node-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: Install sqlite3
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Check sqlite3
+        run: sqlite3 --version
       - name: Syntax check
         run: npm run check
       - name: Test
         run: npm test
+      - name: Package dry run
+        run: npm pack --dry-run

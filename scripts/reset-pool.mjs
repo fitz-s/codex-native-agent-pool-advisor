@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
 import { access, copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -46,12 +47,20 @@ async function writeJsonAtomic(path, value) {
 }
 
 function parseArgs(argv) {
-  const args = { parent: "", global: false, dryRun: false };
+  const args = {
+    parent: "",
+    global: false,
+    dryRun: false,
+    force: "",
+    confirmGlobalReset: false,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--parent") args.parent = String(argv[++i] ?? "").trim();
     else if (arg === "--global") args.global = true;
     else if (arg === "--dry-run") args.dryRun = true;
+    else if (arg === "--force") args.force = String(argv[++i] ?? "").trim();
+    else if (arg === "--confirm-global-reset") args.confirmGlobalReset = true;
     else if (arg === "-h" || arg === "--help") args.help = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
@@ -63,6 +72,13 @@ function parseArgs(argv) {
     throw new Error("choose only one of --parent or --global");
   }
   return args;
+}
+
+function forceToken(scope, parent, before) {
+  return createHash("sha256")
+    .update(JSON.stringify({ scope, parent: parent || null, before }))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 async function sqliteJson(dbPath, sql) {
@@ -114,7 +130,9 @@ async function appendLog(home, record) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
-    process.stdout.write("usage: reset-pool.mjs (--parent <thread_id> | --global) [--dry-run]\n");
+    process.stdout.write("usage: reset-pool.mjs (--parent <thread_id> | --global) --dry-run\n");
+    process.stdout.write("       reset-pool.mjs --parent <thread_id> --force <dry_run_force_token>\n");
+    process.stdout.write("       reset-pool.mjs --global --confirm-global-reset --force <dry_run_force_token>\n");
     return;
   }
 
@@ -124,9 +142,26 @@ async function main() {
 
   const where = args.parent ? `where parent_thread_id=${sqlString(args.parent)}` : "";
   const before = await sqliteJson(dbPath, `select status,count(*) as count from thread_spawn_edges ${where} group by status order by status;`);
+  const scope = args.global ? "global" : "parent";
+  const token = forceToken(scope, args.parent, before);
   if (args.dryRun) {
-    process.stdout.write(`${JSON.stringify({ dry_run: true, parent: args.parent || null, before }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({
+      dry_run: true,
+      scope,
+      parent: args.parent || null,
+      before,
+      force_token: token,
+    }, null, 2)}\n`);
     return;
+  }
+  if (!args.force) {
+    throw new Error("reset mutation requires --force <token> from a matching --dry-run");
+  }
+  if (args.force !== token) {
+    throw new Error("reset mutation requires --force token from the current matching --dry-run");
+  }
+  if (args.global && !args.confirmGlobalReset) {
+    throw new Error("global reset requires --confirm-global-reset");
   }
 
   const resetAt = new Date().toISOString();

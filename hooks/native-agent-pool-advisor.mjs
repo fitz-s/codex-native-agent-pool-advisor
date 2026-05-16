@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
@@ -25,11 +25,10 @@ const NATIVE_EDGE_QUERY_TIMEOUT_MS = 750;
 const NATIVE_EDGE_QUERY_MAX_BUFFER = 1024 * 1024;
 const NATIVE_EDGE_TERMINAL_TAIL_BYTES = 2 * 1024 * 1024;
 const NATIVE_EDGE_REPAIR_BATCH = 50;
-const NATIVE_EDGE_CLOSED_RETENTION_MS = 72 * 60 * 60 * 1000;
 const NATIVE_EDGE_MAINTENANCE_TTL_MS = 6 * 60 * 60 * 1000;
 const ADVISOR_SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const COMMAND_NAME = "native-agent-pool-advisor";
-const EXPLORER_MODEL = "gpt-5.3-codex-spark";
+const DEFAULT_EXPLORER_MODEL = "gpt-5.3-codex-spark";
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
 
@@ -116,9 +115,27 @@ async function readText(path) {
 
 async function readAgentCap() {
   const raw = await readText(configPath());
-  const match = raw.match(/^\s*max_threads\s*=\s*(\d+)\s*$/m);
-  const parsed = match ? Number.parseInt(match[1], 10) : DEFAULT_AGENT_CAP;
+  let inAgentsSection = false;
+  let parsed = DEFAULT_AGENT_CAP;
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const section = trimmed.match(/^\[([^\]]+)\]\s*$/);
+    if (section) {
+      inAgentsSection = section[1].trim() === "agents";
+      continue;
+    }
+    if (!inAgentsSection) continue;
+    const match = trimmed.match(/^max_threads\s*=\s*(\d+)\s*(?:#.*)?$/);
+    if (match) {
+      parsed = Number.parseInt(match[1], 10);
+      break;
+    }
+  }
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_AGENT_CAP;
+}
+
+function explorerModel() {
+  return safeString(process.env.NATIVE_AGENT_POOL_EXPLORER_MODEL).trim() || DEFAULT_EXPLORER_MODEL;
 }
 
 function emptyState() {
@@ -169,7 +186,9 @@ async function readState() {
 async function writeState(state) {
   const path = statePath();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  await rename(tmp, path);
 }
 
 function sleep(ms) {
@@ -178,22 +197,34 @@ function sleep(ms) {
 
 async function acquireStateLock() {
   const lockPath = stateLockPath();
+  const ownerPath = join(lockPath, "owner");
   const deadline = Date.now() + STATE_LOCK_WAIT_MS;
   await mkdir(dirname(lockPath), { recursive: true });
+  const writeOwner = async () => {
+    await writeFile(ownerPath, `${process.pid} ${new Date().toISOString()}\n`);
+  };
 
   while (Date.now() < deadline) {
     try {
       await mkdir(lockPath);
-      await writeFile(join(lockPath, "owner"), `${process.pid} ${new Date().toISOString()}\n`);
-      return async () => {
-        await rm(lockPath, { recursive: true, force: true });
+      await writeOwner();
+      return {
+        touch: writeOwner,
+        release: async () => {
+          await rm(lockPath, { recursive: true, force: true });
+        },
       };
     } catch (error) {
       if (error?.code !== "EEXIST") {
         return null;
       }
       try {
-        const stats = await stat(lockPath);
+        let stats;
+        try {
+          stats = await stat(ownerPath);
+        } catch {
+          stats = await stat(lockPath);
+        }
         if (Date.now() - stats.mtimeMs > STATE_LOCK_STALE_MS) {
           await rm(lockPath, { recursive: true, force: true });
           continue;
@@ -209,12 +240,17 @@ async function acquireStateLock() {
 }
 
 async function withStateLock(work) {
-  const release = await acquireStateLock();
-  if (!release) return LOCK_UNAVAILABLE;
+  const lock = await acquireStateLock();
+  if (!lock) return LOCK_UNAVAILABLE;
+  const heartbeat = setInterval(() => {
+    lock.touch().catch(() => {});
+  }, Math.max(1000, Math.floor(STATE_LOCK_STALE_MS / 3)));
+  heartbeat.unref?.();
   try {
     return await work();
   } finally {
-    await release();
+    clearInterval(heartbeat);
+    await lock.release();
   }
 }
 
@@ -660,7 +696,15 @@ async function transcriptHasTaskComplete(path) {
       handle = await open(path, "r");
       const buffer = Buffer.alloc(stats.size - start);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-      return buffer.subarray(0, bytesRead).toString("utf-8").includes('"task_complete"');
+      for (const line of buffer.subarray(0, bytesRead).toString("utf-8").split(/\r?\n/)) {
+        if (!line.includes('"task_complete"')) continue;
+        const record = parseJsonLine(line);
+        const payload = safeObject(record?.payload);
+        if (record?.type === "event_msg" && payload?.type === "task_complete") {
+          return true;
+        }
+      }
+      return false;
     } finally {
       try {
         await handle?.close();
@@ -713,38 +757,7 @@ async function repairClosedNativeEdges(parentThreadId, closedIds) {
 async function maintainNativePoolStorage(state, nowMs, nowIso) {
   const last = msFromIso(state.last_native_edge_maintenance_at);
   if (last && nowMs - last < NATIVE_EDGE_MAINTENANCE_TTL_MS) return;
-  const dbPath = stateDbPath();
-  if (!existsSync(dbPath)) return;
-
-  if (safeString(process.env.NATIVE_AGENT_POOL_ADVISOR_MAINTENANCE).trim() !== "1") {
-    state.last_native_edge_maintenance_at = nowIso;
-    return;
-  }
-
-  const cutoffSeconds = Math.floor((nowMs - NATIVE_EDGE_CLOSED_RETENTION_MS) / 1000);
-  const sql = [
-    "pragma busy_timeout=250;",
-    "create index if not exists idx_thread_spawn_edges_parent_status on thread_spawn_edges(parent_thread_id,status);",
-    "delete from thread_spawn_edges",
-    "where status='closed'",
-    "and child_thread_id in (",
-    "select e.child_thread_id",
-    "from thread_spawn_edges e",
-    "left join threads t on t.id=e.child_thread_id",
-    "where e.status='closed'",
-    `and coalesce(t.updated_at,0) > 0 and t.updated_at < ${cutoffSeconds}`,
-    ");",
-  ].join(" ");
-
-  try {
-    await execFileAsync("sqlite3", [dbPath, sql], {
-      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
-      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
-    });
-    state.last_native_edge_maintenance_at = nowIso;
-  } catch {
-    // Advisory maintenance must never block tool execution.
-  }
+  state.last_native_edge_maintenance_at = nowIso;
 }
 
 async function discoverNativeThreadEdges(parentThreadId) {
@@ -954,7 +967,7 @@ function isExplorerSpawnInput(payload) {
 
 function hasExplorerModelRouteViolation(payload) {
   if (!isExplorerSpawnInput(payload)) return false;
-  return requestedModel(payload) !== EXPLORER_MODEL;
+  return requestedModel(payload) !== explorerModel();
 }
 
 function operationAgentType(operation) {
@@ -971,16 +984,69 @@ function hasSpawnOperation(operations) {
   return operations.some((operation) => operation.name === "spawn_agent");
 }
 
+function spawnOperationCount(operations) {
+  return operations.filter((operation) => operation.name === "spawn_agent").length;
+}
+
 function hasExplorerModelRouteViolationInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
     if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    return operationModel(operation) !== EXPLORER_MODEL;
+    return operationModel(operation) !== explorerModel();
   });
 }
 
 function toolResponse(payload) {
   return payload.tool_response ?? payload.toolResponse ?? payload.response ?? payload.result;
+}
+
+function operationResponseItemMatches(item, operation) {
+  if (!item || typeof item !== "object") return false;
+  const name = normalizeNestedToolName(
+    item.recipient_name
+      ?? item.recipientName
+      ?? item.tool_name
+      ?? item.toolName
+      ?? item.name,
+  );
+  return name && name === operation?.name;
+}
+
+function unwrapOperationResponseItem(item) {
+  if (!item || typeof item !== "object") return item;
+  return item.output ?? item.result ?? item.response ?? item.tool_response ?? item.toolResponse ?? item;
+}
+
+function operationResponse(payload, operation) {
+  const response = toolResponse(payload);
+  if (Array.isArray(response)) {
+    const matched = response.find((item) => operationResponseItemMatches(item, operation));
+    return matched ? unwrapOperationResponseItem(matched) : response;
+  }
+  if (response && typeof response === "object") {
+    if (operationResponseItemMatches(response, operation)) {
+      return unwrapOperationResponseItem(response);
+    }
+    for (const key of ["tool_uses", "toolUses", "results", "responses", "outputs"]) {
+      if (Array.isArray(response[key])) {
+        const matched = response[key].find((item) => operationResponseItemMatches(item, operation));
+        if (matched) return unwrapOperationResponseItem(matched);
+      }
+    }
+  }
+  return response;
+}
+
+function payloadForOperation(payload, operation) {
+  return {
+    ...payload,
+    tool_name: operation.name,
+    toolName: operation.name,
+    tool_input: operation.input ?? {},
+    toolInput: operation.input ?? {},
+    tool_response: operationResponse(payload, operation),
+    toolResponse: operationResponse(payload, operation),
+  };
 }
 
 function responseText(payload) {
@@ -1028,10 +1094,11 @@ function reservationKey(payload, nowIso) {
   return `fallback:${inputHash}:${nowIso}`;
 }
 
-function reserveSpawnSlot(session, payload, nowMs, nowIso) {
+function reserveSpawnSlot(session, payload, nowMs, nowIso, count = 1) {
   const key = reservationKey(payload, nowIso);
   session.spawn_reservations[key] = {
     key,
+    count: Math.max(1, Number.isFinite(count) ? Math.floor(count) : 1),
     reserved_at: nowIso,
     expires_at: new Date(nowMs + SPAWN_RESERVATION_TTL_MS).toISOString(),
     tool_input_hash: hashText(JSON.stringify(toolInput(payload))),
@@ -1054,7 +1121,10 @@ function clearSpawnReservation(session, payload) {
 }
 
 function spawnReservationCount(session) {
-  return Object.keys(session.spawn_reservations ?? {}).length;
+  return Object.values(session.spawn_reservations ?? {}).reduce((total, reservation) => {
+    const count = Number(reservation?.count ?? 1);
+    return total + (Number.isFinite(count) && count > 0 ? Math.floor(count) : 1);
+  }, 0);
 }
 
 function collectAgentIdsFromValue(value, ids = new Set(), keyHint = "") {
@@ -1337,7 +1407,7 @@ function buildCapacityGuidance(eventName, cap, summary = null) {
 function buildDelegationGuidance(cap) {
   return [
     `Codex context hygiene delegation protocol: treat native subagents as the default context-isolation layer for broad repo lookup, file/symbol mapping, grep-like scans, lightweight review probes, and bounded verification; the leader should preserve main-thread context for judgment, integration, and final decisions.`,
-    `Before doing multiple broad rg/sed/cat reads in the leader context, reuse a compatible existing explorer lane with send_input; if no useful lane exists, launch one bounded explorer subagent when that lookup can be isolated. Native explorer spawns must set agent_type=explorer, model=${EXPLORER_MODEL}, and reasoning_effort=low. If Spark disappears from the native tool schema, treat that as model-catalog drift to repair, not as permission to inherit gpt-5.5 for grep work.`,
+    `Before doing multiple broad rg/sed/cat reads in the leader context, reuse a compatible existing explorer lane with send_input; if no useful lane exists, launch one bounded explorer subagent when that lookup can be isolated. Native explorer spawns must set agent_type=explorer, model=${explorerModel()}, and reasoning_effort=low. If Spark disappears from the native tool schema, treat that as model-catalog drift to repair, not as permission to inherit gpt-5.5 for grep work.`,
     "Explorer prompts must be narrow and self-contained: exact cwd, search target, allowed read-only scope, requested evidence format, and a concise return cap; ask for file:line evidence and a short synthesis, not raw dumps.",
     "For implementation, destructive actions, architectural decisions, or final approval, the leader remains responsible; subagents gather evidence and run bounded checks only.",
     `Respect the native child-agent cap (${cap}) by reusing relevant lanes first and launching at most one new native subagent at a time unless confirmed free slots and true independence justify another.`,
@@ -1463,13 +1533,20 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
 function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload = null, operations = null) {
   if (eventName !== "PreToolUse") return false;
   const ops = operations ?? agentOperations(payload ?? {}, name);
-  if (!hasSpawnOperation(ops)) return false;
+  const requestedSpawns = spawnOperationCount(ops);
+  if (requestedSpawns === 0) return false;
   if (hasExplorerModelRouteViolationInOperations(ops)) return true;
   if (isChildSession) return true;
   if (summary.native_edge_failed) return true;
-  if (summary.occupied >= cap) return true;
-  if (summary.tracked_occupied >= cap) return true;
-  if (summary.transcript_scanned && summary.transcript_occupied >= cap) return true;
+  if (summary.occupied + requestedSpawns > cap) return true;
+  if (summary.tracked_occupied + requestedSpawns > cap) return true;
+  if (
+    !summary.native_edge_authoritative
+    && summary.transcript_scanned
+    && summary.transcript_occupied + requestedSpawns > cap
+  ) {
+    return true;
+  }
   return Boolean(summary.cap_hit_after_last_close);
 }
 
@@ -1485,8 +1562,10 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
 function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payload = null, operations = null) {
   const ops = operations ?? agentOperations(payload ?? {}, "");
   const explorerModelRouteViolation = hasExplorerModelRouteViolationInOperations(ops);
+  const requestedSpawns = spawnOperationCount(ops);
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
+    `requested_spawns=${requestedSpawns}`,
     `ledger=${summary.tracked_occupied}`,
     `transcript_fallback=${summary.transcript_occupied}`,
     `native_current=${nativeEdgeSummary(summary)}`,
@@ -1500,7 +1579,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const context = [
     parts.join(", ") + ".",
     explorerModelRouteViolation
-      ? `Explorer native spawn is blocked until tool input explicitly sets model=${EXPLORER_MODEL} and reasoning_effort=low. Do not inherit gpt-5.5 for read-only lookup; Spark is the configured explorer/fast model.`
+      ? `Explorer native spawn is blocked until tool input explicitly sets model=${explorerModel()} and reasoning_effort=low. Do not inherit gpt-5.5 for read-only lookup; Spark is the configured explorer/fast model.`
       : null,
     blockSpawn && isChildSession
       ? "Nested native spawn is blocked: child sessions must not create subagents. Finish the assigned slice locally and report any needed follow-up delegation to the parent leader."
@@ -1664,33 +1743,52 @@ async function main() {
       let blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
 
       if (isPreSpawn && !blockSpawn) {
-        reserveSpawnSlot(session, payload, nowMs, nowIso);
+        reserveSpawnSlot(session, payload, nowMs, nowIso, spawnOperationCount(operations));
         summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs);
       }
 
       if (eventName === "PostToolUse") {
-        const normalized = normalizeToolName(name);
-        if (normalized === "spawn_agent") {
-          clearSpawnReservation(session, payload);
-          markSpawned(session, payload, nowIso);
-          for (const id of collectSpawnedAgentIds(payload)) transcriptPool.active.add(id);
-          if (textLooksSpawnCapacityFailure(responseText(payload))) {
-            session.last_cap_hit_at = nowIso;
+        let clearedSpawnReservation = false;
+        for (const operation of operations) {
+          const operationPayload = payloadForOperation(payload, operation);
+          if (operation.name === "spawn_agent") {
+            if (!clearedSpawnReservation) {
+              clearSpawnReservation(session, payload);
+              clearedSpawnReservation = true;
+            }
+            markSpawned(session, operationPayload, nowIso);
+            for (const id of collectSpawnedAgentIds(operationPayload)) transcriptPool.active.add(id);
+            if (textLooksSpawnCapacityFailure(responseText(operationPayload))) {
+              session.last_cap_hit_at = nowIso;
+            }
+            continue;
           }
-        }
-        if (normalized === "wait_agent") markWaited(session, payload, nowIso);
-        if (normalized === "close_agent") {
-          const closedIds = markClosed(session, payload);
+          if (operation.name === "wait_agent") {
+            markWaited(session, operationPayload, nowIso);
+            continue;
+          }
+          if (operation.name !== "close_agent") continue;
+
+          const closedIds = markClosed(session, operationPayload);
           if (closedIds.length > 0) {
-            await repairClosedNativeEdges(identity.poolThreadId, closedIds);
+            const changedNativeRows = await repairClosedNativeEdges(identity.poolThreadId, closedIds);
             for (const id of closedIds) {
-              nativeThreadEdges.active?.delete(id);
-              nativeThreadEdges.terminal?.delete(id);
-              nativeThreadEdges.closed?.add(id);
+              const wasNativeOpen = nativeThreadEdges.active?.has(id) || nativeThreadEdges.terminal?.has(id);
+              if (changedNativeRows > 0 || !wasNativeOpen) {
+                nativeThreadEdges.active?.delete(id);
+                nativeThreadEdges.terminal?.delete(id);
+                nativeThreadEdges.closed?.add(id);
+              } else {
+                await appendAdvisorLog({
+                  event: "native_edge_close_repair_missed",
+                  parent_thread_id: identity.poolThreadId,
+                  child_thread_id: id,
+                });
+              }
             }
             session.last_close_at = nowIso;
             for (const id of closedIds) transcriptPool.active.delete(id);
-          } else if (closeLooksFailed(payload)) {
+          } else if (closeLooksFailed(operationPayload)) {
             session.last_close_failed_at = nowIso;
           }
         }
