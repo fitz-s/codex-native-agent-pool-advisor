@@ -633,16 +633,21 @@ function sqlString(value) {
 }
 
 function parseSqliteJsonOutput(stdout) {
-  const jsonLine = safeString(stdout)
-    .trim()
-    .split(/\r?\n/)
-    .reverse()
-    .find((line) => line.trim().startsWith("["));
+  const text = safeString(stdout).trim();
+  if (!text) return [];
   try {
-    return JSON.parse(jsonLine || "[]");
+    return JSON.parse(text);
   } catch {
-    return [];
+    const lastArray = text.lastIndexOf("\n[");
+    if (lastArray >= 0) {
+      try {
+        return JSON.parse(text.slice(lastArray + 1));
+      } catch {
+        return [];
+      }
+    }
   }
+  return [];
 }
 
 async function transcriptHasTaskComplete(path) {
@@ -761,7 +766,7 @@ async function discoverNativeThreadEdges(parentThreadId) {
       timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
       maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
     });
-    const rows = JSON.parse(stdout.trim() || "[]");
+    const rows = parseSqliteJsonOutput(stdout);
     if (!Array.isArray(rows)) return edges;
 
     edges.checked = true;
@@ -783,9 +788,10 @@ async function discoverNativeThreadEdges(parentThreadId) {
       if (status === "closed") {
         edges.closed.add(childId);
       } else {
-        edges.active.add(childId);
         if (await transcriptHasTaskComplete(safeString(row?.rollout_path).trim())) {
           edges.terminal.add(childId);
+        } else {
+          edges.active.add(childId);
         }
       }
     }
@@ -1302,7 +1308,7 @@ function formatTerminalLaneSummary(lane) {
 function terminalCloseTargetGuidance(summary) {
   const lanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
   if (lanes.length === 0) return "";
-  return `Reusable completed native child lanes still consume slots until close succeeds: ${lanes.map(formatTerminalLaneSummary).join(" | ")}. Evaluate lanes before spawning: same task/domain and compatible role/model -> send_input; related but role-mismatched -> use only if the prompt can stay bounded; unrelated/stale/wrong-model -> close_agent only when capacity is needed.`;
+  return `Stale completed native edge rows excluded from occupied budget: ${lanes.map(formatTerminalLaneSummary).join(" | ")}. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. If it is not reachable, use explicit reset/repair tooling rather than treating it as live capacity.`;
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
@@ -1395,7 +1401,7 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
   const nativeTerminal = new Set(nativeThreadEdges?.terminal ?? []);
   const nativeLanes = nativeThreadEdges?.lanes instanceof Map ? nativeThreadEdges.lanes : new Map();
   const nativeChecked = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
-  const nativeEdgeTotal = nativeClosed.size + nativeActive.size;
+  const nativeEdgeTotal = nativeClosed.size + nativeActive.size + nativeTerminal.size;
   const nativeAuthoritative = nativeChecked && (nativeEdgeTotal > 0 || resetAtMs > 0);
   const transcriptActive = new Set(transcriptPool.active ?? []);
   if (!nativeAuthoritative) {
@@ -1471,6 +1477,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   const ops = operations ?? agentOperations({}, name);
   if (ops.length === 0) return false;
   if (summary.terminal > 0) return true;
+  if ((summary.native_edge_terminal ?? 0) > 0) return true;
   const threshold = Math.max(1, cap - DEFAULT_WARN_REMAINING);
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
 }

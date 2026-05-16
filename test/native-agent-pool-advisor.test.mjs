@@ -47,6 +47,18 @@ async function createNativeTables(home) {
   );
 }
 
+async function writeTaskCompleteTranscript(home, id) {
+  const path = join(home, `${id}.jsonl`);
+  await writeFile(
+    path,
+    [
+      `{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"${id}"}}`,
+      '{"timestamp":"2026-05-16T08:00:02.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n"),
+  );
+  return path;
+}
+
 async function runHook(home, payload) {
   const child = spawn(process.execPath, [hookPath], {
     env: { ...process.env, CODEX_HOME: home },
@@ -129,6 +141,46 @@ test("blocks wrapped explorer spawn that would inherit the frontier model", asyn
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /gpt-5\.3-codex-spark/);
+  });
+});
+
+test("native open edges with task_complete transcripts are stale and do not exhaust capacity", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const values = [];
+    for (let index = 1; index <= 6; index += 1) {
+      const id = `child${index}`;
+      const path = await writeTaskCompleteTranscript(home, id);
+      values.push(`('parent1','${id}','open')`);
+      await sqlite(
+        home,
+        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',1778920000);`,
+      );
+    }
+    await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
+
+    const promptOutput = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "spawn agent status",
+    });
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=0\/6/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_current=open=0, terminal_open=6/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /excluded from occupied budget/);
+
+    const spawnOutput = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+    assert.notEqual(spawnOutput?.decision, "block");
+    assert.match(spawnOutput.hookSpecificOutput.additionalContext, /Native agent pool advisory: 1\/6/);
   });
 });
 

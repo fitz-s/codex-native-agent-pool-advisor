@@ -1,8 +1,21 @@
 {
   "name": "codex-native-agent-pool-advisor",
   "version": "0.1.0",
+  "description": "Codex Desktop hook that prevents native subagent pool cap drift and stale-open edge exhaustion.",
   "private": true,
   "type": "module",
+  "author": "Fitz",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "hooks/",
+    "scripts/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "check": "node --check hooks/native-agent-pool-advisor.mjs && node --check scripts/install.mjs && node --check scripts/reset-pool.mjs",
     "test": "node --test test/*.test.mjs"

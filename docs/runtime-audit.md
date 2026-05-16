@@ -22,9 +22,12 @@
 - Empty native-edge tables are not treated as current truth unless an explicit reset marker exists.
 - Transcript and child-session fallback ignore events older than the reset marker.
 - General evidence collection does not repair native edges. Only successful `PostToolUse(close_agent)` can mark a native edge closed.
-- Terminal-open lanes are surfaced as reusable completed lanes with explicit `close_agent target=<id>` cleanup candidates.
+- Current-session terminal lanes still consume local budget until `close_agent` succeeds.
+- Native SQLite `open` edges whose child transcript has `task_complete` are stale terminal-open edges: they are excluded from occupied capacity and surfaced with explicit `close_agent target=<id>` or reset guidance.
 - If the advisor state lock or native edge query is unavailable during `PreToolUse(spawn_agent)`, the hook blocks conservatively.
 
 ## Remaining Risk
 
 The hook cannot prove that every future Codex Desktop spawn path will emit `PreToolUse`. That is why `UserPromptSubmit` still injects budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.
+
+The reset script intentionally mutates `thread_spawn_edges`. It should be treated as an operator repair command, not normal hook execution.

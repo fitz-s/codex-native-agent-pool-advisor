@@ -70,12 +70,14 @@ async function sqliteJson(dbPath, sql) {
     timeout: 5000,
     maxBuffer: 4 * 1024 * 1024,
   });
-  const jsonLine = stdout
-    .trim()
-    .split(/\r?\n/)
-    .reverse()
-    .find((line) => line.trim().startsWith("["));
-  return JSON.parse(jsonLine || "[]");
+  const text = stdout.trim();
+  if (!text) return [];
+  try {
+    return JSON.parse(text);
+  } catch {
+    const lastArray = text.lastIndexOf("\n[");
+    return JSON.parse(lastArray >= 0 ? text.slice(lastArray + 1) : "[]");
+  }
 }
 
 async function markReset(home, parent, resetAt) {
