@@ -1119,6 +1119,30 @@ function operationModel(operation) {
   return safeString(operation?.input?.model).trim();
 }
 
+function operationReasoningEffort(operation) {
+  return safeString(operation?.input?.reasoning_effort ?? operation?.input?.reasoningEffort).trim();
+}
+
+function operationPromptText(operation) {
+  const input = safeObject(operation?.input) ?? {};
+  const parts = [
+    input.message,
+    input.prompt,
+    input.task,
+    input.instructions,
+    input.input,
+  ].map(safeString).filter(Boolean);
+  if (Array.isArray(input.items)) {
+    for (const item of input.items) {
+      if (item && typeof item === "object") {
+        parts.push(safeString(item.text));
+        parts.push(safeString(item.name));
+      }
+    }
+  }
+  return parts.filter(Boolean).join("\n");
+}
+
 function hasSpawnOperation(operations) {
   return operations.some((operation) => operation.name === "spawn_agent");
 }
@@ -1132,6 +1156,50 @@ function hasExplorerModelRouteViolationInOperations(operations) {
     if (operation.name !== "spawn_agent") return false;
     if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
     return !explorerModels().includes(operationModel(operation));
+  });
+}
+
+function countMatches(text, pattern) {
+  return [...safeString(text).matchAll(pattern)].length;
+}
+
+function hasDistinctExplorerFallback() {
+  const preferred = explorerModel();
+  const fallback = explorerFallbackModel();
+  return Boolean(fallback && preferred && fallback !== preferred && explorerModels().includes(fallback));
+}
+
+function looksLikeComplexExplorerPrompt(text) {
+  const raw = safeString(text);
+  const normalized = raw.toLowerCase();
+  if (!normalized.trim()) return false;
+
+  const arrows = countMatches(raw, /(?:->|→)/g);
+  const fileRefs = countMatches(raw, /\b[\w./-]+\.(?:py|ts|tsx|js|mjs|json|toml|yaml|yml|md)\b/g);
+  const reasoningHits = countMatches(
+    normalized,
+    /\b(?:analy[sz]e|trace|classify|determine|whether|verify|validate|audit|review|root cause|policy|strategy|strategic|mathematical|math|sizing|discount|fallback|tests?|settings?|config|runtime|execution|posterior|kelly|semantic|intent|branch|end-to-end|e2e|verdict|conclusion)\b/g,
+  );
+  const hasDomainReasoningMarker = /(?:mathematic|strategic|posterior|kelly|execution-policy|policy mismatch|semantic|live order|limit price|fallbacks?)/i.test(raw);
+  const asksForClassification = /(?:return whether|classify|verdict|conclusion|is intended|bug|mismatch)/i.test(raw);
+
+  return (
+    raw.length > 900
+    || (arrows >= 2 && reasoningHits >= 3)
+    || (fileRefs >= 4 && reasoningHits >= 3)
+    || (hasDomainReasoningMarker && reasoningHits >= 3)
+    || (asksForClassification && reasoningHits >= 4)
+  );
+}
+
+function hasPreferredExplorerComplexityViolationInOperations(operations) {
+  if (!hasDistinctExplorerFallback()) return false;
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
+    if (operationModel(operation) !== explorerModel()) return false;
+    const effort = operationReasoningEffort(operation);
+    return (effort && effort !== "low") || looksLikeComplexExplorerPrompt(operationPromptText(operation));
   });
 }
 
@@ -1546,7 +1614,10 @@ function buildCapacityGuidance(eventName, cap, summary = null) {
 function buildDelegationGuidance(cap) {
   return [
     `Codex context hygiene delegation protocol: treat native subagents as the default context-isolation layer for broad repo lookup, file/symbol mapping, grep-like scans, lightweight review probes, and bounded verification; the leader should preserve main-thread context for judgment, integration, and final decisions.`,
-    `Before doing multiple broad rg/sed/cat reads in the leader context, reuse a compatible existing explorer lane with send_input; if no useful lane exists, launch one bounded explorer subagent when that lookup can be isolated. Native explorer spawns must set agent_type=explorer, model=${explorerModel()} when available, or fallback model=${explorerFallbackModel()} when the preferred model is unavailable; allowed explorer models are: ${explorerModelListText()}. Do not inherit a frontier model for read-only lookup.`,
+    `Explorer model routing: ${explorerModel()} is the preferred ultra-fast scan/probe lane. Use it for narrow read-only grep/file-map/symbol lookup/log filtering jobs with low reasoning, bounded file reads, and no final strategic verdict.`,
+    `${explorerFallbackModel()} is the reasoning explorer / light executor lane. Use it for multi-hop code-path traces, math or strategy classification, config+test synthesis, policy mismatch analysis, or any task likely to require many files, compacting, or a durable conclusion. For these tasks use reasoning_effort=medium or high, not low.`,
+    `Before doing multiple broad rg/sed/cat reads in the leader context, reuse a compatible existing explorer lane with send_input; if no useful lane exists, launch one bounded explorer subagent when that lookup can be isolated. Native explorer spawns must set agent_type=explorer and one of these allowed models: ${explorerModelListText()}. Do not inherit a frontier model for read-only lookup.`,
+    "If a task prompt says to trace A->B->C, inspect several named files plus tests/settings, and return whether the behavior is a bug or policy mismatch, route it to the reasoning explorer model or split it into smaller scan-only probes.",
     "Explorer prompts must be narrow and self-contained: exact cwd, search target, allowed read-only scope, requested evidence format, and a concise return cap; ask for file:line evidence and a short synthesis, not raw dumps.",
     "For implementation, destructive actions, architectural decisions, or final approval, the leader remains responsible; subagents gather evidence and run bounded checks only.",
     `Respect the native child-agent cap (${cap}) by reusing relevant lanes first and launching at most one new native subagent at a time unless confirmed free slots and true independence justify another.`,
@@ -1675,6 +1746,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
   if (hasExplorerModelRouteViolationInOperations(ops)) return true;
+  if (hasPreferredExplorerComplexityViolationInOperations(ops)) return true;
   if (isChildSession) return true;
   if (summary.native_edge_failed) return true;
   if (summary.occupied + requestedSpawns > cap) return true;
@@ -1701,6 +1773,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
 function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payload = null, operations = null) {
   const ops = operations ?? agentOperations(payload ?? {}, "");
   const explorerModelRouteViolation = hasExplorerModelRouteViolationInOperations(ops);
+  const preferredExplorerComplexityViolation = hasPreferredExplorerComplexityViolationInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
@@ -1718,14 +1791,17 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const context = [
     parts.join(", ") + ".",
     explorerModelRouteViolation
-      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}) and reasoning_effort=low. Prefer ${explorerModel()}; use ${explorerFallbackModel()} as the fallback when the preferred model is unavailable. Do not inherit a frontier model for read-only lookup.`
+      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} with reasoning_effort=low for narrow scan/probe work; use ${explorerFallbackModel()} with reasoning_effort=medium/high for multi-hop analysis or light executor work. Do not inherit a frontier model for read-only lookup.`
+      : null,
+    preferredExplorerComplexityViolation
+      ? `This explorer route is too complex or high-effort for the preferred ultra-fast scan lane ${explorerModel()}: it asks for multi-hop tracing, tests/config synthesis, a final bug/policy classification, or non-low reasoning. Use ${explorerFallbackModel()} with reasoning_effort=medium/high, or split the job into narrow ${explorerModel()} scan probes that only return file:line anchors.`
       : null,
     blockSpawn && isChildSession
       ? "Nested native spawn is blocked: child sessions must not create subagents. Finish the assigned slice locally and report any needed follow-up delegation to the parent leader."
       : null,
 	    blockSpawn
-	      ? (explorerModelRouteViolation
-	          ? "Retry at most one explorer spawn after correcting the model override, and only if remaining_spawn_budget is still positive."
+	      ? (explorerModelRouteViolation || preferredExplorerComplexityViolation
+	          ? "Retry at most one explorer spawn after correcting the model/effort route, and only if remaining_spawn_budget is still positive."
 	          : isChildSession
 	          ? "Do not restate or retry the nested spawn prompt. Continue the child task locally; the parent leader decides any follow-up delegation."
 	          : (summary.cap_hit_after_last_close

@@ -25,7 +25,8 @@
 - General evidence collection does not repair native edges. Only successful `PostToolUse(close_agent)` can mark a native edge closed.
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
-- Explorer model routing is an allow-list, not a single hard-coded model. The default is Spark plus mini fallback; installations can override model names in config or env.
+- Explorer model routing is an allow-list plus a task-shape guard, not a single hard-coded model. The default is Spark for low-reasoning scan probes plus mini for reasoning explorer / light executor fallback; installations can override model names in config or env.
+- Complex explorer prompts are blocked on the Spark/preferred scan lane when they ask for multi-hop tracing, several named files plus tests/settings, final bug/policy classification, or non-low reasoning. The hook tells the agent to use mini or split the job into narrow Spark probes.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
 - Native SQLite `open` edges whose child transcript has `task_complete` are stale terminal-open edges: they are excluded from occupied capacity and surfaced with explicit `close_agent target=<id>` or reset guidance.
 - If the advisor state lock or native edge query is unavailable during `PreToolUse(spawn_agent)`, the hook blocks conservatively.

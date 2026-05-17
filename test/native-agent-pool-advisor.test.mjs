@@ -192,6 +192,55 @@ test("allows mini fallback model for explorer spawns by default", async () => {
   });
 });
 
+test("blocks complex spark explorer prompt and routes it to mini", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: [
+          "Read-only investigation in /repo.",
+          "Task: analyze whether submitted live order prices were mathematically/strategically correct or too far below ask to ever fill.",
+          "Trace posterior -> snapshot VWMP/best ask -> compute_native_limit_price -> passive/marketable branch -> Kelly sizing and discounts/fallbacks.",
+          "Inspect src/engine/cycle_runtime.py, src/contracts/semantic_types.py, src/contracts/execution_intent.py, src/engine/evaluator.py, settings, and tests.",
+          "Return whether this is intended post_only maker behavior, a limit price math bug, a Kelly/discount fallback, or an execution-policy mismatch.",
+        ].join(" "),
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /too complex or high-effort/);
+    assert.match(output.reason, /gpt-5\.4-mini/);
+    assert.match(output.reason, /split the job into narrow gpt-5\.3-codex-spark scan probes/);
+  });
+});
+
+test("blocks non-low reasoning on spark explorer route", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "medium",
+        message: "Find all references to compute_native_limit_price.",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /non-low reasoning/);
+    assert.match(output.reason, /gpt-5\.4-mini/);
+  });
+});
+
 test("explorer model allow-list can be customized by advisor config", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

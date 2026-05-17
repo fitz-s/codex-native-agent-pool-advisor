@@ -389,6 +389,10 @@
               <p>Requires read-only explorer work to use a configured fast model lane instead of inheriting a frontier model.</p>
             </article>
             <article class="card">
+              <h3>Wrong model for the task</h3>
+              <p>Blocks complex multi-hop investigations from running on the ultra-fast scan lane when the reasoning explorer lane is available.</p>
+            </article>
+            <article class="card">
               <h3>Destructive reset drift</h3>
               <p>Uses dry-run force tokens before clearing native edge state.</p>
             </article>
@@ -415,6 +419,20 @@ node scripts/doctor.mjs</pre>
           <div class="section-heading">
             <h2>Configure the non-universal parts</h2>
             <p>Model catalogs, state DB names, and fallback policies vary by Codex install. Keep them outside the hook logic.</p>
+          </div>
+          <div class="grid" style="margin-bottom: 22px;">
+            <article class="card">
+              <h3>Spark scan lane</h3>
+              <p><code>gpt-5.3-codex-spark</code> is treated as the ultra-fast low-reasoning lane for grep, file maps, symbol lookup, log filtering, and file:line anchor collection.</p>
+            </article>
+            <article class="card">
+              <h3>Mini reasoning lane</h3>
+              <p><code>gpt-5.4-mini</code> is treated as the reasoning explorer / light executor lane for multi-hop traces, math or strategy classification, tests+config synthesis, and compact-prone reports.</p>
+            </article>
+            <article class="card">
+              <h3>Automatic guard</h3>
+              <p>If a Spark prompt asks to trace A to B to C, inspect many files plus tests, and return a bug/policy verdict, the hook tells Codex to use mini or split the task into narrow Spark probes.</p>
+            </article>
           </div>
           <div class="split">
             <table class="config-table">

@@ -14,6 +14,7 @@ Project page: <https://fitz-s.github.io/codex-native-agent-pool-advisor/>
 - The hook only mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence.
 - Empty `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
 - The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
+- Spark is treated as an ultra-fast scan/probe lane, not a general reasoning lane. Mini is treated as the reasoning explorer / light executor lane.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
@@ -34,6 +35,15 @@ node scripts/doctor.mjs
 The installer copies `hooks/native-agent-pool-advisor.mjs` to `~/.codex/hooks/` and registers it for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
 
 The installer is idempotent: repeated installs should leave one registration per hook event.
+
+## Model Routing
+
+| Model lane | Use for | Do not use for |
+| --- | --- | --- |
+| `gpt-5.3-codex-spark` | Ultra-fast read-only probes: grep/file maps, symbol lookup, log filtering, candidate file:line anchors, small bounded scans. Use `reasoning_effort=low`. | Multi-hop code-path tracing, math/strategy classification, tests+config synthesis, policy mismatch diagnosis, or anything likely to compact repeatedly. |
+| `gpt-5.4-mini` | Reasoning explorer / light executor work: multi-file trace, semantic classification, config+test synthesis, small fixes, and reports that need a durable conclusion. Use `reasoning_effort=medium` or `high` when the task asks for judgment. | Frontier-grade architecture/security approval or high-risk implementation. |
+
+The hook blocks obvious Spark misuse when an explorer prompt asks for multi-hop tracing, several named files plus tests/settings, or a final bug/policy verdict. Split that work into narrow Spark probes or route it to mini.
 
 ## Configuration
 
