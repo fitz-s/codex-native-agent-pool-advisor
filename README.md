@@ -1,6 +1,6 @@
 # Codex Native Agent Pool Advisor
 
-Guardrail hook for Codex Desktop native subagents. It keeps the parent-thread subagent budget visible, blocks capacity-collision spawns, blocks recursive child-agent spawning, and routes read-only explorer lanes onto configured fast models.
+Guardrail hook for Codex Desktop native subagents. It keeps the parent-thread subagent budget visible, blocks capacity-collision spawns, blocks recursive child-agent spawning, and nudges read-only explorer lanes toward explicit, configured models.
 
 Project page: <https://fitz-s.github.io/codex-native-agent-pool-advisor/>
 
@@ -14,7 +14,8 @@ Project page: <https://fitz-s.github.io/codex-native-agent-pool-advisor/>
 - The hook only mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence.
 - Empty `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
 - The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
-- Spark is treated as an ultra-fast scan/probe lane, not a general reasoning lane. Mini is treated as the reasoning explorer / light executor lane.
+- Spark is treated as a near-instant scout lane that can support complex workflows when its output contract is bounded evidence, anchors, or hypotheses. Mini is treated as a reasoning explorer / light executor lane.
+- The hook does not block Spark because a prompt looks "complex"; it emits contract guidance and lets the parent agent choose.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
@@ -38,12 +39,23 @@ The installer is idempotent: repeated installs should leave one registration per
 
 ## Model Routing
 
-| Model lane | Use for | Do not use for |
+| Model lane | Use for | Boundary |
 | --- | --- | --- |
-| `gpt-5.3-codex-spark` | Ultra-fast read-only probes: grep/file maps, symbol lookup, log filtering, candidate file:line anchors, small bounded scans. Use `reasoning_effort=low`. | Multi-hop code-path tracing, math/strategy classification, tests+config synthesis, policy mismatch diagnosis, or anything likely to compact repeatedly. |
-| `gpt-5.4-mini` | Reasoning explorer / light executor work: multi-file trace, semantic classification, config+test synthesis, small fixes, and reports that need a durable conclusion. Use `reasoning_effort=medium` or `high` when the task asks for judgment. | Frontier-grade architecture/security approval or high-risk implementation. |
+| `gpt-5.3-codex-spark` | Near-instant scout work: grep/file maps, symbol lookup, log filtering, candidate file:line anchors, hypothesis sampling, bounded large-text scans, and fast evidence collection inside larger reasoning workflows. Usually `reasoning_effort=low`, but non-low effort is allowed when intentional. | Do not ask it to own final approval, broad synthesis, edits, or repeated compaction. If the task expands, it should stop and return anchors plus an escalation recommendation. |
+| `gpt-5.4-mini` | Reasoning explorer / light executor work: multi-hop code-path traces, semantic classification, config+test synthesis, small low-risk fixes, compact evidence reports, and bounded verification that needs a durable conclusion. Use `reasoning_effort=medium` or `high` when judgment matters. | Not the default for disposable grep if Spark is available. Do not use as final authority for architecture, security, live-money, or high-risk implementation. |
 
-The hook blocks obvious Spark misuse when an explorer prompt asks for multi-hop tracing, several named files plus tests/settings, or a final bug/policy verdict. Split that work into narrow Spark probes or route it to mini.
+Route by output contract, risk, and context-state depth, not by complexity adjectives. A complex parent task can use Spark well if the child prompt asks for bounded scout output such as "return 12 file:line anchors and stop." A mini lane is better when the child owns synthesis, a small edit, or a durable low-risk verification result.
+
+The hook still blocks explorer spawns that omit an allowed model, because inherited frontier lookup burns the main resource silently. It only advises when a Spark or mini prompt looks mismatched to the lane.
+
+## Design Basis
+
+This project follows OpenAI's public agent guidance rather than a local complexity heuristic:
+
+- Codex subagents are recommended for independent read-heavy work such as exploration, tests, triage, and summarization, while write-heavy parallelism needs more care: <https://developers.openai.com/codex/concepts/subagents>
+- Codex model choice should vary by agent role and reasoning need. The same page describes `gpt-5.4-mini` as a fast, efficient choice for exploration, large-file review, and parallel workers, and `gpt-5.3-codex-spark` as a low-latency research-preview option.
+- Agents SDK guidance recommends explicit per-agent model selection and mixed model sizes when fast triage agents and deeper specialists coexist: <https://developers.openai.com/api/docs/guides/agents/models>
+- Community reports about large repos and context compaction point in the same direction: use cheaper/faster subagents for exploration and summarization, but keep synthesis and final judgment bounded and observable.
 
 ## Configuration
 
@@ -123,7 +135,7 @@ npm run check
 npm test
 ```
 
-The test suite covers wrapper-spawn blocking, Spark route enforcement, reset-aware transcript fallback, close-agent release semantics, and explicit reset markers.
+The test suite covers wrapper-spawn blocking, explicit explorer model enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, and explicit reset markers.
 
 ## Known Limits
 

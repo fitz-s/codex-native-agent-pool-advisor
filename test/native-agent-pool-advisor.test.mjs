@@ -192,7 +192,7 @@ test("allows mini fallback model for explorer spawns by default", async () => {
   });
 });
 
-test("blocks complex spark explorer prompt and routes it to mini", async () => {
+test("advises on broad spark explorer prompts without blocking the spawn", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const output = await runHook(home, {
@@ -213,14 +213,14 @@ test("blocks complex spark explorer prompt and routes it to mini", async () => {
       },
     });
 
-    assert.equal(output.decision, "block");
-    assert.match(output.reason, /too complex or high-effort/);
-    assert.match(output.reason, /gpt-5\.4-mini/);
-    assert.match(output.reason, /split the job into narrow gpt-5\.3-codex-spark scan probes/);
+    assert.notEqual(output?.decision, "block");
+    assert.match(output.hookSpecificOutput.additionalContext, /Explorer route advisory, not a block/);
+    assert.match(output.hookSpecificOutput.additionalContext, /scout\/anchor collection/);
+    assert.match(output.hookSpecificOutput.additionalContext, /gpt-5\.4-mini/);
   });
 });
 
-test("blocks non-low reasoning on spark explorer route", async () => {
+test("advises on non-low reasoning spark explorer route without blocking", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const output = await runHook(home, {
@@ -235,9 +235,31 @@ test("blocks non-low reasoning on spark explorer route", async () => {
       },
     });
 
-    assert.equal(output.decision, "block");
-    assert.match(output.reason, /non-low reasoning/);
-    assert.match(output.reason, /gpt-5\.4-mini/);
+    assert.notEqual(output?.decision, "block");
+    assert.match(output.hookSpecificOutput.additionalContext, /Explorer route advisory, not a block/);
+    assert.match(output.hookSpecificOutput.additionalContext, /output contract is scout\/anchor collection/);
+    assert.match(output.hookSpecificOutput.additionalContext, /gpt-5\.4-mini/);
+  });
+});
+
+test("advises when mini is used for disposable narrow scans but still allows it", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "low",
+        message: "Find all references to compute_native_limit_price.",
+      },
+    });
+
+    assert.notEqual(output?.decision, "block");
+    assert.match(output.hookSpecificOutput.additionalContext, /narrow scan/);
+    assert.match(output.hookSpecificOutput.additionalContext, /gpt-5\.3-codex-spark/);
   });
 });
 

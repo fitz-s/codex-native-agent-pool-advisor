@@ -389,8 +389,8 @@
               <p>Requires read-only explorer work to use a configured fast model lane instead of inheriting a frontier model.</p>
             </article>
             <article class="card">
-              <h3>Wrong model for the task</h3>
-              <p>Blocks complex multi-hop investigations from running on the ultra-fast scan lane when the reasoning explorer lane is available.</p>
+              <h3>Contract drift</h3>
+              <p>Advises when a prompt asks a scout lane to own synthesis, edits, approval, or repeated compaction.</p>
             </article>
             <article class="card">
               <h3>Destructive reset drift</h3>
@@ -423,15 +423,15 @@ node scripts/doctor.mjs</pre>
           <div class="grid" style="margin-bottom: 22px;">
             <article class="card">
               <h3>Spark scan lane</h3>
-              <p><code>gpt-5.3-codex-spark</code> is treated as the ultra-fast low-reasoning lane for grep, file maps, symbol lookup, log filtering, and file:line anchor collection.</p>
+              <p><code>gpt-5.3-codex-spark</code> is treated as the near-instant scout lane for grep, file maps, symbol lookup, log filtering, file:line anchors, and fast hypothesis probes inside larger workflows.</p>
             </article>
             <article class="card">
               <h3>Mini reasoning lane</h3>
-              <p><code>gpt-5.4-mini</code> is treated as the reasoning explorer / light executor lane for multi-hop traces, math or strategy classification, tests+config synthesis, and compact-prone reports.</p>
+              <p><code>gpt-5.4-mini</code> is treated as the reasoning explorer / light executor lane for multi-hop traces, compact synthesis, small low-risk edits, and bounded verification.</p>
             </article>
             <article class="card">
-              <h3>Automatic guard</h3>
-              <p>If a Spark prompt asks to trace A to B to C, inspect many files plus tests, and return a bug/policy verdict, the hook tells Codex to use mini or split the task into narrow Spark probes.</p>
+              <h3>Advisory contract</h3>
+              <p>The hook does not block Spark because a task sounds complex. It asks the parent to cap scope/output, return anchors, or escalate synthesis to mini/frontier.</p>
             </article>
           </div>
           <div class="split">
@@ -471,6 +471,27 @@ node scripts/doctor.mjs</pre>
   }
 }</pre>
             </div>
+          </div>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>Route by contract</h2>
+            <p>OpenAI's agent guidance points to explicit model choice per specialist and mixed model sizes in the same workflow. This hook follows that shape: it blocks missing explicit explorer models, but it only advises on Spark/Mini contract fit.</p>
+          </div>
+          <div class="grid">
+            <article class="card">
+              <h3>Official basis</h3>
+              <p>Codex subagents are useful for read-heavy exploration, triage, tests, and summarization; model and reasoning settings should differ by agent need.</p>
+            </article>
+            <article class="card">
+              <h3>Community pressure</h3>
+              <p>Large repositories and compaction-heavy investigations need cheaper context-isolated exploration lanes before the leader spends frontier context.</p>
+            </article>
+            <article class="card">
+              <h3>Hook boundary</h3>
+              <p>The hook enforces observable runtime safety. It does not decide whether Spark, mini, or frontier owns the next reasoning step.</p>
+            </article>
           </div>
         </section>
 
