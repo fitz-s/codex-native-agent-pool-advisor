@@ -22,7 +22,7 @@ Model routing is secondary. The hook can nudge explorer prompts toward explicit 
 - Works with Codex Desktop and Codex CLI when they read the same `~/.codex/hooks.json`, hook events, and native SQLite state layout.
 - Uses `CODEX_HOME` when set; otherwise defaults to `~/.codex`.
 - Reads native pool state from `state_5.sqlite` by default. Override the DB name/path if a Codex build moves it.
-- Installs for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`; run `node scripts/doctor.mjs` after install to confirm the active runtime is actually using this hook.
+- Installs for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`; run `node scripts/doctor.mjs` after install to confirm the active runtime is actually using this hook.
 
 ## Runtime Model
 
@@ -54,7 +54,7 @@ node scripts/install.mjs
 node scripts/doctor.mjs
 ```
 
-The installer copies `hooks/native-agent-pool-advisor.mjs` to `$CODEX_HOME/hooks/` and registers it for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
+The installer copies `hooks/native-agent-pool-advisor.mjs` to `$CODEX_HOME/hooks/` and registers it for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
 
 The installer is idempotent: repeated installs should leave one registration per hook event.
 
@@ -161,6 +161,6 @@ The test suite covers wrapper-spawn blocking, explicit explorer model enforcemen
 ## Known Limits
 
 - This hook is intentionally fail-open on unexpected internal errors so it does not break ordinary Codex tool execution. It blocks only when it has enough state to identify an unsafe spawn, a recursive child spawn, a lock/contention risk, or a model-route violation.
-- If a Codex Desktop or CLI spawn surface bypasses `PreToolUse` entirely, the hook cannot block it in-process; `UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback.
+- If a Codex Desktop or CLI spawn surface bypasses `PreToolUse` entirely, the hook cannot block it in-process; `SessionStart`/`UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback. `SessionStart` is especially important after compaction/resume, when a model may continue work without a fresh user prompt.
 - Historical `hooks.json` backups and setup restore paths can replay old hook stacks. See `docs/runtime-audit.md`.
 - This hook is a launch/capacity guard, not a delegation decision maker.

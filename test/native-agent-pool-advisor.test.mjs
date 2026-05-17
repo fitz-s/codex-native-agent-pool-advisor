@@ -715,12 +715,31 @@ test("max_threads is read from the agents TOML section only", async () => {
   }, "[unrelated]\nmax_threads = 99\n\n[agents]\nmax_threads = 4\n");
 });
 
+test("session start emits cap pressure after resume before a spawn is attempted", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','a1','open'),('parent1','a2','open'),('parent1','a3','open'),('parent1','a4','open'),('parent1','a5','open'),('parent1','a6','open');",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "SessionStart",
+      session_id: "parent1",
+    });
+
+    assert.match(output.hookSpecificOutput.additionalContext, /occupied=6\/6/);
+    assert.match(output.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
+    assert.match(output.hookSpecificOutput.additionalContext, /When remaining_spawn_budget is 0, do not call spawn_agent/);
+  });
+});
+
 test("installer is idempotent for existing hooks.json", async () => {
   await withHome(async (home) => {
     await runScript(installPath, home);
     await runScript(installPath, home);
     const config = JSON.parse(await readFile(join(home, "hooks.json"), "utf-8"));
-    for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+    for (const eventName of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
       const count = config.hooks[eventName]
         .flatMap((entry) => entry.hooks ?? [])
         .filter((hook) => hook.command.includes("native-agent-pool-advisor.mjs")).length;
@@ -735,15 +754,16 @@ test("doctor validates install and uninstall removes advisor registrations", asy
     await runScript(installPath, home);
     const doctor = JSON.parse((await runScript(doctorPath, home)).stdout);
     assert.equal(doctor.ok, true);
+    assert.equal(doctor.checks.registrations.SessionStart, 1);
     assert.equal(doctor.checks.registrations.UserPromptSubmit, 1);
 
     const dryRun = JSON.parse((await runScript(uninstallPath, home, ["--dry-run"])).stdout);
-    assert.equal(dryRun.removed_registrations, 3);
+    assert.equal(dryRun.removed_registrations, 4);
 
     const removed = JSON.parse((await runScript(uninstallPath, home)).stdout);
-    assert.equal(removed.removed_registrations, 3);
+    assert.equal(removed.removed_registrations, 4);
     const config = JSON.parse(await readFile(join(home, "hooks.json"), "utf-8"));
-    for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+    for (const eventName of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
       const entries = Array.isArray(config.hooks?.[eventName]) ? config.hooks[eventName] : [];
       const count = entries
         .flatMap((entry) => entry.hooks ?? [])

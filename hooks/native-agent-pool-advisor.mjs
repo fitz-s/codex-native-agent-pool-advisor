@@ -1551,6 +1551,17 @@ function hasPromptCapacityPressure(summary) {
 function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSession, promptSummary = null, cap = DEFAULT_AGENT_CAP) {
   if (eventName === "SessionStart") {
     if (isChildSession) return false;
+    const criticalPressure = Boolean(
+      promptSummary
+        && (
+          remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
+          || promptSummary.cap_hit_after_last_close
+          || promptSummary.failed_closes > 0
+          || promptSummary.pending_spawn_reservations > 0
+          || (promptSummary.native_edge_overflow ?? 0) > 0
+        ),
+    );
+    if (criticalPressure) return true;
     const last = msFromIso(session.last_capacity_session_guidance_at);
     return !last || nowMs - last > SESSION_CAPACITY_GUIDANCE_TTL_MS;
   }
@@ -2047,9 +2058,8 @@ async function main() {
 
       const prompt = promptText(payload);
       if (eventName === "SessionStart" || eventName === "UserPromptSubmit") {
-        if (eventName === "SessionStart" && !isManagedBridgeInvocation()) return;
         let promptSummary = null;
-        if (eventName === "UserPromptSubmit") {
+        if (eventName === "SessionStart" || eventName === "UserPromptSubmit") {
           const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
           const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
           applyTranscriptEvidenceToSession(session, transcriptPool);

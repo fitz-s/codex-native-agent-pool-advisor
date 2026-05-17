@@ -26,6 +26,7 @@
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as unresolved/overflow evidence, not as `occupied > cap`.
+- `SessionStart` is a first-class guidance surface. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
 - Explorer model routing is an allow-list plus advisory contract guidance, not a single hard-coded model and not a task-shape blocker. The default is Spark for near-instant scout/probe work plus mini for reasoning explorer / light executor work; installations can override model names in config or env.
 - Complex explorer prompts on Spark are allowed when Spark is used as a bounded scout/anchor collector. The hook only advises the agent to cap scope/output or escalate synthesis/edit/final-approval follow-up to mini or a frontier reviewer.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
@@ -35,7 +36,7 @@
 
 ## Remaining Risk
 
-The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. That is why `UserPromptSubmit` still injects budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.
+The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. That is why `SessionStart` and `UserPromptSubmit` both inject budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.
 
 The reset script intentionally mutates `thread_spawn_edges`. It should be treated as an operator repair command, not normal hook execution.
 
