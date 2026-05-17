@@ -1615,7 +1615,7 @@ function formatTerminalLaneSummary(lane) {
 function terminalCloseTargetGuidance(summary) {
   const lanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
   if (lanes.length === 0) return "";
-  return `Stale completed native edge rows excluded from occupied budget: ${lanes.map(formatTerminalLaneSummary).join(" | ")}. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. If it is not reachable, use explicit reset/repair tooling rather than treating it as live capacity.`;
+  return `Completed native edge rows still occupy the native pool until close_agent succeeds or explicit reset/repair removes the edge: ${lanes.map(formatTerminalLaneSummary).join(" | ")}. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. If it is not reachable, use explicit reset/repair tooling before spawning more agents.`;
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
@@ -1724,7 +1724,7 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
   }
 
   const transcriptOccupied = transcriptActive.size;
-  const nativeOccupied = nativeActive.size;
+  const nativeOccupied = nativeActive.size + nativeTerminal.size;
   const trackedOccupied = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
   const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
   const evidenceOccupied = nativeAuthoritative ? nativeOccupied : transcriptOccupied;

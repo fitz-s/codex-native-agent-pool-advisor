@@ -345,7 +345,7 @@ test("blocks wrapped multi-spawn when requested spawn count exceeds remaining ca
   });
 });
 
-test("native open edges with task_complete transcripts are stale and do not exhaust capacity", async () => {
+test("native open edges with task_complete transcripts still occupy capacity until closed", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const values = [];
@@ -365,9 +365,10 @@ test("native open edges with task_complete transcripts are stale and do not exha
       session_id: "parent1",
       prompt: "spawn agent status",
     });
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=0\/6/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=6\/6/);
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_current=open=0, terminal_open=6/);
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /excluded from occupied budget/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /still occupy the native pool until close_agent succeeds/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
 
     const spawnOutput = await runHook(home, {
       hook_event_name: "PreToolUse",
@@ -380,8 +381,9 @@ test("native open edges with task_complete transcripts are stale and do not exha
         message: "map files",
       },
     });
-    assert.notEqual(spawnOutput?.decision, "block");
-    assert.match(spawnOutput.hookSpecificOutput.additionalContext, /Native agent pool advisory: 1\/6/);
+    assert.equal(spawnOutput.decision, "block");
+    assert.match(spawnOutput.reason, /6\/6/);
+    assert.match(spawnOutput.reason, /terminal_open=6/);
   });
 });
 
