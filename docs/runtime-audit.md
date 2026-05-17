@@ -6,7 +6,7 @@
 - Active advisor path: `~/.codex/hooks/native-agent-pool-advisor.mjs`.
 - Advisor state: `~/.codex/state/native-agent-pool-advisor.json`.
 - Optional advisor config: `~/.codex/native-agent-pool-advisor.config.json`.
-- Native Desktop state: `~/.codex/state_5.sqlite`, especially `thread_spawn_edges`.
+- Native Codex state: `~/.codex/state_5.sqlite`, especially `thread_spawn_edges`.
 - Native cap: `~/.codex/config.toml` `[agents].max_threads`.
 
 ## Hidden Branches
@@ -34,7 +34,7 @@
 
 ## Remaining Risk
 
-The hook cannot prove that every future Codex Desktop spawn path will emit `PreToolUse`. That is why `UserPromptSubmit` still injects budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.
+The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. That is why `UserPromptSubmit` still injects budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.
 
 The reset script intentionally mutates `thread_spawn_edges`. It should be treated as an operator repair command, not normal hook execution.
 
