@@ -69,7 +69,7 @@ async function main() {
   const config = await readJsonOrDefault(hooksPath, { hooks: {} });
   const command = hookCommand(home);
   let changed = false;
-  for (const eventName of ["UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
+  for (const eventName of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"]) {
     changed = ensureHook(config, eventName, command) || changed;
   }
   if (changed || !(await pathExists(hooksPath))) await writeJsonAtomic(hooksPath, config);

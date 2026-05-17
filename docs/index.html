@@ -386,7 +386,7 @@
             </article>
             <article class="card">
               <h3>Stale open rows</h3>
-              <p>Excludes native open edges only when the child transcript has structured completion evidence.</p>
+              <p>Keeps occupied capped at the native limit and reports extra open rows as close or reset candidates.</p>
             </article>
             <article class="card">
               <h3>Recursive delegation</h3>
@@ -427,7 +427,7 @@ node scripts/doctor.mjs</pre>
           <div class="grid" style="margin-bottom: 22px;">
             <article class="card">
               <h3>Shared hook runtime</h3>
-              <p>The installer writes to <code>$CODEX_HOME/hooks/</code> and registers <code>UserPromptSubmit</code>, <code>PreToolUse</code>, and <code>PostToolUse</code>.</p>
+              <p>The installer writes to <code>$CODEX_HOME/hooks/</code> and registers <code>SessionStart</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, and <code>PostToolUse</code>.</p>
             </article>
             <article class="card">
               <h3>Native state source</h3>
@@ -435,7 +435,7 @@ node scripts/doctor.mjs</pre>
             </article>
             <article class="card">
               <h3>Model advisory</h3>
-              <p>Explorer model hints are secondary. The primary guard is still the six-slot pool budget and stale-open accounting.</p>
+              <p>Explorer model hints are secondary. The primary guard is still the six-slot pool budget, exact close accounting, and stale-open diagnosis.</p>
             </article>
           </div>
           <div class="split">

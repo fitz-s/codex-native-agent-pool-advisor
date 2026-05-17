@@ -13,7 +13,7 @@ Codex can delegate work to native subagents, but the pool limit is easy for the 
 3. The leader explains the failure, closes several agents, restates the prompt, or tries a different batch.
 4. The thread loses context budget and attention before any useful review, verification, or exploration happens.
 
-This hook makes that category of waste visible and harder to repeat. It injects the current per-parent budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion, treats successful `close_agent` as the only normal slot release, and surfaces stale completed `open` edges that would otherwise make the pool look full forever.
+This hook makes that category of waste visible and harder to repeat. It injects the current per-parent budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion, treats successful `close_agent` as the only normal slot release, and separates capped runtime slot pressure from stale or unresolved `open` edge debt.
 
 Model routing is secondary. The hook can nudge explorer prompts toward explicit Spark/Mini lanes, but its root job is launch/capacity discipline: fewer failed spawns, fewer repeated prompts, and less leader-context drift.
 
@@ -22,16 +22,17 @@ Model routing is secondary. The hook can nudge explorer prompts toward explicit 
 - Works with Codex Desktop and Codex CLI when they read the same `~/.codex/hooks.json`, hook events, and native SQLite state layout.
 - Uses `CODEX_HOME` when set; otherwise defaults to `~/.codex`.
 - Reads native pool state from `state_5.sqlite` by default. Override the DB name/path if a Codex build moves it.
-- Installs for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`; run `node scripts/doctor.mjs` after install to confirm the active runtime is actually using this hook.
+- Installs for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`; run `node scripts/doctor.mjs` after install to confirm the active runtime is actually using this hook.
 
 ## Runtime Model
 
 - Authority is per parent thread: `thread_spawn_edges.parent_thread_id`.
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
-- `wait_agent` never frees a native slot.
-- A completed child tracked in the current session ledger remains a reusable lane and still occupies the local budget until `close_agent` succeeds.
-- A native SQLite edge that is still `open` but whose child transcript ended in `task_complete` is treated as a stale terminal-open edge: it is excluded from occupied capacity and surfaced as a cleanup/reset candidate.
-- The hook only mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence.
+- `occupied` is a saturated runtime slot estimate and is never reported above the cap. Extra `open` rows are surfaced separately as `unresolved_open_edges` and `open_edge_overflow`.
+- Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
+- `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
+- A completed child can still be a reusable lane and can still occupy the pool until `close_agent` succeeds, but old completed `open` rows are only close/reuse/reset candidates, not proof of more than six live slots.
+- The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence. Failed close attempts do not free capacity.
 - Empty `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
 - The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
 - Spark is treated as a near-instant scout lane that can support complex workflows when its output contract is bounded evidence, anchors, or hypotheses. Mini is treated as a reasoning explorer / light executor lane.
@@ -53,7 +54,7 @@ node scripts/install.mjs
 node scripts/doctor.mjs
 ```
 
-The installer copies `hooks/native-agent-pool-advisor.mjs` to `$CODEX_HOME/hooks/` and registers it for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
+The installer copies `hooks/native-agent-pool-advisor.mjs` to `$CODEX_HOME/hooks/` and registers it for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
 
 The installer is idempotent: repeated installs should leave one registration per hook event.
 
@@ -160,6 +161,6 @@ The test suite covers wrapper-spawn blocking, explicit explorer model enforcemen
 ## Known Limits
 
 - This hook is intentionally fail-open on unexpected internal errors so it does not break ordinary Codex tool execution. It blocks only when it has enough state to identify an unsafe spawn, a recursive child spawn, a lock/contention risk, or a model-route violation.
-- If a Codex Desktop or CLI spawn surface bypasses `PreToolUse` entirely, the hook cannot block it in-process; `UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback.
+- If a Codex Desktop or CLI spawn surface bypasses `PreToolUse` entirely, the hook cannot block it in-process; `SessionStart`/`UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback. `SessionStart` is especially important after compaction/resume, when a model may continue work without a fresh user prompt.
 - Historical `hooks.json` backups and setup restore paths can replay old hook stacks. See `docs/runtime-audit.md`.
 - This hook is a launch/capacity guard, not a delegation decision maker.

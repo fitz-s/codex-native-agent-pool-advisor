@@ -11,7 +11,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceHook = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
-const EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse"];
+const EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"];
 
 function safeObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
