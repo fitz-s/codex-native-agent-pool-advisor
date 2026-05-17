@@ -914,7 +914,7 @@ async function transcriptHasTaskComplete(path) {
 
 async function repairClosedNativeEdges(parentThreadId, closedIds) {
   const ids = [...(closedIds ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
-  if (!parentThreadId || ids.length === 0) return 0;
+  if (ids.length === 0) return 0;
   const dbPath = stateDbPath();
   if (!existsSync(dbPath)) return 0;
 
@@ -922,8 +922,7 @@ async function repairClosedNativeEdges(parentThreadId, closedIds) {
     "pragma busy_timeout=250;",
     "update thread_spawn_edges",
     "set status='closed'",
-    `where parent_thread_id=${sqlString(parentThreadId)}`,
-    "and status!='closed'",
+    "where status!='closed'",
     `and child_thread_id in (${ids.map(sqlString).join(",")});`,
     "select changes() as changed;",
   ].join(" ");
@@ -1015,6 +1014,60 @@ async function discoverNativeThreadEdges(parentThreadId) {
   return edges;
 }
 
+async function discoverNativeGlobalOpenEdges() {
+  const edges = emptyNativeThreadEdges();
+
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) {
+    edges.checked = true;
+    edges.failed = true;
+    return edges;
+  }
+
+  const sql = [
+    "select e.parent_thread_id,e.child_thread_id,e.status,t.rollout_path,t.title,t.agent_role,t.model,t.reasoning_effort,t.agent_nickname,t.cwd,t.updated_at",
+    "from thread_spawn_edges e",
+    "left join threads t on t.id=e.child_thread_id",
+    "where e.status!='closed'",
+    "order by coalesce(t.updated_at,0) desc",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(stdout);
+    if (!Array.isArray(rows)) return edges;
+
+    edges.checked = true;
+    for (const row of rows) {
+      const childId = safeString(row?.child_thread_id).trim();
+      if (!childId) continue;
+      edges.lanes.set(childId, {
+        id: childId,
+        parent_thread_id: safeString(row?.parent_thread_id).trim(),
+        title: compactOneLine(row?.title, 72),
+        role: compactOneLine(row?.agent_role, 32),
+        model: compactOneLine(row?.model, 48),
+        reasoning_effort: compactOneLine(row?.reasoning_effort, 16),
+        nickname: compactOneLine(row?.agent_nickname, 32),
+        cwd: compactOneLine(row?.cwd, 72),
+        updated_at: row?.updated_at,
+      });
+      if (await transcriptHasTaskComplete(safeString(row?.rollout_path).trim())) {
+        edges.terminal.add(childId);
+      } else {
+        edges.active.add(childId);
+      }
+    }
+  } catch {
+    edges.failed = true;
+  }
+
+  return edges;
+}
+
 async function findRecentTranscriptByThreadId(threadId, nowMs, preferredPath = "") {
   if (!threadId) return "";
 
@@ -1072,11 +1125,12 @@ async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT
     resetAtMs,
     cap,
   );
-  const [childSessionIds, nativeThreadEdges] = await Promise.all([
+  const [childSessionIds, nativeThreadEdges, globalNativeThreadEdges] = await Promise.all([
     discoverRecentChildSessionIds(poolThreadId, nowMs, resetAtMs),
     discoverNativeThreadEdges(poolThreadId),
+    discoverNativeGlobalOpenEdges(),
   ]);
-  return { transcriptPool, childSessionIds, nativeThreadEdges, poolThreadId };
+  return { transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges, poolThreadId };
 }
 
 function normalizeSession(state, sessionKey) {
@@ -1571,6 +1625,7 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
           || promptSummary.failed_closes > 0
           || promptSummary.pending_spawn_reservations > 0
           || (promptSummary.native_edge_overflow ?? 0) > 0
+          || (promptSummary.native_global_edge_unresolved ?? 0) >= Math.max(1, cap - warnRemaining())
         ),
     );
     if (criticalPressure) return true;
@@ -1590,6 +1645,7 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
       && (
         remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
         || promptSummary.cap_hit_after_last_close
+        || (promptSummary.native_global_edge_unresolved ?? 0) >= Math.max(1, cap - warnRemaining())
       ),
   );
   if (criticalPressure) return true;
@@ -1660,6 +1716,14 @@ function nativeEdgeSummary(summary) {
   return "not_checked";
 }
 
+function nativeGlobalSummary(summary) {
+  if (summary?.native_global_edge_failed) return "unavailable";
+  if (summary?.native_global_edge_checked) {
+    return `open=${summary.native_global_edge_active}, terminal_open=${summary.native_global_edge_terminal ?? 0}, unresolved_open_edges=${summary.native_global_edge_unresolved ?? 0}, open_edge_overflow=${summary.native_global_edge_overflow ?? 0}`;
+  }
+  return "not_checked";
+}
+
 function formatLaneSummary(lane) {
   const id = compactOneLine(lane?.id, 42) || "unknown";
   const parts = [id];
@@ -1690,14 +1754,18 @@ function formatTerminalLaneSummary(lane) {
 function terminalCloseTargetGuidance(summary) {
   const activeLanes = Array.isArray(summary?.native_active_lanes) ? summary.native_active_lanes : [];
   const lanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
-  if (activeLanes.length === 0 && lanes.length === 0) return "";
+  const globalLanes = Array.isArray(summary?.native_global_lanes) ? summary.native_global_lanes : [];
+  if (activeLanes.length === 0 && lanes.length === 0 && globalLanes.length === 0) return "";
   const activeText = activeLanes.length > 0
     ? `Open native lanes without task_complete evidence: ${activeLanes.map(formatTerminalLaneSummary).join(" | ")}.`
     : "";
   const terminalText = lanes.length > 0
     ? `Completed-not-closed native edge candidates: ${lanes.map(formatTerminalLaneSummary).join(" | ")}.`
     : "";
-  return `${activeText} ${terminalText} Runtime occupied slots are capped by the native pool; these rows are close/reuse/reset candidates, not proof of more than the cap. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. Only a successful close_agent result decrements the slot estimate. If close_agent fails, treat that row as stale/unreachable and use explicit reset/repair tooling rather than counting it as freed capacity.`.trim();
+  const globalText = globalLanes.length > 0
+    ? `Global native open-edge candidates affecting all spawns: ${globalLanes.map(formatTerminalLaneSummary).join(" | ")}.`
+    : "";
+  return `${activeText} ${terminalText} ${globalText} Runtime occupied slots are capped by the native pool; these rows are close/reuse/reset candidates, not proof of more than the cap. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. Only a successful close_agent result decrements the slot estimate. If close_agent fails, treat that row as stale/unreachable and use explicit reset/repair tooling rather than counting it as freed capacity.`.trim();
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
@@ -1708,7 +1776,7 @@ function buildTurnBudgetGuidance(summary, cap) {
     : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. Launch at most one spawn_agent before re-checking capacity; each spawn_agent call immediately decrements this local counter.`;
   return [
     hardDirective,
-    `Current native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_current=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
+    `Current native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_current=${nativeEdgeSummary(summary)}, native_global=${nativeGlobalSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
     terminalCloseTargetGuidance(summary),
     "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result.",
     "When remaining_spawn_budget is 0, do not call spawn_agent. You may reuse compatible lanes with send_input, wait for active agents, continue locally, or close a no-longer-needed lane first, but send_input and wait_agent do not increase the spawn budget.",
@@ -1718,7 +1786,7 @@ function buildTurnBudgetGuidance(summary, cap) {
 function buildCapacityGuidance(eventName, cap, summary = null) {
   return [
     buildTurnBudgetGuidance(summary, cap),
-    `Native subagent capacity protocol (launch sequencing only): this parent session has a native child-agent cap of ${cap}; some Codex/App spawn surfaces do not run PreToolUse before spawn_agent, so treat this as a hard self-enforced launch budget.`,
+    `Native subagent capacity protocol (launch sequencing only): this Codex native pool has a child-agent cap of ${cap}; current-parent 0/${cap} is not sufficient proof of spawn capacity when global native open edges exist.`,
     "Do not batch native spawn_agent calls: if reviewer+verifier/critic/researcher lanes are useful, first reuse a compatible completed lane with send_input; otherwise launch at most one native subagent, wait for the spawn result or confirmed free-slot evidence, then decide whether one more is still worth it.",
     "Completed children preserve valuable task context and still consume slots until close succeeds; keep useful lanes open for related follow-up, and close only stale/irrelevant/wrong-role lanes when capacity is needed.",
     "If this thread already saw a pool-exhaustion failure and no later close is confirmed, do not call spawn_agent again in the same turn even when the local ledger estimates fewer than the cap.",
@@ -1791,7 +1859,16 @@ function msFromIso(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs = 0, cap = DEFAULT_AGENT_CAP) {
+function mergeSummary(
+  sessionSummary,
+  transcriptPool,
+  childSessionIds,
+  nativeThreadEdges,
+  globalNativeThreadEdges,
+  session,
+  resetAtMs = 0,
+  cap = DEFAULT_AGENT_CAP,
+) {
   const capValue = slotCap(cap);
   const nativeClosed = new Set(nativeThreadEdges?.closed ?? []);
   const nativeActive = new Set(nativeThreadEdges?.active ?? []);
@@ -1800,6 +1877,10 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
   const nativeChecked = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
   const nativeEdgeTotal = nativeClosed.size + nativeActive.size + nativeTerminal.size;
   const nativeAuthoritative = nativeChecked && (nativeEdgeTotal > 0 || resetAtMs > 0);
+  const globalNativeActive = new Set(globalNativeThreadEdges?.active ?? []);
+  const globalNativeTerminal = new Set(globalNativeThreadEdges?.terminal ?? []);
+  const globalNativeLanes = globalNativeThreadEdges?.lanes instanceof Map ? globalNativeThreadEdges.lanes : new Map();
+  const globalNativeChecked = Boolean(globalNativeThreadEdges?.checked && !globalNativeThreadEdges?.failed);
   const transcriptActive = new Set(transcriptPool.active ?? []);
   if (!nativeAuthoritative) {
     for (const id of childSessionIds ?? []) {
@@ -1821,6 +1902,8 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
   const transcriptSlotReliable = transcriptEstimateCanOverrideFallback;
   const nativeUnresolved = nativeActive.size + nativeTerminal.size;
   const nativeSlotOccupied = clampSlotCount(nativeUnresolved, capValue);
+  const globalNativeUnresolved = globalNativeActive.size + globalNativeTerminal.size;
+  const globalNativeSlotOccupied = clampSlotCount(globalNativeUnresolved, capValue);
   const trackedUnresolved = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
   const trackedOccupied = clampSlotCount(trackedUnresolved, capValue);
   const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
@@ -1845,6 +1928,10 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     evidenceOccupied = nativeSlotOccupied;
     slotPressureSource = "native_open_edges_saturated";
   }
+  if (globalNativeChecked && globalNativeSlotOccupied >= evidenceOccupied) {
+    evidenceOccupied = globalNativeSlotOccupied;
+    slotPressureSource = "native_global_open_edges";
+  }
   const effectiveOccupied = capHitAfterLastClose
     ? capValue
     : clampSlotCount(Math.max(trackedOccupied, evidenceOccupied) + pendingSpawnReservations, capValue);
@@ -1864,12 +1951,18 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     discovered_child_sessions: childSessionIds?.size ?? 0,
     native_edge_checked: Boolean(nativeThreadEdges?.checked),
     native_edge_authoritative: nativeAuthoritative,
-    native_edge_failed: Boolean(nativeThreadEdges?.failed),
+    native_edge_failed: Boolean(nativeThreadEdges?.failed || globalNativeThreadEdges?.failed),
     native_edge_active: nativeActive.size,
     native_edge_closed: nativeClosed.size,
     native_edge_terminal: nativeTerminal.size,
     native_edge_unresolved: nativeUnresolved,
     native_edge_overflow: Math.max(0, nativeUnresolved - capValue),
+    native_global_edge_checked: Boolean(globalNativeThreadEdges?.checked),
+    native_global_edge_failed: Boolean(globalNativeThreadEdges?.failed),
+    native_global_edge_active: globalNativeActive.size,
+    native_global_edge_terminal: globalNativeTerminal.size,
+    native_global_edge_unresolved: globalNativeUnresolved,
+    native_global_edge_overflow: Math.max(0, globalNativeUnresolved - capValue),
     slot_pressure_source: slotPressureSource,
     native_terminal_ids: [...nativeTerminal].slice(0, DEFAULT_AGENT_CAP),
     native_terminal_lanes: [...nativeTerminal]
@@ -1878,6 +1971,9 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     native_active_lanes: [...nativeActive]
       .slice(0, DEFAULT_AGENT_CAP)
       .map((id) => nativeLanes.get(id) ?? { id }),
+    native_global_lanes: [...new Set([...globalNativeActive, ...globalNativeTerminal])]
+      .slice(0, DEFAULT_AGENT_CAP)
+      .map((id) => globalNativeLanes.get(id) ?? { id }),
     native_edge_repaired: nativeThreadEdges?.repaired ?? 0,
     failed_spawns: transcriptPool.failedSpawns ?? 0,
     failed_closes: (transcriptPool.failedCloses ?? 0) + (msFromIso(session.last_close_failed_at) > lastCloseMs ? 1 : 0),
@@ -1896,6 +1992,8 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   if (hasExplorerModelRouteViolationInOperations(ops)) return true;
   if (isChildSession) return true;
   if (summary.native_edge_failed) return true;
+  if (summary.native_global_edge_failed) return true;
+  if ((summary.native_global_edge_unresolved ?? 0) + requestedSpawns > cap) return true;
   if (summary.occupied + requestedSpawns > cap) return true;
   if (summary.tracked_occupied + requestedSpawns > cap) return true;
   if (
@@ -1913,6 +2011,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   if (ops.length === 0) return false;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
+  if ((summary.native_global_edge_unresolved ?? 0) >= Math.max(1, cap - warnRemaining())) return true;
   if (hasExplorerContractAdvisoryInOperations(ops)) return true;
   const threshold = Math.max(1, cap - warnRemaining());
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
@@ -1933,6 +2032,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     `transcript_slot=${summary.transcript_occupied}`,
     `transcript_unresolved=${summary.transcript_unresolved}`,
     `native_current=${nativeEdgeSummary(summary)}`,
+    `native_global=${nativeGlobalSummary(summary)}`,
     `reserved_spawns=${summary.pending_spawn_reservations}`,
     `running=${summary.running}`,
     `completed_not_closed=${summary.terminal}`,
@@ -1959,12 +2059,17 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 	          ? "Retry at most one explorer spawn after correcting the explicit model route, and only if remaining_spawn_budget is still positive."
 	          : isChildSession
 	          ? "Do not restate or retry the nested spawn prompt. Continue the child task locally; the parent leader decides any follow-up delegation."
+	          : (summary.native_global_edge_unresolved ?? 0) >= cap
+	          ? "Global native open-edge pressure is at or above the cap. Do not retry spawn_agent after send_input or wait_agent; only successful close_agent results or an explicit reset can make a later spawn safe."
 	          : (summary.cap_hit_after_last_close
 	              ? "This thread already saw a native pool-exhaustion failure after the last confirmed close; do not retry spawn_agent until a later close succeeds."
 	              : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary. First reuse a compatible completed lane with send_input, wait for active agents, or close a no-longer-needed lane, then retry only one spawn per confirmed free slot."))
 	      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
     (summary.native_edge_overflow ?? 0) > 0
       ? "Native open-edge evidence exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are diagnostic debt/candidates rather than additional live slots."
+      : null,
+    (summary.native_global_edge_overflow ?? 0) > 0
+      ? "Global native open-edge evidence exceeds the runtime cap; this can block spawns even when the current parent thread reports 0/6."
       : null,
     summary.failed_closes > 0
       ? "At least one recent close was not confirmed; treat capacity as uncertain and serialize follow-up spawns."
@@ -2080,10 +2185,10 @@ async function main() {
         let promptSummary = null;
         if (eventName === "SessionStart" || eventName === "UserPromptSubmit") {
           const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
-          const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
+          const { transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
           applyTranscriptEvidenceToSession(session, transcriptPool);
           applyNativeThreadEdgesToSession(session, nativeThreadEdges);
-          promptSummary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+          promptSummary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges, session, resetAtMs, cap);
         }
         const emitCapacity = shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, identity.isChildSession, promptSummary, cap);
         const emitDelegation = shouldEmitDelegationGuidance(eventName, prompt, session, nowMs, identity.isChildSession);
@@ -2108,16 +2213,16 @@ async function main() {
       if (operations.length === 0) return;
 
       const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
-      const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
+      const { transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
       applyNativeThreadEdgesToSession(session, nativeThreadEdges);
 
       const isPreSpawn = eventName === "PreToolUse" && hasSpawnOperation(operations);
-      let summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+      let summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges, session, resetAtMs, cap);
       let blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
 
       if (isPreSpawn && !blockSpawn) {
         reserveSpawnSlot(session, payload, nowMs, nowIso, spawnOperationCount(operations));
-        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges, session, resetAtMs, cap);
       }
 
       if (eventName === "PostToolUse") {
@@ -2151,6 +2256,9 @@ async function main() {
                 nativeThreadEdges.active?.delete(id);
                 nativeThreadEdges.terminal?.delete(id);
                 nativeThreadEdges.closed?.add(id);
+                globalNativeThreadEdges.active?.delete(id);
+                globalNativeThreadEdges.terminal?.delete(id);
+                globalNativeThreadEdges.closed?.add(id);
               } else {
                 await appendAdvisorLog({
                   event: "native_edge_close_repair_missed",
@@ -2165,7 +2273,7 @@ async function main() {
             session.last_close_failed_at = nowIso;
           }
         }
-        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges, session, resetAtMs, cap);
         blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
       }
 
@@ -2175,7 +2283,7 @@ async function main() {
       state.updated_at = nowIso;
       await writeState(state);
 
-      summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+      summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, globalNativeThreadEdges, session, resetAtMs, cap);
       if (!isPreSpawn) blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
       if (blockSpawn || shouldEmitAdvisory(eventName, name, summary, cap, operations)) {
         process.stdout.write(`${JSON.stringify(buildAdvisory(eventName, summary, cap, blockSpawn, identity.isChildSession, payload, operations))}\n`);

@@ -26,14 +26,15 @@ Model routing is secondary. The hook can nudge explorer prompts toward explicit 
 
 ## Runtime Model
 
-- Authority is per parent thread: `thread_spawn_edges.parent_thread_id`.
+- Hard capacity is global-conservative, not parent-only. The advisor reads all native `thread_spawn_edges.status!='closed'` rows as the lower-bound pool pressure because Codex can reject a spawn even when the current parent thread has no open rows.
+- Parent-thread state, `thread_spawn_edges.parent_thread_id`, is still shown for diagnosis and close/reuse target selection, but it is not the sole spawn authority.
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
-- `occupied` is a saturated runtime slot estimate and is never reported above the cap. Extra `open` rows are surfaced separately as `unresolved_open_edges` and `open_edge_overflow`.
+- `occupied` is a saturated runtime slot estimate and is never reported above the cap. Extra global or parent `open` rows are surfaced separately as `unresolved_open_edges` and `open_edge_overflow`.
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
 - `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
 - A completed child can still be a reusable lane and can still occupy the pool until `close_agent` succeeds, but old completed `open` rows are only close/reuse/reset candidates, not proof of more than six live slots.
-- The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence. Failed close attempts do not free capacity.
-- Empty `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
+- The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence. Close repair is keyed by child thread id, not the current parent identity, because resumed sessions can have a different current parent key than the open edge being closed. Failed close attempts do not free capacity.
+- Empty current-parent `thread_spawn_edges` is not enough to prove capacity. Global unresolved native edges can still force `remaining_spawn_budget=0`. Empty global `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
 - The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
 - Spark is treated as a near-instant scout lane that can support complex workflows when its output contract is bounded evidence, anchors, or hypotheses. Mini is treated as a reasoning explorer / light executor lane.
 - The hook does not block Spark because a prompt looks "complex"; it emits contract guidance and lets the parent agent choose.

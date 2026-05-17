@@ -186,6 +186,55 @@ test("missing native edge database blocks spawn conservatively", async () => {
   });
 });
 
+test("global native pool blocks unrelated parent with empty current edges", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('full-parent','g1','open'),('full-parent','g2','open'),('full-parent','g3','open'),('full-parent','g4','open'),('full-parent','g5','open'),('full-parent','g6','open');",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "empty-parent",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /6\/6/);
+    assert.match(output.reason, /native_current=open=0/);
+    assert.match(output.reason, /native_global=open=6/);
+  });
+});
+
+test("global full pool emits zero budget on unrelated prompt before spawn", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('full-parent','g1','open'),('full-parent','g2','open'),('full-parent','g3','open'),('full-parent','g4','open'),('full-parent','g5','open'),('full-parent','g6','open');",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "empty-parent",
+      prompt: "Send messages to two existing agents, then try a new explorer.",
+    });
+    const context = output.hookSpecificOutput.additionalContext;
+
+    assert.match(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
+    assert.match(context, /native_current=open=0/);
+    assert.match(context, /native_global=open=6/);
+    assert.match(context, /Global native open-edge candidates affecting all spawns/);
+  });
+});
+
 test("blocks wrapped explorer spawn that would inherit the frontier model", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -569,7 +618,7 @@ test("overfull native open-edge evidence saturates occupied at the runtime cap",
   });
 });
 
-test("successful close after a cap hit can free one runtime slot despite stale open-edge overflow", async () => {
+test("transcript close after a cap hit does not override global open-edge overflow", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const values = [];
@@ -603,10 +652,10 @@ test("successful close after a cap hit can free one runtime slot despite stale o
       prompt: "spawn agent status",
     });
     const context = promptOutput.hookSpecificOutput.additionalContext;
-    assert.match(context, /occupied=5\/6/);
-    assert.match(context, /remaining_spawn_budget=1/);
-    assert.match(context, /slot_pressure_source=transcript_events/);
-    assert.match(context, /unresolved_open_edges=8/);
+    assert.match(context, /occupied=6\/6/);
+    assert.match(context, /remaining_spawn_budget=0/);
+    assert.match(context, /slot_pressure_source=native_global_open_edges/);
+    assert.match(context, /native_global=open=0, terminal_open=8, unresolved_open_edges=8/);
 
     const spawnOutput = await runHook(home, {
       hook_event_name: "PreToolUse",
@@ -620,7 +669,8 @@ test("successful close after a cap hit can free one runtime slot despite stale o
         message: "map files",
       },
     });
-    assert.notEqual(spawnOutput?.decision, "block");
+    assert.equal(spawnOutput.decision, "block");
+    assert.match(spawnOutput.reason, /native_global=open=0, terminal_open=8, unresolved_open_edges=8/);
   });
 });
 
@@ -926,6 +976,43 @@ test("wait_agent completion does not release a native edge slot", async () => {
     assert.equal(output.decision, "block");
     assert.match(output.reason, /6\/6/);
     assert.match(output.reason, /native_current=open=6/);
+  });
+});
+
+test("successful close_agent repairs native edge by child id across parent identity drift", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('full-parent','global1','open'),('full-parent','global2','open'),('full-parent','global3','open'),('full-parent','global4','open'),('full-parent','global5','open'),('full-parent','global6','open');",
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "empty-parent",
+      tool_input: { target: "global6" },
+      tool_response: { status: "closed" },
+    });
+
+    assert.equal(
+      await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status order by status;"),
+      "closed|1\nopen|5",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "empty-parent",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.notEqual(output?.decision, "block");
   });
 });
 
