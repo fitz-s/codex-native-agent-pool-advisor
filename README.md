@@ -13,7 +13,7 @@ Codex can delegate work to native subagents, but the pool limit is easy for the 
 3. The leader explains the failure, closes several agents, restates the prompt, or tries a different batch.
 4. The thread loses context budget and attention before any useful review, verification, or exploration happens.
 
-This hook makes that category of waste visible and harder to repeat. It injects the current per-parent budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion, treats successful `close_agent` as the only normal slot release, and surfaces completed-not-closed `open` edges with exact close/reset guidance.
+This hook makes that category of waste visible and harder to repeat. It injects the current per-parent budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion, treats successful `close_agent` as the only normal slot release, and separates capped runtime slot pressure from stale or unresolved `open` edge debt.
 
 Model routing is secondary. The hook can nudge explorer prompts toward explicit Spark/Mini lanes, but its root job is launch/capacity discipline: fewer failed spawns, fewer repeated prompts, and less leader-context drift.
 
@@ -28,10 +28,11 @@ Model routing is secondary. The hook can nudge explorer prompts toward explicit 
 
 - Authority is per parent thread: `thread_spawn_edges.parent_thread_id`.
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
-- `wait_agent` never frees a native slot.
-- A completed child tracked in the current session ledger remains a reusable lane and still occupies the local budget until `close_agent` succeeds.
-- A native SQLite edge that is still `open` but whose child transcript ended in `task_complete` is treated as completed-not-closed: it still occupies native capacity until `close_agent` succeeds or an explicit reset/repair removes the edge.
-- The hook only mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence.
+- `occupied` is a saturated runtime slot estimate and is never reported above the cap. Extra `open` rows are surfaced separately as `unresolved_open_edges` and `open_edge_overflow`.
+- Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
+- `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
+- A completed child can still be a reusable lane and can still occupy the pool until `close_agent` succeeds, but old completed `open` rows are only close/reuse/reset candidates, not proof of more than six live slots.
+- The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence. Failed close attempts do not free capacity.
 - Empty `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
 - The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
 - Spark is treated as a near-instant scout lane that can support complex workflows when its output contract is bounded evidence, anchors, or hypotheses. Mini is treated as a reasoning explorer / light executor lane.

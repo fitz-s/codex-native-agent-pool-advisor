@@ -53,6 +53,17 @@ function compactOneLine(value, maxLength = 96) {
   return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+function slotCap(cap = DEFAULT_AGENT_CAP) {
+  const parsed = Number(cap);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_AGENT_CAP;
+}
+
+function clampSlotCount(value, cap = DEFAULT_AGENT_CAP) {
+  const parsed = Number(value);
+  const count = Number.isFinite(parsed) ? Math.floor(parsed) : 0;
+  return Math.max(0, Math.min(slotCap(cap), count));
+}
+
 function safeObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
@@ -631,6 +642,10 @@ function emptyTranscriptPool() {
     active: new Set(),
     spawned: new Set(),
     closed: new Set(),
+    slotOccupied: 0,
+    slotEstimateEvents: 0,
+    slotEstimateReliable: false,
+    slotEstimateSawCapHit: false,
     failedSpawns: 0,
     failedCloses: 0,
     capHitAtMs: 0,
@@ -640,13 +655,38 @@ function emptyTranscriptPool() {
   };
 }
 
-function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0) {
+function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAULT_AGENT_CAP) {
   const pool = emptyTranscriptPool();
   if (!text.trim()) return pool;
   pool.scanned = true;
   pool.truncated = !text.startsWith("{");
+  const capValue = slotCap(cap);
+  let slotEstimate = 0;
+  let slotEstimateKnown = !pool.truncated;
+  let slotEstimateSawCapHit = false;
+  let slotEstimateEvents = 0;
   const pendingSpawnCalls = new Map();
   const pendingCloseCalls = new Map();
+  const noteSlotSpawn = (count = 1) => {
+    const amount = Math.max(1, Number.isFinite(Number(count)) ? Math.floor(Number(count)) : 1);
+    if (!slotEstimateKnown) slotEstimate = 0;
+    slotEstimate = clampSlotCount(slotEstimate + amount, capValue);
+    slotEstimateKnown = true;
+    slotEstimateEvents += amount;
+  };
+  const noteSlotCapHit = () => {
+    slotEstimate = capValue;
+    slotEstimateKnown = true;
+    slotEstimateSawCapHit = true;
+    slotEstimateEvents += 1;
+  };
+  const noteSlotClose = (count = 1) => {
+    const amount = Math.max(1, Number.isFinite(Number(count)) ? Math.floor(Number(count)) : 1);
+    if (slotEstimateKnown) {
+      slotEstimate = clampSlotCount(slotEstimate - amount, capValue);
+    }
+    slotEstimateEvents += amount;
+  };
 
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -664,10 +704,12 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0) {
       if (newThreadId) {
         pool.spawned.add(newThreadId);
         pool.active.add(newThreadId);
+        noteSlotSpawn(1);
       } else {
         pool.failedSpawns += 1;
         if (textLooksSpawnCapacityFailure(JSON.stringify(payload ?? ""))) {
           pool.capHitAtMs = Math.max(pool.capHitAtMs, eventTimestampMs(record));
+          noteSlotCapHit();
         }
       }
       continue;
@@ -685,10 +727,12 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0) {
             pool.spawned.add(id);
             pool.active.add(id);
           }
+          noteSlotSpawn(spawnedIds.length);
         } else {
           pool.failedSpawns += 1;
           if (textLooksSpawnCapacityFailure(safeString(output))) {
             pool.capHitAtMs = Math.max(pool.capHitAtMs, eventTimestampMs(record));
+            noteSlotCapHit();
           }
         }
         continue;
@@ -705,6 +749,7 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0) {
           pool.active.delete(id);
           pool.lastCloseAtMs = Math.max(pool.lastCloseAtMs, eventTimestampMs(record));
         }
+        noteSlotClose(closeIds.length);
       }
       continue;
     }
@@ -728,8 +773,13 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0) {
       pool.active.delete(id);
       pool.lastCloseAtMs = Math.max(pool.lastCloseAtMs, eventTimestampMs(record));
     }
+    noteSlotClose(closeIds.length);
   }
 
+  pool.slotOccupied = clampSlotCount(slotEstimate, capValue);
+  pool.slotEstimateEvents = slotEstimateEvents;
+  pool.slotEstimateSawCapHit = slotEstimateSawCapHit;
+  pool.slotEstimateReliable = Boolean(slotEstimateEvents > 0 && (slotEstimateSawCapHit || !pool.truncated));
   return pool;
 }
 
@@ -911,6 +961,7 @@ async function discoverNativeThreadEdges(parentThreadId) {
     "from thread_spawn_edges e",
     "left join threads t on t.id=e.child_thread_id",
     `where e.parent_thread_id=${sqlString(parentThreadId)}`,
+    "order by coalesce(t.updated_at,0) desc",
   ].join(" ");
 
   try {
@@ -997,7 +1048,7 @@ function nativePoolResetMs(state, poolThreadId = "") {
   return Math.max(globalResetMs, threadResetMs);
 }
 
-async function collectPoolEvidence(identity, nowMs, resetAtMs = 0) {
+async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT_AGENT_CAP) {
   const poolThreadId = identity.poolThreadId || identity.threadId;
   const preferredPath = identity.threadId === poolThreadId ? identity.transcript : "";
   const poolTranscript = await findRecentTranscriptByThreadId(
@@ -1009,6 +1060,7 @@ async function collectPoolEvidence(identity, nowMs, resetAtMs = 0) {
     await readTranscriptForPool(poolTranscript || identity.transcript),
     poolThreadId,
     resetAtMs,
+    cap,
   );
   const [childSessionIds, nativeThreadEdges] = await Promise.all([
     discoverRecentChildSessionIds(poolThreadId, nowMs, resetAtMs),
@@ -1579,7 +1631,7 @@ function remainingSpawnBudget(summary, cap) {
 function nativeEdgeSummary(summary) {
   if (summary?.native_edge_checked) {
     const authority = summary.native_edge_authoritative ? "authoritative" : "fallback";
-    return `open=${summary.native_edge_active}, terminal_open=${summary.native_edge_terminal ?? 0}, authority=${authority}`;
+    return `open=${summary.native_edge_active}, terminal_open=${summary.native_edge_terminal ?? 0}, unresolved_open_edges=${summary.native_edge_unresolved ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
   }
   if (summary?.native_edge_failed) return "unavailable";
   return "not_checked";
@@ -1613,16 +1665,23 @@ function formatTerminalLaneSummary(lane) {
 }
 
 function terminalCloseTargetGuidance(summary) {
+  const activeLanes = Array.isArray(summary?.native_active_lanes) ? summary.native_active_lanes : [];
   const lanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
-  if (lanes.length === 0) return "";
-  return `Completed native edge rows still occupy the native pool until close_agent succeeds or explicit reset/repair removes the edge: ${lanes.map(formatTerminalLaneSummary).join(" | ")}. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. If it is not reachable, use explicit reset/repair tooling before spawning more agents.`;
+  if (activeLanes.length === 0 && lanes.length === 0) return "";
+  const activeText = activeLanes.length > 0
+    ? `Open native lanes without task_complete evidence: ${activeLanes.map(formatTerminalLaneSummary).join(" | ")}.`
+    : "";
+  const terminalText = lanes.length > 0
+    ? `Completed-not-closed native edge candidates: ${lanes.map(formatTerminalLaneSummary).join(" | ")}.`
+    : "";
+  return `${activeText} ${terminalText} Runtime occupied slots are capped by the native pool; these rows are close/reuse/reset candidates, not proof of more than the cap. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. Only a successful close_agent result decrements the slot estimate. If close_agent fails, treat that row as stale/unreachable and use explicit reset/repair tooling rather than counting it as freed capacity.`.trim();
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
   if (!summary) return "";
   const remaining = remainingSpawnBudget(summary, cap);
   return [
-    `Current native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, ledger=${summary.tracked_occupied}, transcript_fallback=${summary.transcript_occupied}, native_current=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
+    `Current native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_current=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
     terminalCloseTargetGuidance(summary),
     "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result.",
     "When remaining_spawn_budget is 0, do not call spawn_agent. Reuse a compatible completed lane with send_input, wait for active agents, continue locally, or close a no-longer-needed lane first.",
@@ -1705,7 +1764,8 @@ function msFromIso(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs = 0) {
+function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs = 0, cap = DEFAULT_AGENT_CAP) {
+  const capValue = slotCap(cap);
   const nativeClosed = new Set(nativeThreadEdges?.closed ?? []);
   const nativeActive = new Set(nativeThreadEdges?.active ?? []);
   const nativeTerminal = new Set(nativeThreadEdges?.terminal ?? []);
@@ -1723,12 +1783,17 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     transcriptActive.delete(id);
   }
 
-  const transcriptOccupied = transcriptActive.size;
-  const nativeOccupied = nativeActive.size + nativeTerminal.size;
-  const trackedOccupied = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
+  const transcriptUnresolved = transcriptActive.size;
+  const transcriptSlotOccupied = clampSlotCount(
+    transcriptPool.slotEstimateEvents > 0 ? transcriptPool.slotOccupied : transcriptUnresolved,
+    capValue,
+  );
+  const transcriptSlotReliable = Boolean(transcriptPool.slotEstimateReliable && transcriptPool.slotEstimateEvents > 0);
+  const nativeUnresolved = nativeActive.size + nativeTerminal.size;
+  const nativeSlotOccupied = clampSlotCount(nativeUnresolved, capValue);
+  const trackedUnresolved = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
+  const trackedOccupied = clampSlotCount(trackedUnresolved, capValue);
   const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
-  const evidenceOccupied = nativeAuthoritative ? nativeOccupied : transcriptOccupied;
-  const effectiveOccupied = Math.max(trackedOccupied, evidenceOccupied) + pendingSpawnReservations;
   const lastCapHitMs = Math.max(
     transcriptPool.capHitAtMs || 0,
     msFromIso(session.last_cap_hit_at),
@@ -1737,12 +1802,32 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     transcriptPool.lastCloseAtMs || 0,
     msFromIso(session.last_close_at),
   );
+  const capHitAfterLastClose = lastCapHitMs > 0 && lastCapHitMs > lastCloseMs;
+  let evidenceOccupied = transcriptSlotOccupied;
+  let slotPressureSource = "transcript_fallback";
+  if (nativeAuthoritative && nativeUnresolved <= capValue) {
+    evidenceOccupied = nativeSlotOccupied;
+    slotPressureSource = "native_open_edges";
+  } else if (transcriptSlotReliable) {
+    evidenceOccupied = transcriptSlotOccupied;
+    slotPressureSource = "transcript_events";
+  } else if (nativeAuthoritative) {
+    evidenceOccupied = nativeSlotOccupied;
+    slotPressureSource = "native_open_edges_saturated";
+  }
+  const effectiveOccupied = capHitAfterLastClose
+    ? capValue
+    : clampSlotCount(Math.max(trackedOccupied, evidenceOccupied) + pendingSpawnReservations, capValue);
 
   return {
     ...sessionSummary,
     occupied: effectiveOccupied,
     tracked_occupied: trackedOccupied,
-    transcript_occupied: transcriptOccupied,
+    tracked_unresolved: trackedUnresolved,
+    transcript_occupied: transcriptSlotOccupied,
+    transcript_unresolved: transcriptUnresolved,
+    transcript_slot_reliable: transcriptSlotReliable,
+    transcript_slot_events: transcriptPool.slotEstimateEvents ?? 0,
     pending_spawn_reservations: pendingSpawnReservations,
     transcript_scanned: Boolean(transcriptPool.scanned),
     transcript_truncated: Boolean(transcriptPool.truncated),
@@ -1753,6 +1838,9 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     native_edge_active: nativeActive.size,
     native_edge_closed: nativeClosed.size,
     native_edge_terminal: nativeTerminal.size,
+    native_edge_unresolved: nativeUnresolved,
+    native_edge_overflow: Math.max(0, nativeUnresolved - capValue),
+    slot_pressure_source: slotPressureSource,
     native_terminal_ids: [...nativeTerminal].slice(0, DEFAULT_AGENT_CAP),
     native_terminal_lanes: [...nativeTerminal]
       .slice(0, DEFAULT_AGENT_CAP)
@@ -1766,7 +1854,7 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     last_cap_hit_at: isoFromMs(lastCapHitMs),
     last_close_at: isoFromMs(lastCloseMs),
     native_pool_reset_at: isoFromMs(resetAtMs),
-    cap_hit_after_last_close: lastCapHitMs > 0 && lastCapHitMs > lastCloseMs,
+    cap_hit_after_last_close: capHitAfterLastClose,
   };
 }
 
@@ -1809,8 +1897,11 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
     `requested_spawns=${requestedSpawns}`,
-    `ledger=${summary.tracked_occupied}`,
-    `transcript_fallback=${summary.transcript_occupied}`,
+    `slot_pressure_source=${summary.slot_pressure_source}`,
+    `ledger_slot=${summary.tracked_occupied}`,
+    `ledger_unresolved=${summary.tracked_unresolved}`,
+    `transcript_slot=${summary.transcript_occupied}`,
+    `transcript_unresolved=${summary.transcript_unresolved}`,
     `native_current=${nativeEdgeSummary(summary)}`,
     `reserved_spawns=${summary.pending_spawn_reservations}`,
     `running=${summary.running}`,
@@ -1842,6 +1933,9 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 	              ? "This thread already saw a native pool-exhaustion failure after the last confirmed close; do not retry spawn_agent until a later close succeeds."
 	              : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary. First reuse a compatible completed lane with send_input, wait for active agents, or close a no-longer-needed lane, then retry only one spawn per confirmed free slot."))
 	      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
+    (summary.native_edge_overflow ?? 0) > 0
+      ? "Native open-edge evidence exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are diagnostic debt/candidates rather than additional live slots."
+      : null,
     summary.failed_closes > 0
       ? "At least one recent close was not confirmed; treat capacity as uncertain and serialize follow-up spawns."
       : null,
@@ -1957,10 +2051,10 @@ async function main() {
         let promptSummary = null;
         if (eventName === "UserPromptSubmit") {
           const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
-          const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs);
+          const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
           applyTranscriptEvidenceToSession(session, transcriptPool);
           applyNativeThreadEdgesToSession(session, nativeThreadEdges);
-          promptSummary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs);
+          promptSummary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
         }
         const emitCapacity = shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, identity.isChildSession, promptSummary, cap);
         const emitDelegation = shouldEmitDelegationGuidance(eventName, prompt, session, nowMs, identity.isChildSession);
@@ -1985,16 +2079,16 @@ async function main() {
       if (operations.length === 0) return;
 
       const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
-      const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs);
+      const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
       applyNativeThreadEdgesToSession(session, nativeThreadEdges);
 
       const isPreSpawn = eventName === "PreToolUse" && hasSpawnOperation(operations);
-      let summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs);
+      let summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
       let blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
 
       if (isPreSpawn && !blockSpawn) {
         reserveSpawnSlot(session, payload, nowMs, nowIso, spawnOperationCount(operations));
-        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs);
+        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
       }
 
       if (eventName === "PostToolUse") {
@@ -2042,7 +2136,7 @@ async function main() {
             session.last_close_failed_at = nowIso;
           }
         }
-        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs);
+        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
         blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
       }
 
@@ -2052,7 +2146,7 @@ async function main() {
       state.updated_at = nowIso;
       await writeState(state);
 
-      summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs);
+      summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
       if (!isPreSpawn) blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
       if (blockSpawn || shouldEmitAdvisory(eventName, name, summary, cap, operations)) {
         process.stdout.write(`${JSON.stringify(buildAdvisory(eventName, summary, cap, blockSpawn, identity.isChildSession, payload, operations))}\n`);

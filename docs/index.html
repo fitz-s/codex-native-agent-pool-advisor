@@ -386,7 +386,7 @@
             </article>
             <article class="card">
               <h3>Stale open rows</h3>
-              <p>Shows completed-not-closed native edges as occupied slots with exact close or reset guidance.</p>
+              <p>Keeps occupied capped at the native limit and reports extra open rows as close or reset candidates.</p>
             </article>
             <article class="card">
               <h3>Recursive delegation</h3>
@@ -435,7 +435,7 @@ node scripts/doctor.mjs</pre>
             </article>
             <article class="card">
               <h3>Model advisory</h3>
-              <p>Explorer model hints are secondary. The primary guard is still the six-slot pool budget and stale-open accounting.</p>
+              <p>Explorer model hints are secondary. The primary guard is still the six-slot pool budget, exact close accounting, and stale-open diagnosis.</p>
             </article>
           </div>
           <div class="split">

@@ -367,7 +367,7 @@ test("native open edges with task_complete transcripts still occupy capacity unt
     });
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=6\/6/);
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_current=open=0, terminal_open=6/);
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /still occupy the native pool until close_agent succeeds/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /Only a successful close_agent result decrements/);
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
 
     const spawnOutput = await runHook(home, {
@@ -384,6 +384,143 @@ test("native open edges with task_complete transcripts still occupy capacity unt
     assert.equal(spawnOutput.decision, "block");
     assert.match(spawnOutput.reason, /6\/6/);
     assert.match(spawnOutput.reason, /terminal_open=6/);
+  });
+});
+
+test("overfull native open-edge evidence saturates occupied at the runtime cap", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const values = [];
+    for (let index = 1; index <= 8; index += 1) {
+      const id = `child${index}`;
+      const path = await writeTaskCompleteTranscript(home, id);
+      values.push(`('parent1','${id}','open')`);
+      await sqlite(
+        home,
+        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',177892000${index});`,
+      );
+    }
+    await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
+
+    const promptOutput = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "spawn agent status",
+    });
+    const context = promptOutput.hookSpecificOutput.additionalContext;
+    assert.match(context, /occupied=6\/6/);
+    assert.doesNotMatch(context, /occupied=8\/6/);
+    assert.match(context, /unresolved_open_edges=8/);
+    assert.match(context, /open_edge_overflow=2/);
+
+    const spawnOutput = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+    assert.equal(spawnOutput.decision, "block");
+    assert.match(spawnOutput.reason, /6\/6/);
+    assert.match(spawnOutput.reason, /open_edge_overflow=2/);
+  });
+});
+
+test("successful close after a cap hit can free one runtime slot despite stale open-edge overflow", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const values = [];
+    for (let index = 1; index <= 8; index += 1) {
+      const id = `child${index}`;
+      const path = await writeTaskCompleteTranscript(home, id);
+      values.push(`('parent1','${id}','open')`);
+      await sqlite(
+        home,
+        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',177892000${index});`,
+      );
+    }
+    await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
+
+    const transcript = join(home, "parent.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"parent1"}}',
+        '{"timestamp":"2026-05-16T08:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"explorer\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"collab spawn failed: agent thread limit reached"}}',
+        '{"timestamp":"2026-05-16T08:01:02.000Z","type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child8\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"{\\"status\\":\\"closed\\"}"}}',
+      ].join("\n"),
+    );
+
+    const promptOutput = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      transcript_path: transcript,
+      prompt: "spawn agent status",
+    });
+    const context = promptOutput.hookSpecificOutput.additionalContext;
+    assert.match(context, /occupied=5\/6/);
+    assert.match(context, /remaining_spawn_budget=1/);
+    assert.match(context, /slot_pressure_source=transcript_events/);
+    assert.match(context, /unresolved_open_edges=8/);
+
+    const spawnOutput = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      transcript_path: transcript,
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+    assert.notEqual(spawnOutput?.decision, "block");
+  });
+});
+
+test("failed close after a cap hit does not free runtime capacity", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open'),('parent1','child4','open'),('parent1','child5','open'),('parent1','child6','open');",
+    );
+
+    const transcript = join(home, "parent.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"parent1"}}',
+        '{"timestamp":"2026-05-16T08:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"explorer\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"collab spawn failed: agent thread limit reached"}}',
+        '{"timestamp":"2026-05-16T08:01:02.000Z","type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child6\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"failed to close: unknown agent"}}',
+      ].join("\n"),
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      transcript_path: transcript,
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /6\/6/);
+    assert.match(output.reason, /failed_closes=1/);
   });
 });
 
