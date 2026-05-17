@@ -484,6 +484,12 @@ function agentOperations(payload, directName = "") {
     operations.push({ name: direct, input: toolInput(payload), source: "direct" });
   }
   collectNestedAgentOperations(toolInput(payload), operations);
+  const byName = new Map();
+  for (const operation of operations) {
+    const index = byName.get(operation.name) ?? 0;
+    operation.name_index = index;
+    byName.set(operation.name, index + 1);
+  }
   return operations;
 }
 
@@ -954,7 +960,11 @@ async function discoverNativeThreadEdges(parentThreadId) {
   if (!parentThreadId) return edges;
 
   const dbPath = stateDbPath();
-  if (!existsSync(dbPath)) return edges;
+  if (!existsSync(dbPath)) {
+    edges.checked = true;
+    edges.failed = true;
+    return edges;
+  }
 
   const sql = [
     "select e.child_thread_id,e.status,t.rollout_path,t.title,t.agent_role,t.model,t.reasoning_effort,t.agent_nickname,t.cwd,t.updated_at",
@@ -1309,7 +1319,8 @@ function unwrapOperationResponseItem(item) {
 function operationResponse(payload, operation) {
   const response = toolResponse(payload);
   if (Array.isArray(response)) {
-    const matched = response.find((item) => operationResponseItemMatches(item, operation));
+    const matches = response.filter((item) => operationResponseItemMatches(item, operation));
+    const matched = matches[operation?.name_index ?? 0] ?? matches[0];
     return matched ? unwrapOperationResponseItem(matched) : response;
   }
   if (response && typeof response === "object") {
@@ -1318,7 +1329,8 @@ function operationResponse(payload, operation) {
     }
     for (const key of ["tool_uses", "toolUses", "results", "responses", "outputs"]) {
       if (Array.isArray(response[key])) {
-        const matched = response[key].find((item) => operationResponseItemMatches(item, operation));
+        const matches = response[key].filter((item) => operationResponseItemMatches(item, operation));
+        const matched = matches[operation?.name_index ?? 0] ?? matches[0];
         if (matched) return unwrapOperationResponseItem(matched);
       }
     }
@@ -1640,11 +1652,11 @@ function remainingSpawnBudget(summary, cap) {
 }
 
 function nativeEdgeSummary(summary) {
+  if (summary?.native_edge_failed) return "unavailable";
   if (summary?.native_edge_checked) {
     const authority = summary.native_edge_authoritative ? "authoritative" : "fallback";
     return `open=${summary.native_edge_active}, terminal_open=${summary.native_edge_terminal ?? 0}, unresolved_open_edges=${summary.native_edge_unresolved ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
   }
-  if (summary?.native_edge_failed) return "unavailable";
   return "not_checked";
 }
 
@@ -1795,11 +1807,14 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
   }
 
   const transcriptUnresolved = transcriptActive.size;
+  const transcriptEstimateCanOverrideFallback = Boolean(
+    transcriptPool.slotEstimateReliable && transcriptPool.slotEstimateEvents > 0,
+  );
   const transcriptSlotOccupied = clampSlotCount(
-    transcriptPool.slotEstimateEvents > 0 ? transcriptPool.slotOccupied : transcriptUnresolved,
+    transcriptEstimateCanOverrideFallback ? transcriptPool.slotOccupied : transcriptUnresolved,
     capValue,
   );
-  const transcriptSlotReliable = Boolean(transcriptPool.slotEstimateReliable && transcriptPool.slotEstimateEvents > 0);
+  const transcriptSlotReliable = transcriptEstimateCanOverrideFallback;
   const nativeUnresolved = nativeActive.size + nativeTerminal.size;
   const nativeSlotOccupied = clampSlotCount(nativeUnresolved, capValue);
   const trackedUnresolved = sessionSummary.tracked_occupied ?? sessionSummary.occupied;

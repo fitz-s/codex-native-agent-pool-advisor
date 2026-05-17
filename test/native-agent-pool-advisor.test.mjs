@@ -75,6 +75,26 @@ async function writeFalseTaskCompleteTranscript(home, id) {
   return path;
 }
 
+async function writeChildSessionTranscript(home, dateParts, parentId, id) {
+  const path = join(home, "sessions", ...dateParts, `${id}.jsonl`);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(
+    path,
+    [
+      JSON.stringify({
+        timestamp: "2026-05-16T08:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id,
+          source: { subagent: { thread_spawn: { parent_thread_id: parentId } } },
+        },
+      }),
+      '{"timestamp":"2026-05-16T08:00:02.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+    ].join("\n"),
+  );
+  return path;
+}
+
 async function runScript(scriptPath, home, args = [], envOverrides = {}) {
   return execFileAsync(process.execPath, [scriptPath, ...args], {
     env: { ...process.env, CODEX_HOME: home, ...envOverrides },
@@ -143,6 +163,26 @@ test("blocks wrapped spawn_agent when native edge cap is full", async () => {
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /6\/6/);
+  });
+});
+
+test("missing native edge database blocks spawn conservatively", async () => {
+  await withHome(async (home) => {
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /Native thread_spawn_edges could not be read/);
+    assert.match(output.reason, /native_current=unavailable/);
   });
 });
 
@@ -342,6 +382,105 @@ test("blocks wrapped multi-spawn when requested spawn count exceeds remaining ca
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /requested_spawns=2/);
+  });
+});
+
+test("wrapped multi-spawn post responses are matched by same-tool ordinal", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "multi_tool_use.parallel",
+      session_id: "parent1",
+      tool_input: {
+        tool_uses: [
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.3-codex-spark",
+              reasoning_effort: "low",
+              message: "map files",
+            },
+          },
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.3-codex-spark",
+              reasoning_effort: "low",
+              message: "map tests",
+            },
+          },
+        ],
+      },
+      tool_response: [
+        { recipient_name: "functions.spawn_agent", output: { agent_id: "child1" } },
+        { recipient_name: "functions.spawn_agent", output: "collab spawn failed: agent thread limit reached" },
+      ],
+    });
+
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const session = state.sessions["thread:parent1"];
+    assert.equal(session.agents.child1.status, "running");
+    assert.ok(session.last_cap_hit_at);
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map more files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /cap_hit_after_last_close=yes/);
+  });
+});
+
+test("wrapped multi-spawn post responses preserve distinct successful agent ids", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "multi_tool_use.parallel",
+      session_id: "parent1",
+      tool_input: {
+        tool_uses: [
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.3-codex-spark",
+              reasoning_effort: "low",
+              message: "map files",
+            },
+          },
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.3-codex-spark",
+              reasoning_effort: "low",
+              message: "map tests",
+            },
+          },
+        ],
+      },
+      tool_response: [
+        { recipient_name: "functions.spawn_agent", output: { agent_id: "child1" } },
+        { recipient_name: "functions.spawn_agent", output: { agent_id: "child2" } },
+      ],
+    });
+
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const agents = state.sessions["thread:parent1"].agents;
+    assert.equal(agents.child1.status, "running");
+    assert.equal(agents.child2.status, "running");
   });
 });
 
@@ -630,6 +769,92 @@ test("empty native table falls back to transcripts unless an explicit reset mark
   });
 });
 
+test("truncated transcript tail estimates do not undercut discovered child fallback", async () => {
+  await withHome(async (home) => {
+    const now = new Date();
+    const dateParts = [
+      String(now.getFullYear()).padStart(4, "0"),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    ];
+    for (let index = 1; index <= 6; index += 1) {
+      await writeChildSessionTranscript(home, dateParts, "parent1", `child${index}`);
+    }
+
+    const transcript = join(home, "parent-tail.jsonl");
+    await writeFile(
+      transcript,
+      [
+        "truncated prefix from unread transcript head",
+        '{"timestamp":"2026-05-16T08:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn-tail","arguments":"{\\"agent_type\\":\\"explorer\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn-tail","output":"{\\"agent_id\\":\\"tail-child\\"}"}}',
+      ].join("\n"),
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      transcript_path: transcript,
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /6\/6/);
+    assert.match(output.reason, /transcript_slot=6/);
+    assert.match(output.reason, /transcript_unresolved=7/);
+    assert.doesNotMatch(output.reason, /transcript_slot=1/);
+  });
+});
+
+test("truncated transcript tail close does not erase discovered child fallback", async () => {
+  await withHome(async (home) => {
+    const now = new Date();
+    const dateParts = [
+      String(now.getFullYear()).padStart(4, "0"),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    ];
+    for (let index = 1; index <= 6; index += 1) {
+      await writeChildSessionTranscript(home, dateParts, "parent1", `child${index}`);
+    }
+
+    const transcript = join(home, "parent-close-tail.jsonl");
+    await writeFile(
+      transcript,
+      [
+        "truncated prefix from unread transcript head",
+        '{"timestamp":"2026-05-16T08:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close-tail","arguments":"{\\"target\\":\\"not-a-discovered-child\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"close-tail","output":"{\\"status\\":\\"closed\\"}"}}',
+      ].join("\n"),
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      transcript_path: transcript,
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /6\/6/);
+    assert.match(output.reason, /transcript_slot=6/);
+    assert.match(output.reason, /transcript_unresolved=6/);
+    assert.doesNotMatch(output.reason, /transcript_slot=0/);
+  });
+});
+
 test("fresh lock contention blocks spawn conservatively", async () => {
   await withHome(async (home) => {
     await mkdir(join(home, "state", "native-agent-pool-advisor.lock"), { recursive: true });
@@ -665,6 +890,42 @@ test("successful close_agent is the only automatic native edge release", async (
     });
 
     assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "closed|1");
+  });
+});
+
+test("wait_agent completion does not release a native edge slot", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open'),('parent1','child4','open'),('parent1','child5','open'),('parent1','child6','open');",
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "wait_agent",
+      session_id: "parent1",
+      tool_input: { targets: ["child1"] },
+      tool_response: { completed: "done" },
+    });
+
+    assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "open|6");
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /6\/6/);
+    assert.match(output.reason, /native_current=open=6/);
   });
 });
 
