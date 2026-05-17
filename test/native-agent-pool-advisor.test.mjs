@@ -991,7 +991,29 @@ test("session start emits cap pressure after resume before a spawn is attempted"
 
     assert.match(output.hookSpecificOutput.additionalContext, /occupied=6\/6/);
     assert.match(output.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
+    assert.match(output.hookSpecificOutput.additionalContext, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
     assert.match(output.hookSpecificOutput.additionalContext, /When remaining_spawn_budget is 0, do not call spawn_agent/);
+  });
+});
+
+test("zero budget guidance says send_input does not make spawning safe", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','a1','open'),('parent1','a2','open'),('parent1','a3','open'),('parent1','a4','open'),('parent1','a5','open'),('parent1','a6','open');",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "Send messages to two existing agents, then use one more explorer if needed.",
+    });
+    const context = output.hookSpecificOutput.additionalContext;
+
+    assert.match(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
+    assert.match(context, /even after send_input or wait_agent/);
+    assert.match(context, /send_input and wait_agent do not increase the spawn budget/);
   });
 });
 

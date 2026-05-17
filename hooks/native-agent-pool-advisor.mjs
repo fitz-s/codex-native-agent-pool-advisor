@@ -1703,11 +1703,15 @@ function terminalCloseTargetGuidance(summary) {
 function buildTurnBudgetGuidance(summary, cap) {
   if (!summary) return "";
   const remaining = remainingSpawnBudget(summary, cap);
+  const hardDirective = remaining === 0
+    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true. remaining_spawn_budget=0: do not call spawn_agent in this assistant response, even after send_input or wait_agent. Only a successful close_agent result can make a later spawn safe."
+    : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. Launch at most one spawn_agent before re-checking capacity; each spawn_agent call immediately decrements this local counter.`;
   return [
+    hardDirective,
     `Current native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_current=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
     terminalCloseTargetGuidance(summary),
     "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result.",
-    "When remaining_spawn_budget is 0, do not call spawn_agent. Reuse a compatible completed lane with send_input, wait for active agents, continue locally, or close a no-longer-needed lane first.",
+    "When remaining_spawn_budget is 0, do not call spawn_agent. You may reuse compatible lanes with send_input, wait for active agents, continue locally, or close a no-longer-needed lane first, but send_input and wait_agent do not increase the spawn budget.",
   ].filter(Boolean).join(" ");
 }
 
