@@ -6,7 +6,7 @@
     <title>Codex Native Agent Pool Advisor</title>
     <meta
       name="description"
-      content="A Codex Desktop hook that prevents invisible native subagent pool exhaustion, long failed prompts, and stale completed-agent accounting."
+      content="A Codex Desktop and CLI hook that prevents invisible native subagent pool exhaustion, long failed prompts, and stale completed-agent accounting."
     >
     <style>
       :root {
@@ -331,10 +331,10 @@
       <main>
         <section class="hero">
           <div>
-            <p class="eyebrow">Subagent capacity guardrail for Codex Desktop</p>
-            <h1>Stop losing long prompts to invisible native subagent limits.</h1>
+            <p class="eyebrow">Native subagent pool guardrail for Codex Desktop and CLI</p>
+            <h1>Stop wasting context on failed six-slot subagent spawns.</h1>
             <p class="lead">
-              Has your Codex agent ever written a careful 900-word reviewer prompt, then failed because it did not know there were only six native subagent slots? This hook makes the pool visible before the agent wastes the turn.
+              Has your Codex agent ever written a careful reviewer prompt, hit the native subagent cap, then spent the next turn closing lanes and restating the same prompt? This hook makes the pool visible before the agent burns context and attention.
             </p>
             <div class="actions">
               <a class="button primary" href="#install">Install the hook</a>
@@ -354,7 +354,7 @@
             <pre><span class="dim">agent:</span> I will spawn reviewer, verifier, and critic...
 <span class="bad">runtime:</span> unable to create 1 agent
 <span class="bad">runtime:</span> native subagent pool is full
-<span class="dim">agent:</span> closing six old agents, retrying long prompt...
+<span class="dim">agent:</span> closing old agents, retrying long prompt...
 
 <span class="good">advisor:</span> occupied=5/6, remaining_spawn_budget=1
 <span class="good">advisor:</span> requested_spawns=2 would exceed cap
@@ -365,15 +365,23 @@
         <section class="band">
           <div class="section-heading">
             <h2>What it prevents</h2>
-            <p>The hook does not decide whether to delegate. It only keeps Codex from colliding with native pool reality.</p>
+            <p>The hook does not decide whether to delegate. It keeps Codex from wasting the leader turn on native pool reality the model cannot reliably see.</p>
           </div>
           <div class="grid">
             <article class="card">
-              <h3>Invisible cap hits</h3>
-              <p>Reads per-parent native edge state and injects current budget before launch-heavy turns.</p>
+              <h3>Long-prompt loss</h3>
+              <p>Warns before the agent spends a full reviewer, verifier, or explorer prompt on a spawn that cannot fit.</p>
             </article>
             <article class="card">
-              <h3>Batch spawn failures</h3>
+              <h3>Invisible cap hits</h3>
+              <p>Reads per-parent native edge state and injects occupied/remaining budget before launch-heavy turns.</p>
+            </article>
+            <article class="card">
+              <h3>Blind retry loops</h3>
+              <p>Blocks doomed over-cap spawns so the leader does not close lanes, restate prompts, and drift from the task.</p>
+            </article>
+            <article class="card">
+              <h3>Batch overbooking</h3>
               <p>Counts nested wrapper calls so two requested spawns consume two slots before approval.</p>
             </article>
             <article class="card">
@@ -382,18 +390,14 @@
             </article>
             <article class="card">
               <h3>Recursive delegation</h3>
-              <p>Blocks child agents from spawning their own reviewers, verifiers, or explorers.</p>
+              <p>Blocks child agents from spawning their own reviewers, verifiers, researchers, or explorers.</p>
             </article>
             <article class="card">
-              <h3>Wrong explorer model</h3>
-              <p>Requires read-only explorer work to use a configured fast model lane instead of inheriting a frontier model.</p>
+              <h3>Model drift</h3>
+              <p>Requires read-only explorer work to set an explicit configured model instead of inheriting a frontier model by accident.</p>
             </article>
             <article class="card">
-              <h3>Contract drift</h3>
-              <p>Advises when a prompt asks a scout lane to own synthesis, edits, approval, or repeated compaction.</p>
-            </article>
-            <article class="card">
-              <h3>Destructive reset drift</h3>
+              <h3>Unsafe reset drift</h3>
               <p>Uses dry-run force tokens before clearing native edge state.</p>
             </article>
           </div>
@@ -403,7 +407,7 @@
           <div class="split">
             <div class="section-heading">
               <h2>Install</h2>
-              <p>Run tests first, install into your Codex home, then verify the live hook registration with doctor.</p>
+              <p>Run tests first, install into the active Codex home, then verify the live Desktop or CLI hook registration with doctor.</p>
             </div>
             <div class="code-block">
               <pre>git clone https://github.com/fitz-s/codex-native-agent-pool-advisor.git
@@ -418,20 +422,20 @@ node scripts/doctor.mjs</pre>
         <section id="configure" class="band">
           <div class="section-heading">
             <h2>Configure the non-universal parts</h2>
-            <p>Model catalogs, state DB names, and fallback policies vary by Codex install. Keep them outside the hook logic.</p>
+            <p>Codex Desktop and CLI installs can differ in model names, state DB names, caps, and CODEX_HOME. Keep those details outside the hook logic.</p>
           </div>
           <div class="grid" style="margin-bottom: 22px;">
             <article class="card">
-              <h3>Spark scan lane</h3>
-              <p><code>gpt-5.3-codex-spark</code> is treated as the near-instant scout lane for grep, file maps, symbol lookup, log filtering, file:line anchors, and fast hypothesis probes inside larger workflows.</p>
+              <h3>Shared hook runtime</h3>
+              <p>The installer writes to <code>$CODEX_HOME/hooks/</code> and registers <code>UserPromptSubmit</code>, <code>PreToolUse</code>, and <code>PostToolUse</code>.</p>
             </article>
             <article class="card">
-              <h3>Mini reasoning lane</h3>
-              <p><code>gpt-5.4-mini</code> is treated as the reasoning explorer / light executor lane for multi-hop traces, compact synthesis, small low-risk edits, and bounded verification.</p>
+              <h3>Native state source</h3>
+              <p>The default budget source is <code>state_5.sqlite</code> and <code>thread_spawn_edges</code>. Override it when a Codex build moves the DB.</p>
             </article>
             <article class="card">
-              <h3>Advisory contract</h3>
-              <p>The hook does not block Spark because a task sounds complex. It asks the parent to cap scope/output, return anchors, or escalate synthesis to mini/frontier.</p>
+              <h3>Model advisory</h3>
+              <p>Explorer model hints are secondary. The primary guard is still the six-slot pool budget and stale-open accounting.</p>
             </article>
           </div>
           <div class="split">
@@ -476,21 +480,21 @@ node scripts/doctor.mjs</pre>
 
         <section>
           <div class="section-heading">
-            <h2>Route by contract</h2>
-            <p>OpenAI's agent guidance points to explicit model choice per specialist and mixed model sizes in the same workflow. This hook follows that shape: it blocks missing explicit explorer models, but it only advises on Spark/Mini contract fit.</p>
+            <h2>Model routing is secondary</h2>
+            <p>The main product is not a model taxonomy. It is a runtime guardrail against failed native spawns and the attention drift that follows them.</p>
           </div>
           <div class="grid">
             <article class="card">
-              <h3>Official basis</h3>
-              <p>Codex subagents are useful for read-heavy exploration, triage, tests, and summarization; model and reasoning settings should differ by agent need.</p>
+              <h3>Spark scout</h3>
+              <p>Use fast scout lanes for bounded anchors, file maps, log filters, and hypothesis probes that protect the leader context.</p>
             </article>
             <article class="card">
-              <h3>Community pressure</h3>
-              <p>Large repositories and compaction-heavy investigations need cheaper context-isolated exploration lanes before the leader spends frontier context.</p>
+              <h3>Mini reasoning lane</h3>
+              <p>Use mini for compact synthesis, light low-risk execution, and bounded verification when the child owns a durable conclusion.</p>
             </article>
             <article class="card">
               <h3>Hook boundary</h3>
-              <p>The hook enforces observable runtime safety. It does not decide whether Spark, mini, or frontier owns the next reasoning step.</p>
+              <p>The hook only enforces observable runtime safety. It does not decide whether Spark, mini, or frontier owns the next reasoning step.</p>
             </article>
           </div>
         </section>
@@ -508,7 +512,7 @@ node scripts/reset-pool.mjs --parent &lt;thread_id&gt; --force &lt;token_from_dr
       </main>
 
       <footer>
-        MIT licensed. Built for Codex Desktop native subagent pool visibility.
+        MIT licensed. Built for Codex native subagent pool visibility across Desktop and CLI hook runtimes.
       </footer>
     </div>
   </body>

@@ -1,8 +1,28 @@
 # Codex Native Agent Pool Advisor
 
-Guardrail hook for Codex Desktop native subagents. It keeps the parent-thread subagent budget visible, blocks capacity-collision spawns, blocks recursive child-agent spawning, and nudges read-only explorer lanes toward explicit, configured models.
+Guardrail hook for Codex native subagents in Codex Desktop and Codex CLI installs that use the shared `~/.codex` hook/state runtime. It prevents the recurring failure mode where an agent spends a long prompt on a new reviewer/verifier/explorer, hits the six-subagent native pool cap, then burns more context and attention closing old lanes and retrying.
 
 Project page: <https://fitz-s.github.io/codex-native-agent-pool-advisor/>
+
+## What Problem It Solves
+
+Codex can delegate work to native subagents, but the pool limit is easy for the model to lose track of during long tasks. The expensive failure looks like this:
+
+1. The leader writes a detailed child-agent prompt.
+2. Runtime rejects the spawn because the native pool is already full.
+3. The leader explains the failure, closes several agents, restates the prompt, or tries a different batch.
+4. The thread loses context budget and attention before any useful review, verification, or exploration happens.
+
+This hook makes that category of waste visible and harder to repeat. It injects the current per-parent budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion, treats successful `close_agent` as the only normal slot release, and surfaces stale completed `open` edges that would otherwise make the pool look full forever.
+
+Model routing is secondary. The hook can nudge explorer prompts toward explicit Spark/Mini lanes, but its root job is launch/capacity discipline: fewer failed spawns, fewer repeated prompts, and less leader-context drift.
+
+## Compatibility
+
+- Works with Codex Desktop and Codex CLI when they read the same `~/.codex/hooks.json`, hook events, and native SQLite state layout.
+- Uses `CODEX_HOME` when set; otherwise defaults to `~/.codex`.
+- Reads native pool state from `state_5.sqlite` by default. Override the DB name/path if a Codex build moves it.
+- Installs for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`; run `node scripts/doctor.mjs` after install to confirm the active runtime is actually using this hook.
 
 ## Runtime Model
 
@@ -20,7 +40,7 @@ Project page: <https://fitz-s.github.io/codex-native-agent-pool-advisor/>
 
 ## Prerequisites
 
-- Codex Desktop with native subagents and `~/.codex/state_5.sqlite`.
+- Codex Desktop or Codex CLI with native subagents, hook events, and `~/.codex/state_5.sqlite`.
 - Node.js 22 or newer.
 - `sqlite3` on `PATH`.
 
@@ -33,11 +53,11 @@ node scripts/install.mjs
 node scripts/doctor.mjs
 ```
 
-The installer copies `hooks/native-agent-pool-advisor.mjs` to `~/.codex/hooks/` and registers it for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
+The installer copies `hooks/native-agent-pool-advisor.mjs` to `$CODEX_HOME/hooks/` and registers it for `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`.
 
 The installer is idempotent: repeated installs should leave one registration per hook event.
 
-## Model Routing
+## Delegation Guidance
 
 | Model lane | Use for | Boundary |
 | --- | --- | --- |
@@ -59,7 +79,7 @@ This project follows OpenAI's public agent guidance rather than a local complexi
 
 ## Configuration
 
-Create `~/.codex/native-agent-pool-advisor.config.json` when your Codex install uses different model names, a different fallback cap, or a different native state DB name.
+Create `$CODEX_HOME/native-agent-pool-advisor.config.json` when your Codex install uses different model names, a different fallback cap, or a different native state DB name.
 If only `models.explorer` is set, the first model is treated as preferred and the second as fallback.
 
 ```json
@@ -110,7 +130,7 @@ Use `--remove-hook-file` only if no other local process references `~/.codex/hoo
 
 Use reset only when the native edge table is known to contain stale rows that no current parent can close.
 
-Danger: `reset-pool.mjs` deletes rows from Codex Desktop's `thread_spawn_edges` table. Always run `--dry-run` first. A reset creates a timestamped backup of `state_5.sqlite`; keep that backup until a fresh Codex session has proven the pool budget is healthy.
+Danger: `reset-pool.mjs` deletes rows from Codex's `thread_spawn_edges` table. Always run `--dry-run` first. A reset creates a timestamped backup of `state_5.sqlite`; keep that backup until a fresh Codex session has proven the pool budget is healthy.
 
 ```bash
 node scripts/reset-pool.mjs --parent <parent_thread_id> --dry-run
@@ -140,6 +160,6 @@ The test suite covers wrapper-spawn blocking, explicit explorer model enforcemen
 ## Known Limits
 
 - This hook is intentionally fail-open on unexpected internal errors so it does not break ordinary Codex tool execution. It blocks only when it has enough state to identify an unsafe spawn, a recursive child spawn, a lock/contention risk, or a model-route violation.
-- If a Codex spawn surface bypasses `PreToolUse` entirely, the hook cannot block it in-process; `UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback.
+- If a Codex Desktop or CLI spawn surface bypasses `PreToolUse` entirely, the hook cannot block it in-process; `UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback.
 - Historical `hooks.json` backups and setup restore paths can replay old hook stacks. See `docs/runtime-audit.md`.
 - This hook is a launch/capacity guard, not a delegation decision maker.
