@@ -29,12 +29,15 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 
 - Spawn admission is scoped to the current parent/session. The advisor reads native `thread_spawn_edges` rows where `parent_thread_id` matches the current parent thread; rows from other parent sessions do not affect this turn's budget.
 - There is no global runtime pool counter in normal admission. Global reset tools are operator repair surfaces for stale state, not spawn-budget authority.
+- A spawn hook payload without `session_id`, `thread_id`, transcript `session_meta`, or `parent_thread_id` is unscoped and blocks conservatively. It must not fall back to a shared working-directory bucket.
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
-- `occupied` is a saturated current-parent slot estimate and is never reported above the cap. Extra current-parent `open` rows are surfaced separately as `unresolved_open_edges` and `open_edge_overflow`.
+- `occupied` is a saturated current-parent runtime slot estimate and is never reported above the cap. Extra current-parent `open` rows are surfaced separately as `db_open_edge_debt` and `open_edge_overflow`; they are persistent-state repair debt, not additional live subagents.
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
 - `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
 - A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
 - The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Runtime `not found` / `unknown agent` close evidence is also treated as a stale-unreachable lane and repaired to `closed`; other close failures do not free capacity.
+- Runtime `not found` close evidence only releases a slot when the current parent owns the matching native edge row, or when native edge state is unavailable and transcript fallback is the only evidence source. A typo or foreign target does not free current-parent capacity.
+- Child transcript terminal detection checks beyond the tail window when needed, so a long transcript with an earlier `task_complete` does not get mislabeled as an active open lane.
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
 - Child sessions do not receive proactive prompt-time delegation guidance. A child that needs more delegation should report that recommendation upward; the parent leader owns slot closure and relaunch.
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.

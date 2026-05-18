@@ -566,13 +566,20 @@ async function sessionIdentity(payload) {
   const threadId = transcriptThreadId || directThreadId;
   const parentThreadId = parentThreadIdFromChildMeta(transcriptMeta) || directParentThreadId(payload);
   const poolThreadId = parentThreadId || threadId;
+  const unscoped = !poolThreadId;
   return {
     threadId,
     parentThreadId,
     poolThreadId,
     transcript,
-    key: poolThreadId ? `thread:${poolThreadId}` : stableSessionKey(payload),
+    key: poolThreadId ? `thread:${poolThreadId}` : `unscoped:${hashText(JSON.stringify({
+      event: hookEventName(payload),
+      tool: toolName(payload),
+      transcript,
+      prompt: promptText(payload),
+    }))}`,
     isChildSession: Boolean(parentThreadId) || directChildSessionFlag(payload),
+    unscoped,
   };
 }
 
@@ -901,15 +908,9 @@ async function transcriptHasTaskComplete(path) {
       handle = await open(path, "r");
       const buffer = Buffer.alloc(stats.size - start);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-      for (const line of buffer.subarray(0, bytesRead).toString("utf-8").split(/\r?\n/)) {
-        if (!line.includes('"task_complete"')) continue;
-        const record = parseJsonLine(line);
-        const payload = safeObject(record?.payload);
-        if (record?.type === "event_msg" && payload?.type === "task_complete") {
-          return true;
-        }
-      }
-      return false;
+      if (textHasTaskCompleteEvent(buffer.subarray(0, bytesRead).toString("utf-8"))) return true;
+      if (start === 0) return false;
+      return await scanTranscriptForTaskComplete(path, stats.size);
     } finally {
       try {
         await handle?.close();
@@ -922,13 +923,61 @@ async function transcriptHasTaskComplete(path) {
   }
 }
 
-async function repairClosedNativeEdges(parentThreadId, closedIds) {
+function textHasTaskCompleteEvent(text) {
+  for (const line of safeString(text).split(/\r?\n/)) {
+    if (!line.includes('"task_complete"')) continue;
+    const record = parseJsonLine(line);
+    const payload = safeObject(record?.payload);
+    if (record?.type === "event_msg" && payload?.type === "task_complete") {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function scanTranscriptForTaskComplete(path, size) {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    const chunkSize = 1024 * 1024;
+    const buffer = Buffer.alloc(chunkSize);
+    let offset = 0;
+    let carry = "";
+    while (offset < size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(chunkSize, size - offset), offset);
+      if (bytesRead <= 0) break;
+      offset += bytesRead;
+      const text = carry + buffer.subarray(0, bytesRead).toString("utf-8");
+      const lines = text.split(/\r?\n/);
+      carry = lines.pop() ?? "";
+      if (textHasTaskCompleteEvent(lines.join("\n"))) return true;
+    }
+    return textHasTaskCompleteEvent(carry);
+  } catch {
+    return false;
+  } finally {
+    try {
+      await handle?.close();
+    } catch {
+      // best effort
+    }
+  }
+}
+
+async function repairClosedNativeEdgeIds(parentThreadId, closedIds) {
   const ids = [...(closedIds ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
   const parentId = safeString(parentThreadId).trim();
-  if (ids.length === 0 || !parentId) return 0;
+  if (ids.length === 0 || !parentId) return new Set();
   const dbPath = stateDbPath();
-  if (!existsSync(dbPath)) return 0;
+  if (!existsSync(dbPath)) return new Set();
 
+  const selectSql = [
+    "select child_thread_id",
+    "from thread_spawn_edges",
+    "where status!='closed'",
+    `and parent_thread_id=${sqlString(parentId)}`,
+    `and child_thread_id in (${ids.map(sqlString).join(",")});`,
+  ].join(" ");
   const sql = [
     "pragma busy_timeout=250;",
     "update thread_spawn_edges",
@@ -940,6 +989,18 @@ async function repairClosedNativeEdges(parentThreadId, closedIds) {
   ].join(" ");
 
   try {
+    const { stdout: selectStdout } = await execFileAsync("sqlite3", ["-json", dbPath, selectSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const repairableRows = parseSqliteJsonOutput(selectStdout);
+    const repairableIds = new Set(
+      (Array.isArray(repairableRows) ? repairableRows : [])
+        .map((row) => safeString(row?.child_thread_id).trim())
+        .filter(Boolean),
+    );
+    if (repairableIds.size === 0) return repairableIds;
+
     const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
       timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
       maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
@@ -954,10 +1015,14 @@ async function repairClosedNativeEdges(parentThreadId, closedIds) {
         changed,
       });
     }
-    return Number.isFinite(changed) ? changed : 0;
+    return changed > 0 ? repairableIds : new Set();
   } catch {
-    return 0;
+    return new Set();
   }
+}
+
+async function repairClosedNativeEdges(parentThreadId, closedIds) {
+  return (await repairClosedNativeEdgeIds(parentThreadId, closedIds)).size;
 }
 
 async function applyMissingCloseEvidence(parentThreadId, transcriptPool, nativeThreadEdges) {
@@ -965,21 +1030,23 @@ async function applyMissingCloseEvidence(parentThreadId, transcriptPool, nativeT
   const parentId = safeString(parentThreadId).trim();
   if (!parentId || ids.length === 0) return 0;
 
-  const changed = await repairClosedNativeEdges(parentId, ids);
-  for (const id of ids) {
+  const repairedIds = await repairClosedNativeEdgeIds(parentId, ids);
+  const nativeAuthoritative = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
+  const effectiveIds = nativeAuthoritative ? repairedIds : new Set(ids);
+  for (const id of effectiveIds) {
     nativeThreadEdges?.active?.delete(id);
     nativeThreadEdges?.terminal?.delete(id);
     nativeThreadEdges?.closed?.add(id);
   }
-  if (changed > 0) {
+  if (repairedIds.size > 0) {
     await appendAdvisorLog({
       event: "native_edge_close_not_found_repair",
       parent_thread_id: parentId,
       requested: ids.length,
-      changed,
+      changed: repairedIds.size,
     });
   }
-  return changed;
+  return repairedIds.size;
 }
 
 async function maintainNativePoolStorage(state, nowMs, nowIso) {
@@ -1675,7 +1742,7 @@ function nativeEdgeSummary(summary) {
   if (summary?.native_edge_failed) return "unavailable";
   if (summary?.native_edge_checked) {
     const authority = summary.native_edge_authoritative ? "authoritative" : "fallback";
-    return `open=${summary.native_edge_active}, terminal_open=${summary.native_edge_terminal ?? 0}, unresolved_open_edges=${summary.native_edge_unresolved ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
+    return `slot_open=${summary.native_edge_active ?? 0}, slot_terminal=${summary.native_edge_terminal ?? 0}, slot_estimate=${summary.native_edge_slot_occupied ?? summary.occupied}/${summary.native_edge_cap ?? "?"}, db_open_edge_debt=${summary.native_edge_debt ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
   }
   return "not_checked";
 }
@@ -1717,7 +1784,10 @@ function terminalCloseTargetGuidance(summary) {
   const terminalText = lanes.length > 0
     ? `Current-parent completed-not-closed native edge candidates: ${lanes.map(formatTerminalLaneSummary).join(" | ")}.`
     : "";
-  return `${activeText} ${terminalText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
+  const overflowText = (summary?.native_edge_overflow ?? 0) > 0
+    ? `Native DB open-edge debt exceeds the ${summary.native_edge_cap ?? "configured"}-slot runtime cap: db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}. Overflow rows are repair debt, not additional live agents.`
+    : "";
+  return `${activeText} ${terminalText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
@@ -1728,7 +1798,7 @@ function buildTurnBudgetGuidance(summary, cap) {
     : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. Launch at most one spawn_agent before re-checking capacity; each spawn_agent call immediately decrements this local counter.`;
   return [
     hardDirective,
-    `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_current=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
+    `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
     terminalCloseTargetGuidance(summary),
     "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
     "When remaining_spawn_budget is 0, do not call spawn_agent. Continue locally or close a known no-longer-needed current-parent lane first; send_input and wait_agent do not increase the spawn budget.",
@@ -1842,7 +1912,13 @@ function mergeSummary(
   );
   const transcriptSlotReliable = transcriptEstimateCanOverrideFallback;
   const nativeUnresolved = nativeActive.size + nativeTerminal.size;
-  const nativeSlotOccupied = clampSlotCount(nativeUnresolved, capValue);
+  const nativeSlotActive = clampSlotCount(nativeActive.size, capValue);
+  const nativeSlotTerminal = clampSlotCount(
+    Math.min(nativeTerminal.size, Math.max(0, capValue - nativeSlotActive)),
+    capValue,
+  );
+  const nativeSlotOccupied = clampSlotCount(nativeSlotActive + nativeSlotTerminal, capValue);
+  const nativeEdgeOverflow = Math.max(0, nativeUnresolved - capValue);
   const trackedUnresolved = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
   const trackedOccupied = clampSlotCount(trackedUnresolved, capValue);
   const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
@@ -1885,18 +1961,23 @@ function mergeSummary(
     native_edge_checked: Boolean(nativeThreadEdges?.checked),
     native_edge_authoritative: nativeAuthoritative,
     native_edge_failed: Boolean(nativeThreadEdges?.failed),
-    native_edge_active: nativeActive.size,
+    native_edge_active: nativeSlotActive,
+    native_edge_active_debt: nativeActive.size,
     native_edge_closed: nativeClosed.size,
-    native_edge_terminal: nativeTerminal.size,
+    native_edge_terminal: nativeSlotTerminal,
+    native_edge_terminal_debt: nativeTerminal.size,
+    native_edge_slot_occupied: nativeSlotOccupied,
+    native_edge_debt: nativeUnresolved,
     native_edge_unresolved: nativeUnresolved,
-    native_edge_overflow: Math.max(0, nativeUnresolved - capValue),
+    native_edge_overflow: nativeEdgeOverflow,
+    native_edge_cap: capValue,
     slot_pressure_source: slotPressureSource,
-    native_terminal_ids: [...nativeTerminal].slice(0, DEFAULT_AGENT_CAP),
+    native_terminal_ids: [...nativeTerminal].slice(0, nativeSlotTerminal),
     native_terminal_lanes: [...nativeTerminal]
-      .slice(0, DEFAULT_AGENT_CAP)
+      .slice(0, nativeSlotTerminal)
       .map((id) => nativeLanes.get(id) ?? { id }),
     native_active_lanes: [...nativeActive]
-      .slice(0, DEFAULT_AGENT_CAP)
+      .slice(0, nativeSlotActive)
       .map((id) => nativeLanes.get(id) ?? { id }),
     native_edge_repaired: nativeThreadEdges?.repaired ?? 0,
     failed_spawns: transcriptPool.failedSpawns ?? 0,
@@ -1954,7 +2035,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     `ledger_unresolved=${summary.tracked_unresolved}`,
     `transcript_slot=${summary.transcript_occupied}`,
     `transcript_unresolved=${summary.transcript_unresolved}`,
-    `native_current=${nativeEdgeSummary(summary)}`,
+    `native_slots=${nativeEdgeSummary(summary)}`,
     `reserved_spawns=${summary.pending_spawn_reservations}`,
     `running=${summary.running}`,
     `completed_not_closed=${summary.terminal}`,
@@ -1991,7 +2072,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 	              : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary. Continue locally or close a no-longer-needed current-parent lane, then retry only one spawn per confirmed free slot."))
 	      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
     (summary.native_edge_overflow ?? 0) > 0
-      ? "Native open-edge evidence exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are diagnostic debt/candidates rather than additional live slots."
+      ? `Native DB open-edge debt exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are repair debt rather than additional live agents. db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}.`
       : null,
     summary.failed_closes > 0
       ? "At least one recent close was not confirmed; treat capacity as uncertain and serialize follow-up spawns."
@@ -2093,6 +2174,18 @@ async function main() {
     const nowMs = now.getTime();
     const nowIso = now.toISOString();
     const identity = await sessionIdentity(payload);
+    if (eventName === "PreToolUse" && hasSpawnOperation(operations) && identity.unscoped) {
+      const context = `Native agent pool guard: blocking spawn_agent because this hook payload has no session_id, thread_id, transcript_path session_meta, or parent_thread_id. Capacity is scoped per parent/session; an unscoped payload must not fall back to a shared cwd bucket. Retry only after Codex provides a scoped parent/session identity.`;
+      process.stdout.write(`${JSON.stringify({
+        decision: "block",
+        reason: context,
+        hookSpecificOutput: {
+          hookEventName: eventName,
+          additionalContext: context,
+        },
+      })}\n`);
+      return;
+    }
 
     const lockResult = await withStateLock(async () => {
       const state = await readState();
@@ -2167,8 +2260,10 @@ async function main() {
             ? collectCloseTargetIds(operationPayload)
             : [];
           if (missingCloseIds.length > 0) {
-            await repairClosedNativeEdges(identity.poolThreadId, missingCloseIds);
-            for (const id of missingCloseIds) {
+            const repairedIds = await repairClosedNativeEdgeIds(identity.poolThreadId, missingCloseIds);
+            const nativeAuthoritative = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
+            const effectiveIds = nativeAuthoritative ? repairedIds : new Set(missingCloseIds);
+            for (const id of effectiveIds) {
               delete session.agents[id];
               nativeThreadEdges.active?.delete(id);
               nativeThreadEdges.terminal?.delete(id);
@@ -2177,7 +2272,7 @@ async function main() {
               transcriptPool.closed.add(id);
               transcriptPool.missingClosed.add(id);
             }
-            session.last_close_at = nowIso;
+            if (effectiveIds.size > 0) session.last_close_at = nowIso;
             continue;
           }
 

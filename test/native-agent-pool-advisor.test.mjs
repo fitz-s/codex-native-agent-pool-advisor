@@ -76,6 +76,19 @@ async function writeFalseTaskCompleteTranscript(home, id) {
   return path;
 }
 
+async function writeEarlyTaskCompleteLongTranscript(home, id) {
+  const path = join(home, `${id}-long.jsonl`);
+  await writeFile(
+    path,
+    [
+      `{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"${id}"}}`,
+      '{"timestamp":"2026-05-16T08:00:02.000Z","type":"event_msg","payload":{"type":"task_complete"}}',
+      "x".repeat((2 * 1024 * 1024) + 4096),
+    ].join("\n"),
+  );
+  return path;
+}
+
 async function writeChildSessionTranscript(home, dateParts, parentId, id) {
   const path = join(home, "sessions", ...dateParts, `${id}.jsonl`);
   await mkdir(dirname(path), { recursive: true });
@@ -183,7 +196,26 @@ test("missing native edge database blocks spawn conservatively", async () => {
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /Native thread_spawn_edges could not be read/);
-    assert.match(output.reason, /native_current=unavailable/);
+    assert.match(output.reason, /native_slots=unavailable/);
+  });
+});
+
+test("unscoped spawn hook payload blocks instead of merging cwd state", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /unscoped payload must not fall back to a shared cwd bucket/);
   });
 });
 
@@ -231,7 +263,7 @@ test("unrelated parent native open edges do not emit zero budget on current prom
     const context = output.hookSpecificOutput.additionalContext;
 
     assert.match(context, /^SPAWN_AGENT_LOCAL_COUNTER_START=6/);
-    assert.match(context, /native_current=open=0/);
+    assert.match(context, /native_slots=slot_open=0/);
     assert.doesNotMatch(context, /native_global/);
     assert.doesNotMatch(context, /Global native/);
   });
@@ -597,7 +629,7 @@ test("native open edges with task_complete transcripts still occupy capacity unt
       prompt: "spawn agent status",
     });
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=6\/6/);
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_current=open=0, terminal_open=6/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_slots=slot_open=0, slot_terminal=6/);
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /successful close_agent result or runtime not-found close evidence decrements/);
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
 
@@ -614,7 +646,7 @@ test("native open edges with task_complete transcripts still occupy capacity unt
     });
     assert.equal(spawnOutput.decision, "block");
     assert.match(spawnOutput.reason, /6\/6/);
-    assert.match(spawnOutput.reason, /terminal_open=6/);
+    assert.match(spawnOutput.reason, /slot_terminal=6/);
   });
 });
 
@@ -641,8 +673,11 @@ test("overfull native open-edge evidence saturates occupied at the runtime cap",
     const context = promptOutput.hookSpecificOutput.additionalContext;
     assert.match(context, /occupied=6\/6/);
     assert.doesNotMatch(context, /occupied=8\/6/);
-    assert.match(context, /unresolved_open_edges=8/);
+    assert.match(context, /slot_estimate=6\/6/);
+    assert.match(context, /db_open_edge_debt=8/);
     assert.match(context, /open_edge_overflow=2/);
+    assert.doesNotMatch(context, /terminal_open/);
+    assert.doesNotMatch(context, /unresolved_open_edges/);
 
     const spawnOutput = await runHook(home, {
       hook_event_name: "PreToolUse",
@@ -658,6 +693,10 @@ test("overfull native open-edge evidence saturates occupied at the runtime cap",
     assert.equal(spawnOutput.decision, "block");
     assert.match(spawnOutput.reason, /6\/6/);
     assert.match(spawnOutput.reason, /open_edge_overflow=2/);
+    assert.match(spawnOutput.reason, /slot_estimate=6\/6/);
+    assert.match(spawnOutput.reason, /db_open_edge_debt=8/);
+    assert.doesNotMatch(spawnOutput.reason, /terminal_open/);
+    assert.doesNotMatch(spawnOutput.reason, /unresolved_open_edges/);
   });
 });
 
@@ -698,7 +737,8 @@ test("transcript close after a cap hit does not override current-parent overfull
     assert.match(context, /occupied=6\/6/);
     assert.match(context, /remaining_spawn_budget=0/);
     assert.match(context, /slot_pressure_source=native_open_edges_saturated/);
-    assert.match(context, /native_current=open=0, terminal_open=8, unresolved_open_edges=8/);
+    assert.match(context, /native_slots=slot_open=0, slot_terminal=6, slot_estimate=6\/6, db_open_edge_debt=8/);
+    assert.doesNotMatch(context, /terminal_open=8/);
     assert.doesNotMatch(context, /native_global/);
 
     const spawnOutput = await runHook(home, {
@@ -714,7 +754,8 @@ test("transcript close after a cap hit does not override current-parent overfull
       },
     });
     assert.equal(spawnOutput.decision, "block");
-    assert.match(spawnOutput.reason, /native_current=open=0, terminal_open=8, unresolved_open_edges=8/);
+    assert.match(spawnOutput.reason, /native_slots=slot_open=0, slot_terminal=6, slot_estimate=6\/6, db_open_edge_debt=8/);
+    assert.doesNotMatch(spawnOutput.reason, /terminal_open=8/);
     assert.doesNotMatch(spawnOutput.reason, /native_global/);
   });
 });
@@ -789,7 +830,7 @@ test("transcript close not found repairs stale open edge before next prompt", as
     );
     assert.match(output.hookSpecificOutput.additionalContext, /occupied=5\/6/);
     assert.match(output.hookSpecificOutput.additionalContext, /remaining_spawn_budget=1/);
-    assert.match(output.hookSpecificOutput.additionalContext, /native_current=open=5, terminal_open=0/);
+    assert.match(output.hookSpecificOutput.additionalContext, /native_slots=slot_open=5, slot_terminal=0/);
   });
 });
 
@@ -821,7 +862,29 @@ test("task_complete text in non-event transcript records does not mark native ed
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /native_current=open=6, terminal_open=0/);
+    assert.match(output.reason, /native_slots=slot_open=6, slot_terminal=0/);
+  });
+});
+
+test("task_complete outside terminal tail still marks native edge terminal", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const path = await writeEarlyTaskCompleteLongTranscript(home, "child1");
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+    await sqlite(
+      home,
+      `insert into threads values ('child1','${path}','done child1','explorer','gpt-5.3-codex-spark','low','Agent 1','/tmp',1778920000);`,
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "spawn agent status",
+    });
+
+    const context = output.hookSpecificOutput.additionalContext;
+    assert.match(context, /native_slots=slot_open=0, slot_terminal=1/);
+    assert.match(context, /db_open_edge_debt=1/);
   });
 });
 
@@ -1040,6 +1103,39 @@ test("close_agent not found marks current-parent native edge unreachable", async
   });
 });
 
+test("close_agent not found for non-owned target does not release current-parent capacity", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open'),('parent1','child4','open'),('parent1','child5','open'),('parent1','child6','open');",
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "parent1",
+      tool_input: { target: "typo-child" },
+      tool_response: "agent with id typo-child not found",
+    });
+
+    assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "open|6");
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+    });
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /6\/6 estimated slots occupied/);
+  });
+});
+
 test("wait_agent completion does not release a native edge slot", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -1072,7 +1168,7 @@ test("wait_agent completion does not release a native edge slot", async () => {
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /6\/6/);
-    assert.match(output.reason, /native_current=open=6/);
+    assert.match(output.reason, /native_slots=slot_open=6/);
   });
 });
 
