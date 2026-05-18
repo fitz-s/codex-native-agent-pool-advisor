@@ -30,7 +30,8 @@
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as unresolved/overflow evidence, not as `occupied > cap`.
 - `SessionStart` is a first-class guidance surface for parent sessions. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
 - Child sessions receive no proactive prompt-time delegation guidance. A child `spawn_agent` attempt is blocked at `PreToolUse`.
-- Explorer model routing is an allow-list plus advisory contract guidance, not a single hard-coded model and not a task-shape blocker. The default is Spark for near-instant scout/probe work plus mini for reasoning explorer / light executor work; installations can override model names in config or env.
+- Model selection is mandatory for every `spawn_agent` call. Missing `model` is blocked because it inherits the parent model; the default explicit choice is mini unless the leader judges that Spark or 5.5 fits the work better.
+- Explorer model routing is an allow-list plus advisory contract guidance, not a single hard-coded model and not a task-shape blocker. Spark is for near-instant scout/probe work, mini is the default reasoning/light-executor lane, and 5.5 is for critic/architecture/security/high-risk/final-approval work.
 - Complex explorer prompts on Spark are allowed when Spark is used as a bounded scout/anchor collector. The hook only advises the agent to cap scope/output or escalate synthesis/edit/final-approval follow-up to mini or a frontier reviewer.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
 - `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path.

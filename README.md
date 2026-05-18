@@ -15,7 +15,7 @@ Codex can delegate work to native subagents, but the pool limit is easy for the 
 
 This hook makes that category of waste visible and harder to repeat. It injects the current parent/session budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion at tool time, treats successful `close_agent` as the only normal slot release, and separates capped runtime slot pressure from stale or unresolved `open` edge debt.
 
-Model routing is secondary. The hook can nudge explorer prompts toward explicit Spark/Mini lanes, but its root job is launch/capacity discipline: fewer failed spawns, fewer repeated prompts, and less leader-context drift.
+Model routing is secondary but explicit. The hook requires every subagent spawn to include a deliberate model choice, with mini as the default when there is no stronger reason. That prevents accidental inheritance of the parent frontier model while still letting the leader choose Spark for scout work or 5.5 for critic/high-risk work.
 
 ## Compatibility
 
@@ -36,8 +36,9 @@ Model routing is secondary. The hook can nudge explorer prompts toward explicit 
 - The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Failed close attempts do not free capacity.
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
 - Child sessions do not receive proactive prompt-time delegation guidance. A child that attempts `spawn_agent` is blocked at `PreToolUse` and should report the need upward to its parent leader.
-- The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
-- Spark is treated as a near-instant scout lane that can support complex workflows when its output contract is bounded evidence, anchors, or hypotheses. Mini is treated as a reasoning explorer / light executor lane.
+- Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model, and that is blocked when the hook sees the spawn.
+- The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, or final approval.
+- Explorer model allow-list defaults to `gpt-5.3-codex-spark,gpt-5.4-mini`, so lookup lanes cannot silently spend `gpt-5.5`.
 - The hook does not block Spark because a prompt looks "complex"; it emits contract guidance and lets the parent agent choose.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
@@ -60,18 +61,19 @@ The installer copies `hooks/native-agent-pool-advisor.mjs` to `$CODEX_HOME/hooks
 
 The installer is idempotent: repeated installs should leave one registration per hook event.
 
-## Optional Model Route Guard
+## Mandatory Model Selection
 
-The capacity guard does not decide whether Codex should delegate. Model routing is an optional second guard for the cases where the leader has already chosen to spawn an explorer and the tool input would otherwise inherit an expensive frontier model.
+The capacity guard does not decide whether Codex should delegate. If the leader has already chosen to spawn, the hook requires the leader to make the model-selection judgment explicit instead of inheriting the parent model by accident.
 
 | Model lane | Use for | Boundary |
 | --- | --- | --- |
 | `gpt-5.3-codex-spark` | Near-instant scout work: grep/file maps, symbol lookup, log filtering, candidate file:line anchors, hypothesis sampling, bounded large-text scans, and fast evidence collection inside larger reasoning workflows. Usually `reasoning_effort=low`, but non-low effort is allowed when intentional. | Do not ask it to own final approval, broad synthesis, edits, or repeated compaction. If the task expands, it should stop and return anchors plus an escalation recommendation. |
-| `gpt-5.4-mini` | Reasoning explorer / light executor work: multi-hop code-path traces, semantic classification, config+test synthesis, small low-risk fixes, compact evidence reports, and bounded verification that needs a durable conclusion. Use `reasoning_effort=medium` or `high` when judgment matters. | Not the default for disposable grep if Spark is available. Do not use as final authority for architecture, security, live-money, or high-risk implementation. |
+| `gpt-5.4-mini` | Default subagent lane; reasoning explorer / light executor work: multi-hop code-path traces, semantic classification, config+test synthesis, small low-risk fixes, compact evidence reports, and bounded verification that needs a durable conclusion. Use `reasoning_effort=medium` or `high` when judgment matters. | Not the default for disposable grep if Spark is available. Do not use as final authority for architecture, security, live-money, or high-risk implementation. |
+| `gpt-5.5` | Critic, architecture, security judgment, high-risk implementation, and final approval. | Do not use for ordinary explorer/scout lanes or broad grep/file scans. |
 
 Route by output contract, risk, and context-state depth, not by complexity adjectives. A complex parent task can use Spark well if the child prompt asks for bounded scout output such as "return 12 file:line anchors and stop." A mini lane is better when the child owns synthesis, a small edit, or a durable low-risk verification result.
 
-The hook still blocks explorer spawns that omit an allowed model, because inherited frontier lookup burns the main resource silently. It only advises when a Spark or mini prompt looks mismatched to the lane.
+The hook blocks any spawn that omits `model`, because inheritance is exactly the failure mode. It still blocks explorer spawns that choose a model outside the configured explorer allow-list, and only advises when a Spark or mini prompt looks mismatched to the lane.
 
 ## Design Basis
 
@@ -106,7 +108,7 @@ If only `models.explorer` is set, the first model is treated as preferred and th
 
 Environment overrides are also supported:
 
-- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated explorer allow-list.
+- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated explorer allow-list. This does not change the global default: omitted model is still blocked, and the leader should explicitly choose mini when unsure.
 - `NATIVE_AGENT_POOL_EXPLORER_MODEL`: preferred explorer model.
 - `NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL`: fallback explorer model.
 - `NATIVE_AGENT_POOL_DEFAULT_CAP`: fallback cap when `[agents].max_threads` is absent.
@@ -160,7 +162,7 @@ npm run check
 npm test
 ```
 
-The test suite covers wrapper-spawn blocking, explicit explorer model enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, and explicit reset markers.
+The test suite covers wrapper-spawn blocking, universal explicit model enforcement, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, and explicit reset markers.
 
 ## Known Limits
 

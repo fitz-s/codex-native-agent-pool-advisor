@@ -1220,6 +1220,13 @@ function hasExplorerModelRouteViolationInOperations(operations) {
   });
 }
 
+function hasMissingSpawnModelInOperations(operations) {
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    return !operationModel(operation);
+  });
+}
+
 function countMatches(text, pattern) {
   return [...safeString(text).matchAll(pattern)].length;
 }
@@ -1531,6 +1538,11 @@ function looksLikeDelegationPrompt(prompt) {
   return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bagents?\b|\bpool\b|\bcap\b|\blimit\b|\bcritics?\b|\breviewers?\b|\breviews?\b|\bverifiers?\b|\bverif(?:y|ier|ication)\b|\bresearchers?\b|\baudit(?:or|ing)?\b|\bdelegate\b|\bparallel\b|\bfan[ -]?out\b|子代理|智能体|代理|上限|满池|名额|槽位|并行|派发|审查代理|验证代理|评审代理|复审代理|验收代理|审查|复核|评审|审计|验证|深度推理|第一性原理)/i.test(normalized);
 }
 
+function looksLikeSpawnIntentPrompt(prompt) {
+  const normalized = safeString(prompt).toLowerCase();
+  return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bagents?\b|\bexplorers?\b|\breviewers?\b|\bverifiers?\b|\bresearchers?\b|\bcritics?\b|\bparallel\b|\bfan[ -]?out\b|子代理|智能体|代理|explorer|并行|派发|审查代理|验证代理|评审代理|复审代理|调查代理|研究代理)/i.test(normalized);
+}
+
 function hasRecentCapacityPressure(session, nowMs) {
   const recentMs = 6 * 60 * 60 * 1000;
   const lastCapHit = msFromIso(session.last_cap_hit_at);
@@ -1588,6 +1600,7 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
       ),
   );
   if (criticalPressure) return true;
+  if (looksLikeSpawnIntentPrompt(prompt)) return true;
 
   const signature = hashText(prompt.trim().toLowerCase());
   const last = msFromIso(session.last_capacity_prompt_guidance_at);
@@ -1677,9 +1690,20 @@ function buildTurnBudgetGuidance(summary, cap) {
   ].filter(Boolean).join(" ");
 }
 
+function buildSubagentModelSelectionGuidance() {
+  return [
+    "SUBAGENT_MODEL_SELECTION_REQUIRED=true.",
+    `Every spawn_agent call in this assistant response must include an explicit model. If there is no stronger reason, default to model="${explorerFallbackModel()}".`,
+    `Before spawning, classify the work: use model="${explorerModel()}" for fast read-only scout/probe/grep-style evidence collection; use model="${explorerFallbackModel()}" for reasoning exploration, bounded verification, and light low-risk execution; use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, or final approval.`,
+    "This judgment step is mandatory; never omit model, because omitted model inherits the parent frontier model.",
+    "This is a spawn-shape guard, not a recommendation to create a subagent.",
+  ].join(" ");
+}
+
 function buildCapacityGuidance(eventName, cap, summary = null) {
   return [
     buildTurnBudgetGuidance(summary, cap),
+    buildSubagentModelSelectionGuidance(),
     `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
     "Do not batch native spawn_agent calls. Launch at most one native subagent per confirmed free slot, then re-check capacity before another spawn.",
     "Completed children can still consume slots until close succeeds; close only a current-parent lane that the leader knows is no longer needed.",
@@ -1838,6 +1862,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const ops = operations ?? agentOperations(payload ?? {}, name);
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
+  if (hasMissingSpawnModelInOperations(ops)) return true;
   if (hasExplorerModelRouteViolationInOperations(ops)) return true;
   if (isChildSession) return true;
   if (summary.native_edge_failed) return true;
@@ -1865,6 +1890,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
 
 function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payload = null, operations = null) {
   const ops = operations ?? agentOperations(payload ?? {}, "");
+  const missingSpawnModel = hasMissingSpawnModelInOperations(ops);
   const explorerModelRouteViolation = hasExplorerModelRouteViolationInOperations(ops);
   const preferredExplorerContractAdvisory = hasPreferredExplorerContractAdvisoryInOperations(ops);
   const fallbackExplorerContractAdvisory = hasFallbackExplorerContractAdvisoryInOperations(ops);
@@ -1887,6 +1913,9 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 
   const context = [
     parts.join(", ") + ".",
+    missingSpawnModel
+      ? `Subagent spawn is blocked until tool input includes an explicit model. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} for fast scout/probe work and gpt-5.5 only for critic, architecture, security, high-risk implementation, or final approval.`
+      : null,
     explorerModelRouteViolation
       ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for fast scout/probe work and ${explorerFallbackModel()} for reasoning explorer or light executor work. Do not inherit a frontier model for read-only lookup.`
       : null,
@@ -1900,7 +1929,9 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       ? "Nested native spawn is blocked: child sessions cannot create subagents; the parent leader owns delegation."
       : null,
 	    blockSpawn
-	      ? (explorerModelRouteViolation
+	      ? (missingSpawnModel
+	          ? "Retry at most one spawn after making the model-selection judgment explicit, and only if remaining_spawn_budget is still positive."
+	          : explorerModelRouteViolation
 	          ? "Retry at most one explorer spawn after correcting the explicit model route, and only if remaining_spawn_budget is still positive."
 	          : isChildSession
 	          ? "Nested spawn denied; no child-side delegation guidance is emitted."

@@ -236,7 +236,7 @@ test("unrelated parent native open edges do not emit zero budget on current prom
   });
 });
 
-test("blocks wrapped explorer spawn that would inherit the frontier model", async () => {
+test("blocks wrapped spawn that would inherit the parent frontier model", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const output = await runHook(home, {
@@ -254,8 +254,49 @@ test("blocks wrapped explorer spawn that would inherit the frontier model", asyn
     });
 
     assert.equal(output.decision, "block");
+    assert.match(output.reason, /explicit model/);
+    assert.match(output.reason, /Default to gpt-5\.4-mini/);
     assert.match(output.reason, /gpt-5\.3-codex-spark/);
     assert.match(output.reason, /gpt-5\.4-mini/);
+  });
+});
+
+test("blocks non-explorer spawns that omit explicit model selection", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "worker",
+        message: "Implement a bounded low-risk fix.",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /explicit model/);
+    assert.match(output.reason, /Default to gpt-5\.4-mini/);
+    assert.match(output.reason, /model-selection judgment/);
+  });
+});
+
+test("allows explicit frontier model for critic roles", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "critic",
+        model: "gpt-5.5",
+        reasoning_effort: "high",
+        message: "Review architecture risk.",
+      },
+    });
+
+    assert.notEqual(output?.decision, "block");
   });
 });
 
@@ -1107,6 +1148,29 @@ test("zero budget guidance says send_input does not make spawning safe", async (
   });
 });
 
+test("prompt-time guidance requires explicit model-selection judgment when spawn hooks are bypassed", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "Let subagents investigate in parallel with explorer lanes.",
+    });
+    const context = output.hookSpecificOutput.additionalContext;
+
+    assert.match(context, /SUBAGENT_MODEL_SELECTION_REQUIRED=true/);
+    assert.match(context, /Every spawn_agent call/);
+    assert.match(context, /default to model=\"gpt-5\.4-mini\"/);
+    assert.match(context, /model=\"gpt-5\.3-codex-spark\"/);
+    assert.match(context, /model=\"gpt-5\.4-mini\"/);
+    assert.match(context, /model=\"gpt-5\.5\"/);
+    assert.match(context, /This judgment step is mandatory/);
+    assert.match(context, /omitted model inherits the parent frontier model/);
+    assert.match(context, /not a recommendation to create a subagent/);
+  });
+});
+
 test("child session user prompts receive no proactive subagent guidance", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -1145,6 +1209,47 @@ test("installer is idempotent for existing hooks.json", async () => {
         .filter((hook) => hook.command.includes("native-agent-pool-advisor.mjs")).length;
       assert.equal(count, 1, eventName);
     }
+    const sessionStartEntry = config.hooks.SessionStart.find((entry) => {
+      return (entry.hooks ?? []).some((hook) => hook.command.includes("native-agent-pool-advisor.mjs"));
+    });
+    assert.equal(sessionStartEntry.matcher, "startup|resume");
+  });
+});
+
+test("installer restores SessionStart advisor when a startup self-heal removed it", async () => {
+  await withHome(async (home) => {
+    await mkdir(join(home, "hooks"), { recursive: true });
+    await writeFile(
+      join(home, "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              matcher: "startup|resume",
+              hooks: [{ type: "command", command: `node "${join(home, "hooks", "quiet-omx-status-self-heal.mjs")}"` }],
+            },
+          ],
+          UserPromptSubmit: [
+            { hooks: [{ type: "command", command: `node "${join(home, "hooks", "native-agent-pool-advisor.mjs")}"` }] },
+          ],
+          PreToolUse: [
+            { hooks: [{ type: "command", command: `node "${join(home, "hooks", "native-agent-pool-advisor.mjs")}"` }] },
+          ],
+          PostToolUse: [
+            { hooks: [{ type: "command", command: `node "${join(home, "hooks", "native-agent-pool-advisor.mjs")}"` }] },
+          ],
+        },
+      }),
+    );
+
+    await runScript(installPath, home);
+    const config = JSON.parse(await readFile(join(home, "hooks.json"), "utf-8"));
+    const entries = config.hooks.SessionStart;
+    const advisorEntries = entries.filter((entry) => {
+      return (entry.hooks ?? []).some((hook) => hook.command.includes("native-agent-pool-advisor.mjs"));
+    });
+    assert.equal(advisorEntries.length, 1);
+    assert.equal(advisorEntries[0].matcher, "startup|resume");
   });
 });
 
