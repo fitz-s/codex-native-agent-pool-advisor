@@ -173,6 +173,31 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
 
 `ok=false` means the real transcript contains a native spawn path that was not protected before the child was created. That is a runtime-boundary failure, not a passing hook test.
 
+Use explicit expectations when validating a real run:
+
+```bash
+# Model routing: each tool input model must match the native DB model.
+node scripts/live-check.mjs \
+  --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl \
+  --since-line <line_before_test> \
+  --expect-model gpt-5.3-codex-spark \
+  --expect-model gpt-5.4-mini \
+  --expect-model gpt-5.5 \
+  --expect-current-open 0 \
+  --expect-all-closed \
+  --allow-missing-guidance
+
+# Capacity: six successful child lanes still occupy six slots until close_agent succeeds.
+node scripts/live-check.mjs \
+  --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl \
+  --since-line <line_before_capacity_test> \
+  --expect-model gpt-5.3-codex-spark \
+  --expect-current-open 6 \
+  --allow-missing-guidance
+```
+
+At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent.
+
 ## Known Limits
 
 - This hook is intentionally fail-open on unexpected internal errors so it does not break ordinary Codex tool execution. Hard blocking only exists on hook events Codex actually emits for that tool path.

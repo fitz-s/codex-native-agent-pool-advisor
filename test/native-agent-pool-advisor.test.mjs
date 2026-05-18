@@ -1315,6 +1315,56 @@ test("live-check detects real missing-model native spawn bypass evidence", async
   });
 });
 
+test("live-check verifies explicit model routes, closes, and current open count", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      [
+        "insert into thread_spawn_edges values ('parent1','spark1','closed'),('parent1','mini1','closed'),('parent1','frontier1','closed');",
+        "insert into threads values ('spark1','/tmp/spark.jsonl','SPARK_LANE_OK','explorer','gpt-5.3-codex-spark','low','Franklin','/tmp',1779075987);",
+        "insert into threads values ('mini1','/tmp/mini.jsonl','MINI_LANE_OK','explorer','gpt-5.4-mini','medium','Gibbs','/tmp',1779076009);",
+        "insert into threads values ('frontier1','/tmp/frontier.jsonl','FRONTIER_LANE_OK','default','gpt-5.5','low','Mendel','/tmp',1779076031);",
+      ].join(""),
+    );
+    const transcript = join(home, "parent-models.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spark","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"SPARK_LANE_OK\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"spark","output":"{\\"agent_id\\":\\"spark1\\",\\"nickname\\":\\"Franklin\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close-spark","arguments":"{\\"target\\":\\"spark1\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close-spark","output":"{\\"previous_status\\":{\\"completed\\":\\"SPARK_LANE_OK\\"}}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"mini","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"MINI_LANE_OK\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"mini","output":"{\\"agent_id\\":\\"mini1\\",\\"nickname\\":\\"Gibbs\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close-mini","arguments":"{\\"target\\":\\"mini1\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close-mini","output":"{\\"previous_status\\":{\\"completed\\":\\"MINI_LANE_OK\\"}}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"frontier","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.5\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"FRONTIER_LANE_OK\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"frontier","output":"{\\"agent_id\\":\\"frontier1\\",\\"nickname\\":\\"Mendel\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close-frontier","arguments":"{\\"target\\":\\"frontier1\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close-frontier","output":"{\\"previous_status\\":{\\"completed\\":\\"FRONTIER_LANE_OK\\"}}"}}',
+      ].join("\n"),
+    );
+
+    const result = JSON.parse((await runScript(liveCheckPath, home, [
+      "--transcript", transcript,
+      "--expect-model", "gpt-5.3-codex-spark",
+      "--expect-model", "gpt-5.4-mini",
+      "--expect-model", "gpt-5.5",
+      "--expect-current-open", "0",
+      "--expect-all-closed",
+      "--allow-missing-guidance",
+    ])).stdout);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.check_status, "passed");
+    assert.equal(result.model_routes.length, 3);
+    assert.equal(result.checks.find((check) => check.name === "model_recorded:gpt-5.4-mini").status, "pass");
+    assert.equal(result.checks.find((check) => check.name === "current_parent_open_count").evidence, "open=0, expected=0");
+  });
+});
+
 test("reset script requires dry-run force token before mutation", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

@@ -57,6 +57,15 @@ Use the read-only live checker for that evidence:
 node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl
 ```
 
+The live checker supports expectation-based E2E gates:
+
+- `--expect-model <model>` verifies that a successful `spawn_agent` tool input and its native SQLite child row both used that model. Repeat it to cover Spark, mini, and frontier lanes.
+- `--expect-current-open <n>` verifies the current parent/session open-edge count after the scanned transcript window.
+- `--expect-all-closed` verifies every successful spawn in the scanned window has both a successful close call and a closed native edge.
+- `--require-guidance` treats missing prompt-time advisor markers as a failure; `--allow-missing-guidance` keeps model/capacity verification independent from Codex transcript marker availability.
+
+The capacity E2E should stop at six real child lanes. At `open=6`, the live `UserPromptSubmit` hook must report `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not launch a seventh child to prove the cap.
+
 ## Remaining Risk
 
 The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. In current observed Desktop native-spawn behavior, that assumption has already failed. That is why `SessionStart` and `UserPromptSubmit` both inject budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.

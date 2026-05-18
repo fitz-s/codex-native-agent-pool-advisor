@@ -28,7 +28,17 @@ const FAILURE_PATTERNS = [
 
 function usage() {
   return [
-    "Usage: node scripts/live-check.mjs --transcript <path> [--state-db <path>] [--parent <thread_id>] [--since-line <n>]",
+    "Usage: node scripts/live-check.mjs --transcript <path> [options]",
+    "",
+    "Options:",
+    "  --state-db <path>             Native Codex SQLite DB path.",
+    "  --parent <thread_id>          Parent thread id; defaults to transcript session_meta id.",
+    "  --since-line <n>              Scan transcript records starting at this 1-based line.",
+    "  --expect-model <model>        Require a successful spawn whose tool input and native DB edge both use this model. Repeatable.",
+    "  --expect-current-open <n>     Require this parent/session to have exactly n open native edges after the scanned window.",
+    "  --expect-all-closed           Require every successful spawn in the scanned window to have a successful close and closed DB edge.",
+    "  --require-guidance            Fail if no advisor guidance marker appears before the first scanned spawn.",
+    "  --allow-missing-guidance      Do not fail when the runtime transcript lacks prompt-time advisor markers.",
     "",
     "Read-only check for real Codex native spawn behavior. It does not create, close, or message subagents.",
   ].join("\n");
@@ -43,6 +53,14 @@ function parseArgs(argv) {
     else if (arg === "--state-db") args.stateDb = argv[++i];
     else if (arg === "--parent") args.parent = argv[++i];
     else if (arg === "--since-line") args.sinceLine = Number(argv[++i]);
+    else if (arg === "--expect-model") {
+      args.expectModels ??= [];
+      args.expectModels.push(argv[++i]);
+    }
+    else if (arg === "--expect-current-open") args.expectCurrentOpen = Number(argv[++i]);
+    else if (arg === "--expect-all-closed") args.expectAllClosed = true;
+    else if (arg === "--require-guidance") args.requireGuidance = true;
+    else if (arg === "--allow-missing-guidance") args.allowMissingGuidance = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
   return args;
@@ -210,6 +228,16 @@ async function readEdges(dbPath, parent) {
   }
 }
 
+function buildCheck(name, passed, evidence, severity = "fail") {
+  return { name, status: passed ? "pass" : severity, evidence };
+}
+
+function summarizeChecks(checks) {
+  if (checks.some((check) => check.status === "fail")) return "failed";
+  if (checks.some((check) => check.status === "warn")) return "passed_with_warnings";
+  return "passed";
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -228,14 +256,85 @@ async function main() {
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
   const edgeByChild = new Map(edges.rows.map((row) => [row.child_thread_id, row]));
+  const successfulSpawns = spawnCalls.filter((call) => call.output?.agent_id && !call.output.failed);
+  const closeTargetSet = new Set(
+    transcript.calls
+      .filter((call) => call.name === "close_agent" && call.target && call.output && !call.output.failed)
+      .map((call) => call.target),
+  );
+  const openRows = edges.rows.filter((row) => row.status === "open");
+  const spawnReports = successfulSpawns.map((call) => {
+    const edge = edgeByChild.get(call.output.agent_id) ?? null;
+    return {
+      call,
+      edge,
+      tool_model_matches_native: Boolean(call.model && edge?.model === call.model),
+      closed: Boolean(edge?.status === "closed" && closeTargetSet.has(call.output.agent_id)),
+    };
+  });
+  const expectedModels = Array.isArray(args.expectModels) ? args.expectModels.filter(Boolean) : [];
+  const checks = [
+    buildCheck(
+      "native_db_available",
+      edges.available,
+      edges.available ? `state_db=${edges.path}` : (edges.error || "state DB unavailable"),
+    ),
+    buildCheck(
+      "no_missing_model_spawn_created",
+      missingModelCreated.length === 0,
+      missingModelCreated.length === 0
+        ? "no missing-model spawn created a child"
+        : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
+    ),
+    buildCheck(
+      "guidance_before_first_spawn",
+      spawnCalls.length === 0 || guidanceBeforeFirstSpawn || args.allowMissingGuidance || !args.requireGuidance,
+      guidanceBeforeFirstSpawn
+        ? `first marker line=${transcript.markers.find((marker) => marker.line < earliestSpawnLine)?.line}`
+        : "no advisor guidance marker found before first scanned spawn",
+      args.requireGuidance && !args.allowMissingGuidance ? "fail" : "warn",
+    ),
+    ...expectedModels.map((model) => {
+      const matches = spawnReports.filter((report) => report.call.model === model && report.edge?.model === model);
+      return buildCheck(
+        `model_recorded:${model}`,
+        matches.length > 0,
+        matches.length > 0
+          ? matches.map((report) => `${report.call.output.agent_id}:${report.edge.agent_role}/${report.edge.reasoning_effort}/${report.edge.status}`).join(", ")
+          : `no successful spawn with tool input and native DB model=${model}`,
+      );
+    }),
+  ];
+  if (Number.isFinite(args.expectCurrentOpen)) {
+    checks.push(buildCheck(
+      "current_parent_open_count",
+      openRows.length === args.expectCurrentOpen,
+      `open=${openRows.length}, expected=${args.expectCurrentOpen}`,
+    ));
+  }
+  if (args.expectAllClosed) {
+    const notClosed = spawnReports.filter((report) => !report.closed);
+    checks.push(buildCheck(
+      "successful_spawns_closed",
+      notClosed.length === 0,
+      notClosed.length === 0
+        ? "every successful spawn in the scanned window has a successful close and closed native edge"
+        : notClosed.map((report) => `${report.call.output.agent_id}:edge=${report.edge?.status ?? "missing"}, close=${closeTargetSet.has(report.call.output.agent_id)}`).join(", "),
+    ));
+  }
+  const checkStatus = summarizeChecks(checks);
 
   const result = {
-    ok: missingModelCreated.length === 0 && (spawnCalls.length === 0 || guidanceBeforeFirstSpawn),
-    verdict: missingModelCreated.length > 0
+    ok: checkStatus !== "failed",
+    verdict: checkStatus === "failed" && missingModelCreated.length > 0
       ? "native_spawn_missing_model_bypassed_advisor"
+      : checkStatus === "failed"
+      ? "live_check_failed"
       : spawnCalls.length > 0 && !guidanceBeforeFirstSpawn
-      ? "native_spawn_seen_without_prior_advisor_guidance"
+      ? "live_check_passed_without_transcript_guidance"
       : "no_bypass_detected_in_scanned_window",
+    check_status: checkStatus,
+    checks,
     transcript_path: transcriptPath,
     parent_thread_id: parent,
     scanned_since_line: Number.isFinite(args.sinceLine) ? args.sinceLine : 1,
@@ -252,6 +351,17 @@ async function main() {
       output_failed: call.output?.failed ?? null,
       native_edge: call.output?.agent_id ? edgeByChild.get(call.output.agent_id) ?? null : null,
       message_preview: call.message_preview,
+    })),
+    model_routes: spawnReports.map((report) => ({
+      child_thread_id: report.call.output.agent_id,
+      tool_model: report.call.model || null,
+      native_model: report.edge?.model ?? null,
+      agent_type: report.call.agent_type || null,
+      native_role: report.edge?.agent_role ?? null,
+      reasoning_effort: report.edge?.reasoning_effort ?? report.call.reasoning_effort ?? null,
+      native_status: report.edge?.status ?? null,
+      tool_model_matches_native: report.tool_model_matches_native,
+      closed_after_spawn: report.closed,
     })),
     close_calls: transcript.calls.filter((call) => call.name === "close_agent").map((call) => ({
       line: call.line,
