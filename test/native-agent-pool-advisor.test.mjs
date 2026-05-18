@@ -13,6 +13,7 @@ const hookPath = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
 const installPath = join(repoRoot, "scripts", "install.mjs");
 const resetPath = join(repoRoot, "scripts", "reset-pool.mjs");
 const doctorPath = join(repoRoot, "scripts", "doctor.mjs");
+const liveCheckPath = join(repoRoot, "scripts", "live-check.mjs");
 const uninstallPath = join(repoRoot, "scripts", "uninstall.mjs");
 
 async function withHome(work, configText = "[agents]\nmax_threads = 6\n") {
@@ -1261,6 +1262,8 @@ test("doctor validates install and uninstall removes advisor registrations", asy
     assert.equal(doctor.ok, true);
     assert.equal(doctor.checks.registrations.SessionStart, 1);
     assert.equal(doctor.checks.registrations.UserPromptSubmit, 1);
+    assert.equal(doctor.runtime_capabilities.registration_verified_only, true);
+    assert.equal(doctor.runtime_capabilities.native_spawn_pre_tool_use_hard_block, "not_documented");
 
     const dryRun = JSON.parse((await runScript(uninstallPath, home, ["--dry-run"])).stdout);
     assert.equal(dryRun.removed_registrations, 4);
@@ -1275,6 +1278,40 @@ test("doctor validates install and uninstall removes advisor registrations", asy
         .filter((hook) => hook.command.includes("native-agent-pool-advisor.mjs")).length;
       assert.equal(count, 0, eventName);
     }
+  });
+});
+
+test("live-check detects real missing-model native spawn bypass evidence", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','closed');"
+        + "insert into threads values ('child1','/tmp/child.jsonl','Test E2E','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+    );
+    const transcript = join(home, "parent.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"E2E hook test only\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Mencius\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.ok, false);
+    assert.equal(output.verdict, "native_spawn_missing_model_bypassed_advisor");
+    assert.equal(output.spawn_calls[0].has_model, false);
+    assert.equal(output.spawn_calls[0].created_agent_id, "child1");
+    assert.equal(output.spawn_calls[0].native_edge.model, "gpt-5.5");
   });
 });
 

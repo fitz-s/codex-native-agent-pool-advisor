@@ -13,7 +13,7 @@ Codex can delegate work to native subagents, but the pool limit is easy for the 
 3. The leader explains the failure, closes several agents, restates the prompt, or tries a different batch.
 4. The thread loses context budget and attention before any useful review, verification, or exploration happens.
 
-This hook makes that category of waste visible and harder to repeat. It injects the current parent/session budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion at tool time, treats successful `close_agent` as the only normal slot release, and separates capped runtime slot pressure from stale or unresolved `open` edge debt.
+This hook makes that category of waste visible and harder to repeat. It injects the current parent/session budget, blocks doomed spawns only on Codex tool surfaces that actually emit `PreToolUse`, treats successful `close_agent` as the only normal slot release, and separates capped runtime slot pressure from stale or unresolved `open` edge debt.
 
 Model routing is secondary but explicit. The hook requires every subagent spawn to include a deliberate model choice, with mini as the default when there is no stronger reason. That prevents accidental inheritance of the parent frontier model while still letting the leader choose Spark for scout work or 5.5 for critic/high-risk work.
 
@@ -22,7 +22,8 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Works with Codex Desktop and Codex CLI when they read the same `~/.codex/hooks.json`, hook events, and native SQLite state layout.
 - Uses `CODEX_HOME` when set; otherwise defaults to `~/.codex`.
 - Reads native pool state from `state_5.sqlite` by default. Override the DB name/path if a Codex build moves it.
-- Installs for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`; run `node scripts/doctor.mjs` after install to confirm the active runtime is actually using this hook.
+- Installs for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `PostToolUse`; run `node scripts/doctor.mjs` after install to confirm registration, hash, and native DB reachability.
+- `doctor` does not prove that a future native `spawn_agent` call will emit `PreToolUse`. Use `node scripts/live-check.mjs --transcript <path>` against a real Codex transcript for end-to-end evidence.
 
 ## Runtime Model
 
@@ -35,8 +36,8 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
 - The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Failed close attempts do not free capacity.
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
-- Child sessions do not receive proactive prompt-time delegation guidance. A child that attempts `spawn_agent` is blocked at `PreToolUse` and should report the need upward to its parent leader.
-- Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model, and that is blocked when the hook sees the spawn.
+- Child sessions do not receive proactive prompt-time delegation guidance. A child that needs more delegation should report that recommendation upward; the parent leader owns slot closure and relaunch.
+- Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
 - The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, or final approval.
 - Explorer model allow-list defaults to `gpt-5.3-codex-spark,gpt-5.4-mini`, so lookup lanes cannot silently spend `gpt-5.5`.
 - The hook does not block Spark because a prompt looks "complex"; it emits contract guidance and lets the parent agent choose.
@@ -73,7 +74,7 @@ The capacity guard does not decide whether Codex should delegate. If the leader 
 
 Route by output contract, risk, and context-state depth, not by complexity adjectives. A complex parent task can use Spark well if the child prompt asks for bounded scout output such as "return 12 file:line anchors and stop." A mini lane is better when the child owns synthesis, a small edit, or a durable low-risk verification result.
 
-The hook blocks any spawn that omits `model`, because inheritance is exactly the failure mode. It still blocks explorer spawns that choose a model outside the configured explorer allow-list, and only advises when a Spark or mini prompt looks mismatched to the lane.
+When Codex emits `PreToolUse` for a spawn operation, the hook blocks any spawn that omits `model`, because inheritance is exactly the failure mode. It also blocks explorer spawns that choose a model outside the configured explorer allow-list, and only advises when a Spark or mini prompt looks mismatched to the lane. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
 
 ## Design Basis
 
@@ -108,7 +109,7 @@ If only `models.explorer` is set, the first model is treated as preferred and th
 
 Environment overrides are also supported:
 
-- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated explorer allow-list. This does not change the global default: omitted model is still blocked, and the leader should explicitly choose mini when unsure.
+- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated explorer allow-list. This does not change the global default: omitted model is still invalid, and is blocked when Codex emits a supported `PreToolUse` event for the spawn path.
 - `NATIVE_AGENT_POOL_EXPLORER_MODEL`: preferred explorer model.
 - `NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL`: fallback explorer model.
 - `NATIVE_AGENT_POOL_DEFAULT_CAP`: fallback cap when `[agents].max_threads` is absent.
@@ -162,11 +163,19 @@ npm run check
 npm test
 ```
 
-The test suite covers wrapper-spawn blocking, universal explicit model enforcement, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, and explicit reset markers.
+The test suite covers hook-script behavior: wrapper-spawn blocking, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
+
+For real end-to-end evidence from Codex Desktop or CLI, inspect the actual parent transcript after a spawn attempt:
+
+```bash
+node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl
+```
+
+`ok=false` means the real transcript contains a native spawn path that was not protected before the child was created. That is a runtime-boundary failure, not a passing hook test.
 
 ## Known Limits
 
-- This hook is intentionally fail-open on unexpected internal errors so it does not break ordinary Codex tool execution. It blocks only when it has enough state to identify an unsafe spawn, a recursive child spawn, a lock/contention risk, or a model-route violation.
-- If a Codex Desktop or CLI spawn surface bypasses `PreToolUse` entirely, the hook cannot block it in-process; `SessionStart`/`UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback. `SessionStart` is especially important after compaction/resume, when a model may continue work without a fresh user prompt.
+- This hook is intentionally fail-open on unexpected internal errors so it does not break ordinary Codex tool execution. Hard blocking only exists on hook events Codex actually emits for that tool path.
+- Official Codex hook documentation currently documents `PreToolUse` support for Bash, `apply_patch`, and MCP tool names. Native `spawn_agent` hard-block coverage is not a documented capability. If a Codex Desktop or CLI spawn surface bypasses `PreToolUse`, the hook cannot block it in-process; `SessionStart`/`UserPromptSubmit` guidance and `PostToolUse` reconciliation are the fallback. `SessionStart` is especially important after compaction/resume, when a model may continue work without a fresh user prompt.
 - Historical `hooks.json` backups and setup restore paths can replay old hook stacks. See `docs/runtime-audit.md`.
 - This hook is a launch/capacity guard, not a delegation decision maker.

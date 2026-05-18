@@ -29,20 +29,37 @@
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as unresolved/overflow evidence, not as `occupied > cap`.
 - `SessionStart` is a first-class guidance surface for parent sessions. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
-- Child sessions receive no proactive prompt-time delegation guidance. A child `spawn_agent` attempt is blocked at `PreToolUse`.
-- Model selection is mandatory for every `spawn_agent` call. Missing `model` is blocked because it inherits the parent model; the default explicit choice is mini unless the leader judges that Spark or 5.5 fits the work better.
+- Child sessions receive no proactive prompt-time delegation guidance. A child should not own recursive delegation; it reports escalation needs upward and the parent leader owns reuse, close, and relaunch.
+- Model selection is mandatory for every `spawn_agent` call. Missing `model` inherits the parent model; the default explicit choice is mini unless the leader judges that Spark or 5.5 fits the work better. This is hard-blocked only when Codex emits a supported `PreToolUse` event for the spawn path.
 - Explorer model routing is an allow-list plus advisory contract guidance, not a single hard-coded model and not a task-shape blocker. Spark is for near-instant scout/probe work, mini is the default reasoning/light-executor lane, and 5.5 is for critic/architecture/security/high-risk/final-approval work.
 - Complex explorer prompts on Spark are allowed when Spark is used as a bounded scout/anchor collector. The hook only advises the agent to cap scope/output or escalate synthesis/edit/final-approval follow-up to mini or a frontier reviewer.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
 - `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path.
 - Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; it must not mutate unrelated parent rows.
 - Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. They still count for current-parent admission until close succeeds or an explicit reset removes stale state.
-- If the advisor state lock or native edge query is unavailable during `PreToolUse(spawn_agent)`, the hook blocks conservatively.
+- If the advisor state lock or native edge query is unavailable during a supported `PreToolUse(spawn_agent)` event, the hook blocks conservatively.
 - Automatic hook maintenance does not prune Codex SQLite. SQLite mutation is limited to successful close-agent repair and the explicit reset tool.
+
+## End-To-End Runtime Finding
+
+The project must not treat synthetic `PreToolUse(spawn_agent)` tests as proof that Codex Desktop or CLI native subagent creation is interceptable. OpenAI's current Codex hook documentation lists `PreToolUse` support for Bash, `apply_patch`, and MCP tool names; native `spawn_agent` is not listed as a documented hard-block target.
+
+Observed Desktop evidence showed a missing-model native `spawn_agent` call create a child thread and native edge without prior advisor markers in the parent transcript. In that runtime, the hook's hard-block branch was not reached. The correct operational claim is therefore:
+
+- `SessionStart` and `UserPromptSubmit` can provide prompt-time guidance when emitted.
+- `PreToolUse` can hard-block only tool paths that Codex actually routes through that hook event.
+- `PostToolUse` and SQLite reconciliation can diagnose and repair state after supported close/spawn evidence appears.
+- Real validation requires transcript/SQLite evidence, not just `doctor`.
+
+Use the read-only live checker for that evidence:
+
+```bash
+node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl
+```
 
 ## Remaining Risk
 
-The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. That is why `SessionStart` and `UserPromptSubmit` both inject budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.
+The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. In current observed Desktop native-spawn behavior, that assumption has already failed. That is why `SessionStart` and `UserPromptSubmit` both inject budget guidance and why `spawn_agent` batching is discouraged even when the hook appears healthy.
 
 The reset script intentionally mutates `thread_spawn_edges`. It should be treated as an operator repair command, not normal hook execution.
 

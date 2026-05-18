@@ -12,6 +12,13 @@ const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceHook = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
 const EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"];
+const RUNTIME_CAPABILITIES = {
+  registration_verified_only: true,
+  pre_tool_use_documented_targets: ["Bash", "apply_patch", "MCP tools"],
+  native_spawn_pre_tool_use_hard_block: "not_documented",
+  native_spawn_control_plane: "SessionStart/UserPromptSubmit guidance plus PostToolUse reconciliation when Codex emits those events",
+  e2e_native_spawn_block_requires_live_check: true,
+};
 
 function safeObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -138,7 +145,7 @@ async function main() {
     && checks.state_db_exists
     && checks.thread_spawn_edges_count !== null;
 
-  process.stdout.write(`${JSON.stringify({ ok, checks }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ ok, checks, runtime_capabilities: RUNTIME_CAPABILITIES }, null, 2)}\n`);
   if (!ok) process.exitCode = 1;
 }
 

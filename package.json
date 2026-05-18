@@ -20,6 +20,7 @@
   "bin": {
     "codex-native-agent-pool-advisor-install": "scripts/install.mjs",
     "codex-native-agent-pool-advisor-doctor": "scripts/doctor.mjs",
+    "codex-native-agent-pool-advisor-live-check": "scripts/live-check.mjs",
     "codex-native-agent-pool-advisor-reset": "scripts/reset-pool.mjs",
     "codex-native-agent-pool-advisor-uninstall": "scripts/uninstall.mjs"
   },
@@ -33,7 +34,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check hooks/native-agent-pool-advisor.mjs && node --check scripts/install.mjs && node --check scripts/reset-pool.mjs && node --check scripts/doctor.mjs && node --check scripts/uninstall.mjs",
+    "check": "node --check hooks/native-agent-pool-advisor.mjs && node --check scripts/install.mjs && node --check scripts/reset-pool.mjs && node --check scripts/doctor.mjs && node --check scripts/live-check.mjs && node --check scripts/uninstall.mjs",
     "test": "node --test test/*.test.mjs"
   }
 }
