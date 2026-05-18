@@ -36,6 +36,7 @@
 - Complex explorer prompts on Spark are allowed when Spark is used as a bounded scout/anchor collector. The hook only advises the agent to cap scope/output or escalate synthesis/edit/final-approval follow-up to mini or a frontier reviewer.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
 - `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path; runtime not-found close evidence is the stale-unreachable exception.
+- A zero-budget prompt is only a capacity snapshot. After a successful close or runtime not-found repair, the next hook or `PreToolUse` capacity check replaces the old snapshot; agents must not keep treating stale zero-budget text as current authority.
 - Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; it must not mutate unrelated parent rows.
 - Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. They still count for current-parent admission until close succeeds or an explicit reset removes stale state.
 - Long child transcripts must still be scanned for `task_complete` outside the terminal tail window before an open edge is labeled active.
@@ -66,7 +67,7 @@ The live checker supports expectation-based E2E gates:
 - `--expect-all-closed` verifies every successful spawn in the scanned window has both a successful close call and a closed native edge.
 - `--require-guidance` treats missing prompt-time advisor markers as a failure; `--allow-missing-guidance` keeps model/capacity verification independent from Codex transcript marker availability.
 
-The capacity E2E should stop at six real child lanes. At `open=6`, the live `UserPromptSubmit` hook must report `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not launch a seventh child to prove the cap.
+The capacity E2E should stop at six real child lanes. At `open=6`, the live `UserPromptSubmit` hook must report `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not launch a seventh child to prove the cap. If a later close succeeds, verify that a fresh hook/live check reports the reduced open count before spawning.
 
 ## Remaining Risk
 

@@ -35,6 +35,7 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
 - `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
 - A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
+- A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
 - The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Runtime `not found` / `unknown agent` close evidence is also treated as a stale-unreachable lane and repaired to `closed`; other close failures do not free capacity.
 - Runtime `not found` close evidence only releases a slot when the current parent owns the matching native edge row, or when native edge state is unavailable and transcript fallback is the only evidence source. A typo or foreign target does not free current-parent capacity.
 - Child transcript terminal detection checks beyond the tail window when needed, so a long transcript with an earlier `task_complete` does not get mislabeled as an active open lane.
@@ -211,7 +212,7 @@ node scripts/live-check.mjs \
   --allow-missing-guidance
 ```
 
-At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent.
+At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent. If a later close succeeds, run a fresh hook/live check and use the updated budget instead of the stale zero-budget prompt.
 
 ## Known Limits
 

@@ -1273,10 +1273,12 @@ test("session start emits cap pressure after resume before a spawn is attempted"
     assert.match(output.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
     assert.match(output.hookSpecificOutput.additionalContext, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
     assert.match(output.hookSpecificOutput.additionalContext, /When remaining_spawn_budget is 0, do not call spawn_agent/);
+    assert.match(output.hookSpecificOutput.additionalContext, /zero-budget snapshot/);
+    assert.match(output.hookSpecificOutput.additionalContext, /next hook\/PreToolUse capacity check/);
   });
 });
 
-test("zero budget guidance says send_input does not make spawning safe", async () => {
+test("zero budget guidance rejects send_input and requires capacity refresh after close", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -1292,8 +1294,9 @@ test("zero budget guidance says send_input does not make spawning safe", async (
     const context = output.hookSpecificOutput.additionalContext;
 
     assert.match(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
-    assert.match(context, /even after send_input or wait_agent/);
     assert.match(context, /send_input and wait_agent do not increase the spawn budget/);
+    assert.match(context, /If close_agent succeeds, re-check capacity before any spawn/);
+    assert.match(context, /older zero-budget snapshot is no longer authoritative/);
   });
 });
 
