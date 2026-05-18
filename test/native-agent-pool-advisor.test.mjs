@@ -1161,11 +1161,17 @@ test("prompt-time guidance requires explicit model-selection judgment when spawn
     const context = output.hookSpecificOutput.additionalContext;
 
     assert.match(context, /SUBAGENT_MODEL_SELECTION_REQUIRED=true/);
+    assert.match(context, /SUBAGENT_MODEL_DECISION_REQUIRED=true/);
+    assert.match(context, /task_contract=\{output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition\}/);
     assert.match(context, /Every spawn_agent call/);
     assert.match(context, /default to model=\"gpt-5\.4-mini\"/);
     assert.match(context, /model=\"gpt-5\.3-codex-spark\"/);
     assert.match(context, /model=\"gpt-5\.4-mini\"/);
     assert.match(context, /model=\"gpt-5\.5\"/);
+    assert.match(context, /strict output cap/);
+    assert.match(context, /If you cannot state the child output cap and stop condition, do not use Spark/);
+    assert.match(context, /Do not launch multiple lanes just because there are multiple perspectives/);
+    assert.match(context, /large-context repos, first make a local module\/file map/);
     assert.match(context, /This judgment step is mandatory/);
     assert.match(context, /omitted model inherits the parent frontier model/);
     assert.match(context, /not a recommendation to create a subagent/);

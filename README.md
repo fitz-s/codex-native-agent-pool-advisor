@@ -38,9 +38,9 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
 - Child sessions do not receive proactive prompt-time delegation guidance. A child that needs more delegation should report that recommendation upward; the parent leader owns slot closure and relaunch.
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
-- The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, or final approval.
+- The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection with an output cap and stop condition. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.
 - Explorer model allow-list defaults to `gpt-5.3-codex-spark,gpt-5.4-mini`, so lookup lanes cannot silently spend `gpt-5.5`.
-- The hook does not block Spark because a prompt looks "complex"; it emits contract guidance and lets the parent agent choose.
+- The hook does not block Spark because a prompt looks "complex"; it emits a pre-spawn decision contract and lets the parent agent choose. `Analyze`, `review`, `read-only`, and `bounded` are not model choices by themselves.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
@@ -66,6 +66,16 @@ The installer is idempotent: repeated installs should leave one registration per
 
 The capacity guard does not decide whether Codex should delegate. If the leader has already chosen to spawn, the hook requires the leader to make the model-selection judgment explicit instead of inheriting the parent model by accident.
 
+Before spawning, the leader should make a compact task contract:
+
+- `output`: anchors, evidence table, synthesis, patch, critique, or final approval.
+- `risk`: read-only, low-risk edit, high-risk edit, security, live-money, destructive, or external side effect.
+- `state_depth`: stateless lookup, multi-hop trace, prior-lane context, or final integration.
+- `context_size`: exact files/lines, medium slice, large compiled/vendor tree, logs/DB, or unknown.
+- `edit_permission`: none, low-risk local, broad local, or external/prod.
+- `final_authority`: whether the child may conclude or only return evidence.
+- `output_cap` and `stop_condition`: how much the child may return and when it must stop or escalate.
+
 | Model lane | Use for | Boundary |
 | --- | --- | --- |
 | `gpt-5.3-codex-spark` | Near-instant scout work: grep/file maps, symbol lookup, log filtering, candidate file:line anchors, hypothesis sampling, bounded large-text scans, and fast evidence collection inside larger reasoning workflows. Usually `reasoning_effort=low`, but non-low effort is allowed when intentional. | Do not ask it to own final approval, broad synthesis, edits, or repeated compaction. If the task expands, it should stop and return anchors plus an escalation recommendation. |
@@ -73,6 +83,8 @@ The capacity guard does not decide whether Codex should delegate. If the leader 
 | `gpt-5.5` | Critic, architecture, security judgment, high-risk implementation, and final approval. | Do not use for ordinary explorer/scout lanes or broad grep/file scans. |
 
 Route by output contract, risk, and context-state depth, not by complexity adjectives. A complex parent task can use Spark well if the child prompt asks for bounded scout output such as "return 12 file:line anchors and stop." A mini lane is better when the child owns synthesis, a small edit, or a durable low-risk verification result.
+
+For broad, compiled, vendor, or large-context repos, do a local `rg`/module map first. Then send Spark exact slices for anchors, not the whole tree. Use mini for synthesis once the slices exist. If two scout lanes fail or compact on context, stop spawning, shrink the slice locally, and reuse or close current lanes before trying again.
 
 When Codex emits `PreToolUse` for a spawn operation, the hook blocks any spawn that omits `model`, because inheritance is exactly the failure mode. It also blocks explorer spawns that choose a model outside the configured explorer allow-list, and only advises when a Spark or mini prompt looks mismatched to the lane. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
 

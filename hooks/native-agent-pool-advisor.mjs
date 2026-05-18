@@ -1692,9 +1692,15 @@ function buildTurnBudgetGuidance(summary, cap) {
 
 function buildSubagentModelSelectionGuidance() {
   return [
-    "SUBAGENT_MODEL_SELECTION_REQUIRED=true.",
+    "SUBAGENT_MODEL_SELECTION_REQUIRED=true. SUBAGENT_MODEL_DECISION_REQUIRED=true.",
+    "Before any spawn_agent call, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}.",
     `Every spawn_agent call in this assistant response must include an explicit model. If there is no stronger reason, default to model="${explorerFallbackModel()}".`,
-    `Before spawning, classify the work: use model="${explorerModel()}" for fast read-only scout/probe/grep-style evidence collection; use model="${explorerFallbackModel()}" for reasoning exploration, bounded verification, and light low-risk execution; use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, or final approval.`,
+    `Use model="${explorerModel()}" only for read-only scout output: grep/file maps, symbol/log filters, candidate file:line anchors, or hypotheses with a strict output cap and no durable verdict.`,
+    `Use model="${explorerFallbackModel()}" for multi-hop tracing, compact synthesis, bounded verification, config/test interpretation, or light low-risk execution where the child owns a durable conclusion.`,
+    `Use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`,
+    "If you cannot state the child output cap and stop condition, do not use Spark; slice locally first or choose mini.",
+    "Do not launch multiple lanes just because there are multiple perspectives; launch at most one child per confirmed free slot, then re-check capacity and whether existing lanes can be reused.",
+    "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Spark exact slices to anchor, and use mini/frontier for synthesis.",
     "This judgment step is mandatory; never omit model, because omitted model inherits the parent frontier model.",
     "This is a spawn-shape guard, not a recommendation to create a subagent.",
   ].join(" ");
@@ -1914,10 +1920,10 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const context = [
     parts.join(", ") + ".",
     missingSpawnModel
-      ? `Subagent spawn is blocked until tool input includes an explicit model. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} for fast scout/probe work and gpt-5.5 only for critic, architecture, security, high-risk implementation, or final approval.`
+      ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
       : null,
     explorerModelRouteViolation
-      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for fast scout/probe work and ${explorerFallbackModel()} for reasoning explorer or light executor work. Do not inherit a frontier model for read-only lookup.`
+      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for capped scout/probe anchors and ${explorerFallbackModel()} for reasoning explorer, synthesis, verification, or light executor work. Do not inherit a frontier model for read-only lookup.`
       : null,
     preferredExplorerContractAdvisory
       ? `Explorer route advisory, not a block: ${explorerModel()} is useful even inside complex work when the output contract is scout/anchor collection. Keep the prompt bounded with exact scope, file:line evidence, output cap, and stop condition; if the child must synthesize a durable verdict, edit files, approve a claim, or repeatedly compact, route that follow-up to ${explorerFallbackModel()} or a frontier reviewer.`
@@ -1930,7 +1936,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       : null,
 	    blockSpawn
 	      ? (missingSpawnModel
-	          ? "Retry at most one spawn after making the model-selection judgment explicit, and only if remaining_spawn_budget is still positive."
+	          ? "Retry at most one spawn after making the model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and remaining_spawn_budget must still be positive."
 	          : explorerModelRouteViolation
 	          ? "Retry at most one explorer spawn after correcting the explicit model route, and only if remaining_spawn_budget is still positive."
 	          : isChildSession
