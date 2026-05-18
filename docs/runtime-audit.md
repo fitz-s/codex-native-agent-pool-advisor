@@ -24,7 +24,7 @@
 - Normal admission must never use a global native edge count. Other parent sessions can be shown by repair tooling, but they are not current-turn capacity evidence.
 - A readable empty current-parent native edge slice is authoritative for that parent/session. Transcript and child-session fallback are only used when current-parent native evidence is unavailable.
 - Transcript and child-session fallback ignore events older than the reset marker.
-- General evidence collection does not repair native edges. Only successful `PostToolUse(close_agent)` for the current parent/session can mark a native edge closed and decrement slot pressure.
+- General evidence collection does not repair native edges. Successful `PostToolUse(close_agent)` for the current parent/session marks a native edge closed and decrements slot pressure; runtime `not found` / `unknown agent` close evidence is also repaired because the lane is no longer reachable by Codex.
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as unresolved/overflow evidence, not as `occupied > cap`.
@@ -34,7 +34,7 @@
 - Explorer model routing is an allow-list plus advisory contract guidance, not a single hard-coded model and not a task-shape blocker. Spark is for near-instant scout/probe work, mini is the default reasoning/light-executor lane, and 5.5 is for critic/architecture/security/high-risk/final-approval work.
 - Complex explorer prompts on Spark are allowed when Spark is used as a bounded scout/anchor collector. The hook only advises the agent to cap scope/output or escalate synthesis/edit/final-approval follow-up to mini or a frontier reviewer.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
-- `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path.
+- `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path; runtime not-found close evidence is the stale-unreachable exception.
 - Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; it must not mutate unrelated parent rows.
 - Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. They still count for current-parent admission until close succeeds or an explicit reset removes stale state.
 - If the advisor state lock or native edge query is unavailable during a supported `PreToolUse(spawn_agent)` event, the hook blocks conservatively.

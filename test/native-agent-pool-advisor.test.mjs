@@ -598,7 +598,7 @@ test("native open edges with task_complete transcripts still occupy capacity unt
     });
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=6\/6/);
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_current=open=0, terminal_open=6/);
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /Only a successful close_agent result decrements/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /successful close_agent result or runtime not-found close evidence decrements/);
     assert.match(promptOutput.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
 
     const spawnOutput = await runHook(home, {
@@ -735,7 +735,7 @@ test("failed close after a cap hit does not free runtime capacity", async () => 
         '{"timestamp":"2026-05-16T08:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"explorer\\"}"}}',
         '{"timestamp":"2026-05-16T08:01:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"collab spawn failed: agent thread limit reached"}}',
         '{"timestamp":"2026-05-16T08:01:02.000Z","type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child6\\"}"}}',
-        '{"timestamp":"2026-05-16T08:01:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"failed to close: unknown agent"}}',
+        '{"timestamp":"2026-05-16T08:01:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"failed to close: transport error"}}',
       ].join("\n"),
     );
 
@@ -755,6 +755,41 @@ test("failed close after a cap hit does not free runtime capacity", async () => 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /6\/6/);
     assert.match(output.reason, /failed_closes=1/);
+  });
+});
+
+test("transcript close not found repairs stale open edge before next prompt", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open'),('parent1','child4','open'),('parent1','child5','open'),('parent1','child6','open');",
+    );
+
+    const transcript = join(home, "parent.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"parent1"}}',
+        '{"timestamp":"2026-05-16T08:01:02.000Z","type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child6\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"agent with id child6 not found"}}',
+      ].join("\n"),
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      transcript_path: transcript,
+      prompt: "spawn agent status",
+    });
+
+    assert.equal(
+      await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status order by status;"),
+      "closed|1\nopen|5",
+    );
+    assert.match(output.hookSpecificOutput.additionalContext, /occupied=5\/6/);
+    assert.match(output.hookSpecificOutput.additionalContext, /remaining_spawn_budget=1/);
+    assert.match(output.hookSpecificOutput.additionalContext, /native_current=open=5, terminal_open=0/);
   });
 });
 
@@ -982,6 +1017,23 @@ test("successful close_agent is the only automatic native edge release", async (
       session_id: "parent1",
       tool_input: { target: "child1" },
       tool_response: { status: "closed" },
+    });
+
+    assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "closed|1");
+  });
+});
+
+test("close_agent not found marks current-parent native edge unreachable", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "parent1",
+      tool_input: { target: "child1" },
+      tool_response: "agent with id child1 not found",
     });
 
     assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "closed|1");

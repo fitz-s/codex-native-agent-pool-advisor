@@ -646,6 +646,7 @@ function emptyTranscriptPool() {
     active: new Set(),
     spawned: new Set(),
     closed: new Set(),
+    missingClosed: new Set(),
     slotOccupied: 0,
     slotEstimateEvents: 0,
     slotEstimateReliable: false,
@@ -744,7 +745,18 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
       const closeIds = callId ? pendingCloseCalls.get(callId) : null;
       if (closeIds) {
         pendingCloseCalls.delete(callId);
-        if (textLooksCloseFailed(safeString(payload.output ?? payload.result ?? ""))) {
+        const outputText = safeString(payload.output ?? payload.result ?? "");
+        if (textLooksCloseTargetMissing(outputText)) {
+          for (const id of closeIds) {
+            pool.closed.add(id);
+            pool.missingClosed.add(id);
+            pool.active.delete(id);
+            pool.lastCloseAtMs = Math.max(pool.lastCloseAtMs, eventTimestampMs(record));
+          }
+          noteSlotClose(closeIds.length);
+          continue;
+        }
+        if (textLooksCloseFailed(outputText)) {
           pool.failedCloses += closeIds.length;
           continue;
         }
@@ -948,6 +960,28 @@ async function repairClosedNativeEdges(parentThreadId, closedIds) {
   }
 }
 
+async function applyMissingCloseEvidence(parentThreadId, transcriptPool, nativeThreadEdges) {
+  const ids = [...(transcriptPool?.missingClosed ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
+  const parentId = safeString(parentThreadId).trim();
+  if (!parentId || ids.length === 0) return 0;
+
+  const changed = await repairClosedNativeEdges(parentId, ids);
+  for (const id of ids) {
+    nativeThreadEdges?.active?.delete(id);
+    nativeThreadEdges?.terminal?.delete(id);
+    nativeThreadEdges?.closed?.add(id);
+  }
+  if (changed > 0) {
+    await appendAdvisorLog({
+      event: "native_edge_close_not_found_repair",
+      parent_thread_id: parentId,
+      requested: ids.length,
+      changed,
+    });
+  }
+  return changed;
+}
+
 async function maintainNativePoolStorage(state, nowMs, nowIso) {
   const last = msFromIso(state.last_native_edge_maintenance_at);
   if (last && nowMs - last < NATIVE_EDGE_MAINTENANCE_TTL_MS) return;
@@ -1075,6 +1109,7 @@ async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT
     discoverRecentChildSessionIds(poolThreadId, nowMs, resetAtMs),
     discoverNativeThreadEdges(poolThreadId),
   ]);
+  await applyMissingCloseEvidence(poolThreadId, transcriptPool, nativeThreadEdges);
   return { transcriptPool, childSessionIds, nativeThreadEdges, poolThreadId };
 }
 
@@ -1372,6 +1407,12 @@ function textLooksCloseFailed(text) {
   );
 }
 
+function textLooksCloseTargetMissing(text) {
+  return /(?:unknown agent|agent (?:with id [A-Za-z0-9_.:-]+ )?not found|not found|invalid agent)/i.test(
+    safeString(text),
+  );
+}
+
 function textLooksSpawnCapacityFailure(text) {
   return /(?:collab spawn failed|agent thread limit reached|thread limit reached|pool[- ]?exhaustion|pool[^.!?\n]{0,80}(?:full|exhausted)|无法生成|不能启动|名额[^.!?\n]{0,80}满|数量[^.!?\n]{0,80}上限|线程上限|子代理[^.!?\n]{0,80}(?:上限|已满)|智能体[^.!?\n]{0,80}(?:上限|已满)|native[^.!?\n]{0,80}(?:agent|subagent)[^.!?\n]{0,80}(?:limit|cap)[^.!?\n]{0,80}(?:reached|full|exhausted)|(?:limit|cap)[^.!?\n]{0,80}(?:reached|full|exhausted)[^.!?\n]{0,80}native[^.!?\n]{0,80}(?:agent|subagent))/i.test(
     safeString(text),
@@ -1380,6 +1421,10 @@ function textLooksSpawnCapacityFailure(text) {
 
 function closeLooksFailed(payload) {
   return textLooksCloseFailed(responseText(payload));
+}
+
+function closeLooksTargetMissing(payload) {
+  return textLooksCloseTargetMissing(responseText(payload));
 }
 
 function toolCallId(payload) {
@@ -1672,20 +1717,20 @@ function terminalCloseTargetGuidance(summary) {
   const terminalText = lanes.length > 0
     ? `Current-parent completed-not-closed native edge candidates: ${lanes.map(formatTerminalLaneSummary).join(" | ")}.`
     : "";
-  return `${activeText} ${terminalText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result decrements the slot estimate for a current-parent lane. If close_agent fails, treat that row as stale/unreachable and use explicit reset/repair tooling rather than counting it as freed capacity.`.trim();
+  return `${activeText} ${terminalText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
   if (!summary) return "";
   const remaining = remainingSpawnBudget(summary, cap);
   const hardDirective = remaining === 0
-    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true. remaining_spawn_budget=0: do not call spawn_agent in this assistant response, even after send_input or wait_agent. Only a successful close_agent result can make a later spawn safe."
+    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true. remaining_spawn_budget=0: do not call spawn_agent in this assistant response, even after send_input or wait_agent. Only a successful close_agent result or runtime not-found close evidence can make a later spawn safe."
     : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. Launch at most one spawn_agent before re-checking capacity; each spawn_agent call immediately decrements this local counter.`;
   return [
     hardDirective,
     `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_current=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
     terminalCloseTargetGuidance(summary),
-    "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result.",
+    "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
     "When remaining_spawn_budget is 0, do not call spawn_agent. Continue locally or close a known no-longer-needed current-parent lane first; send_input and wait_agent do not increase the spawn budget.",
   ].filter(Boolean).join(" ");
 }
@@ -2117,6 +2162,24 @@ async function main() {
             continue;
           }
           if (operation.name !== "close_agent") continue;
+
+          const missingCloseIds = closeLooksTargetMissing(operationPayload)
+            ? collectCloseTargetIds(operationPayload)
+            : [];
+          if (missingCloseIds.length > 0) {
+            await repairClosedNativeEdges(identity.poolThreadId, missingCloseIds);
+            for (const id of missingCloseIds) {
+              delete session.agents[id];
+              nativeThreadEdges.active?.delete(id);
+              nativeThreadEdges.terminal?.delete(id);
+              nativeThreadEdges.closed?.add(id);
+              transcriptPool.active.delete(id);
+              transcriptPool.closed.add(id);
+              transcriptPool.missingClosed.add(id);
+            }
+            session.last_close_at = nowIso;
+            continue;
+          }
 
           const closedIds = markClosed(session, operationPayload);
           if (closedIds.length > 0) {

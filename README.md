@@ -34,7 +34,7 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
 - `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
 - A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
-- The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Failed close attempts do not free capacity.
+- The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Runtime `not found` / `unknown agent` close evidence is also treated as a stale-unreachable lane and repaired to `closed`; other close failures do not free capacity.
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
 - Child sessions do not receive proactive prompt-time delegation guidance. A child that needs more delegation should report that recommendation upward; the parent leader owns slot closure and relaunch.
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
