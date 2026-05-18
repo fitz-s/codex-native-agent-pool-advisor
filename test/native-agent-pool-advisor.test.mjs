@@ -186,7 +186,7 @@ test("missing native edge database blocks spawn conservatively", async () => {
   });
 });
 
-test("global native pool blocks unrelated parent with empty current edges", async () => {
+test("unrelated parent native open edges do not block current parent", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -206,14 +206,15 @@ test("global native pool blocks unrelated parent with empty current edges", asyn
       },
     });
 
-    assert.equal(output.decision, "block");
-    assert.match(output.reason, /6\/6/);
-    assert.match(output.reason, /native_current=open=0/);
-    assert.match(output.reason, /native_global=open=6/);
+    assert.notEqual(output?.decision, "block");
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const reservations = Object.values(state.sessions["thread:empty-parent"].spawn_reservations);
+    assert.equal(reservations.length, 1);
+    assert.equal(reservations[0].count, 1);
   });
 });
 
-test("global full pool emits zero budget on unrelated prompt before spawn", async () => {
+test("unrelated parent native open edges do not emit zero budget on current prompt", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -228,10 +229,10 @@ test("global full pool emits zero budget on unrelated prompt before spawn", asyn
     });
     const context = output.hookSpecificOutput.additionalContext;
 
-    assert.match(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
+    assert.match(context, /^SPAWN_AGENT_LOCAL_COUNTER_START=6/);
     assert.match(context, /native_current=open=0/);
-    assert.match(context, /native_global=open=6/);
-    assert.match(context, /Global native open-edge candidates affecting all spawns/);
+    assert.doesNotMatch(context, /native_global/);
+    assert.doesNotMatch(context, /Global native/);
   });
 });
 
@@ -618,7 +619,7 @@ test("overfull native open-edge evidence saturates occupied at the runtime cap",
   });
 });
 
-test("transcript close after a cap hit does not override global open-edge overflow", async () => {
+test("transcript close after a cap hit does not override current-parent overfull native edges", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const values = [];
@@ -654,8 +655,9 @@ test("transcript close after a cap hit does not override global open-edge overfl
     const context = promptOutput.hookSpecificOutput.additionalContext;
     assert.match(context, /occupied=6\/6/);
     assert.match(context, /remaining_spawn_budget=0/);
-    assert.match(context, /slot_pressure_source=native_global_open_edges/);
-    assert.match(context, /native_global=open=0, terminal_open=8, unresolved_open_edges=8/);
+    assert.match(context, /slot_pressure_source=native_open_edges_saturated/);
+    assert.match(context, /native_current=open=0, terminal_open=8, unresolved_open_edges=8/);
+    assert.doesNotMatch(context, /native_global/);
 
     const spawnOutput = await runHook(home, {
       hook_event_name: "PreToolUse",
@@ -670,7 +672,8 @@ test("transcript close after a cap hit does not override global open-edge overfl
       },
     });
     assert.equal(spawnOutput.decision, "block");
-    assert.match(spawnOutput.reason, /native_global=open=0, terminal_open=8, unresolved_open_edges=8/);
+    assert.match(spawnOutput.reason, /native_current=open=0, terminal_open=8, unresolved_open_edges=8/);
+    assert.doesNotMatch(spawnOutput.reason, /native_global/);
   });
 });
 
@@ -979,7 +982,7 @@ test("wait_agent completion does not release a native edge slot", async () => {
   });
 });
 
-test("successful close_agent repairs native edge by child id across parent identity drift", async () => {
+test("successful close_agent only repairs native edge for current parent", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -997,7 +1000,7 @@ test("successful close_agent repairs native edge by child id across parent ident
 
     assert.equal(
       await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status order by status;"),
-      "closed|1\nopen|5",
+      "open|6",
     );
 
     const output = await runHook(home, {
@@ -1101,6 +1104,33 @@ test("zero budget guidance says send_input does not make spawning safe", async (
     assert.match(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
     assert.match(context, /even after send_input or wait_agent/);
     assert.match(context, /send_input and wait_agent do not increase the spawn budget/);
+  });
+});
+
+test("child session user prompts receive no proactive subagent guidance", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const transcript = join(home, "child.jsonl");
+    await writeFile(
+      transcript,
+      JSON.stringify({
+        timestamp: "2026-05-16T08:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "child1",
+          source: { subagent: { thread_spawn: { parent_thread_id: "parent1" } } },
+        },
+      }),
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "child1",
+      transcript_path: transcript,
+      prompt: "Use reviewers and verifier agents in parallel.",
+    });
+
+    assert.equal(output, null);
   });
 });
 

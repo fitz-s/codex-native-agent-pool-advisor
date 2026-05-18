@@ -8,7 +8,7 @@
 - Optional advisor config: `~/.codex/native-agent-pool-advisor.config.json`.
 - Native Codex state: `~/.codex/state_5.sqlite`, especially `thread_spawn_edges`.
 - Native cap: `~/.codex/config.toml` `[agents].max_threads`.
-- Spawn safety uses global unresolved native edges as the hard lower bound. Per-parent edges are diagnostic, not sufficient proof that a resumed/current thread can spawn.
+- Spawn safety is scoped to the current parent/session. The admission slice is `thread_spawn_edges.parent_thread_id = <current parent thread>`.
 
 ## Hidden Branches
 
@@ -21,20 +21,21 @@
 ## Theory vs Runtime Fixes
 
 - Wrapper/nested tool calls are inspected for agent operations, so `multi_tool_use.parallel` cannot hide `spawn_agent`.
-- The original per-parent-only design was wrong for observed runtime behavior. A current thread can report `parent_thread_id` occupancy of zero while the native runtime still rejects a spawn because other unresolved native edges remain. The advisor now treats all `thread_spawn_edges.status!='closed'` rows as global pressure for spawn admission.
-- Empty native-edge tables are not treated as current truth unless an explicit reset marker exists.
+- Normal admission must never use a global native edge count. Other parent sessions can be shown by repair tooling, but they are not current-turn capacity evidence.
+- A readable empty current-parent native edge slice is authoritative for that parent/session. Transcript and child-session fallback are only used when current-parent native evidence is unavailable.
 - Transcript and child-session fallback ignore events older than the reset marker.
-- General evidence collection does not repair native edges. Only successful `PostToolUse(close_agent)` can mark a native edge closed and decrement slot pressure.
+- General evidence collection does not repair native edges. Only successful `PostToolUse(close_agent)` for the current parent/session can mark a native edge closed and decrement slot pressure.
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as unresolved/overflow evidence, not as `occupied > cap`.
-- `SessionStart` is a first-class guidance surface. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
+- `SessionStart` is a first-class guidance surface for parent sessions. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
+- Child sessions receive no proactive prompt-time delegation guidance. A child `spawn_agent` attempt is blocked at `PreToolUse`.
 - Explorer model routing is an allow-list plus advisory contract guidance, not a single hard-coded model and not a task-shape blocker. The default is Spark for near-instant scout/probe work plus mini for reasoning explorer / light executor work; installations can override model names in config or env.
 - Complex explorer prompts on Spark are allowed when Spark is used as a bounded scout/anchor collector. The hook only advises the agent to cap scope/output or escalate synthesis/edit/final-approval follow-up to mini or a frontier reviewer.
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
-- `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce global pressure. A successful `close_agent` is the normal decrement path.
-- Successful `close_agent` repair is keyed by `child_thread_id` globally. It does not require the current hook identity to match the original `parent_thread_id`, because resume/compaction and lane reuse can drift the apparent current parent.
-- Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. Recent cap-hit/close/spawn transcript events decide slot pressure when native `open` evidence is overfull; the rows remain explicit `close_agent target=<id>` or reset candidates.
+- `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path.
+- Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; it must not mutate unrelated parent rows.
+- Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. They still count for current-parent admission until close succeeds or an explicit reset removes stale state.
 - If the advisor state lock or native edge query is unavailable during `PreToolUse(spawn_agent)`, the hook blocks conservatively.
 - Automatic hook maintenance does not prune Codex SQLite. SQLite mutation is limited to successful close-agent repair and the explicit reset tool.
 

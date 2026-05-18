@@ -13,7 +13,7 @@ Codex can delegate work to native subagents, but the pool limit is easy for the 
 3. The leader explains the failure, closes several agents, restates the prompt, or tries a different batch.
 4. The thread loses context budget and attention before any useful review, verification, or exploration happens.
 
-This hook makes that category of waste visible and harder to repeat. It injects the current per-parent budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion, treats successful `close_agent` as the only normal slot release, and separates capped runtime slot pressure from stale or unresolved `open` edge debt.
+This hook makes that category of waste visible and harder to repeat. It injects the current parent/session budget, blocks spawns that are already doomed by capacity, rejects child-agent recursion at tool time, treats successful `close_agent` as the only normal slot release, and separates capped runtime slot pressure from stale or unresolved `open` edge debt.
 
 Model routing is secondary. The hook can nudge explorer prompts toward explicit Spark/Mini lanes, but its root job is launch/capacity discipline: fewer failed spawns, fewer repeated prompts, and less leader-context drift.
 
@@ -26,15 +26,16 @@ Model routing is secondary. The hook can nudge explorer prompts toward explicit 
 
 ## Runtime Model
 
-- Hard capacity is global-conservative, not parent-only. The advisor reads all native `thread_spawn_edges.status!='closed'` rows as the lower-bound pool pressure because Codex can reject a spawn even when the current parent thread has no open rows.
-- Parent-thread state, `thread_spawn_edges.parent_thread_id`, is still shown for diagnosis and close/reuse target selection, but it is not the sole spawn authority.
+- Spawn admission is scoped to the current parent/session. The advisor reads native `thread_spawn_edges` rows where `parent_thread_id` matches the current parent thread; rows from other parent sessions do not affect this turn's budget.
+- There is no global runtime pool counter in normal admission. Global reset tools are operator repair surfaces for stale state, not spawn-budget authority.
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
-- `occupied` is a saturated runtime slot estimate and is never reported above the cap. Extra global or parent `open` rows are surfaced separately as `unresolved_open_edges` and `open_edge_overflow`.
+- `occupied` is a saturated current-parent slot estimate and is never reported above the cap. Extra current-parent `open` rows are surfaced separately as `unresolved_open_edges` and `open_edge_overflow`.
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
 - `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
-- A completed child can still be a reusable lane and can still occupy the pool until `close_agent` succeeds, but old completed `open` rows are only close/reuse/reset candidates, not proof of more than six live slots.
-- The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence. Close repair is keyed by child thread id, not the current parent identity, because resumed sessions can have a different current parent key than the open edge being closed. Failed close attempts do not free capacity.
-- Empty current-parent `thread_spawn_edges` is not enough to prove capacity. Global unresolved native edges can still force `remaining_spawn_budget=0`. Empty global `thread_spawn_edges` is authoritative only after an explicit reset marker; otherwise transcript fallback prevents false-zero occupancy.
+- A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
+- The hook only decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Failed close attempts do not free capacity.
+- If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
+- Child sessions do not receive proactive prompt-time delegation guidance. A child that attempts `spawn_agent` is blocked at `PreToolUse` and should report the need upward to its parent leader.
 - The default explorer model list is `gpt-5.3-codex-spark,gpt-5.4-mini`: prefer Spark, fallback to mini if Spark is unavailable.
 - Spark is treated as a near-instant scout lane that can support complex workflows when its output contract is bounded evidence, anchors, or hypotheses. Mini is treated as a reasoning explorer / light executor lane.
 - The hook does not block Spark because a prompt looks "complex"; it emits contract guidance and lets the parent agent choose.
@@ -59,7 +60,9 @@ The installer copies `hooks/native-agent-pool-advisor.mjs` to `$CODEX_HOME/hooks
 
 The installer is idempotent: repeated installs should leave one registration per hook event.
 
-## Delegation Guidance
+## Optional Model Route Guard
+
+The capacity guard does not decide whether Codex should delegate. Model routing is an optional second guard for the cases where the leader has already chosen to spawn an explorer and the tool input would otherwise inherit an expensive frontier model.
 
 | Model lane | Use for | Boundary |
 | --- | --- | --- |
