@@ -1790,6 +1790,26 @@ function terminalCloseTargetGuidance(summary) {
   return `${activeText} ${terminalText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
 }
 
+function zeroBudgetRecoveryGuidance(summary) {
+  const activeLanes = Array.isArray(summary?.native_active_lanes) ? summary.native_active_lanes : [];
+  const terminalLanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
+  const hasListedLane = activeLanes.length > 0 || terminalLanes.length > 0;
+  const candidateText = terminalLanes.length > 0
+    ? "Prefer completed-not-closed candidates first."
+    : activeLanes.length > 0
+    ? "Only close an active lane when the leader knows it is no longer needed; otherwise reuse it, wait for it, or continue locally."
+    : "No current-parent close target is listed; treat this as a state mismatch and verify hook/native DB state instead of retrying spawn.";
+  return [
+    "ZERO_BUDGET_RECOVERY_REQUIRED=true.",
+    "Do not stop at saying the subagent pool is full.",
+    "Before any new spawn, choose one recovery action: reuse a compatible current-parent lane with send_input, close exactly one listed current-parent lane that is no longer needed, wait for an active lane if its result is needed, or continue locally.",
+    candidateText,
+    hasListedLane
+      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and then spawn at most one lane if budget is positive."
+      : "If live state says fewer lanes exist than the hook snapshot, run a fresh hook/live check and use the newer scoped budget."
+  ].join(" ");
+}
+
 function buildTurnBudgetGuidance(summary, cap) {
   if (!summary) return "";
   const remaining = remainingSpawnBudget(summary, cap);
@@ -1799,6 +1819,7 @@ function buildTurnBudgetGuidance(summary, cap) {
   return [
     hardDirective,
     `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
+    remaining === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
     terminalCloseTargetGuidance(summary),
     "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
     "When remaining_spawn_budget is 0, do not call spawn_agent. Continue locally or close a known no-longer-needed current-parent lane first; send_input and wait_agent do not increase the spawn budget. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
@@ -2069,7 +2090,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 	          ? "Nested spawn denied; no child-side delegation guidance is emitted."
 	          : (summary.cap_hit_after_last_close
 	              ? "This thread already saw a native pool-exhaustion failure after the last confirmed close; do not retry spawn_agent until a later close succeeds and a newer hook/PreToolUse capacity check reports budget."
-	              : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary. Continue locally or close a no-longer-needed current-parent lane, then retry only one spawn per confirmed free slot."))
+	              : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close exactly one listed no-longer-needed current-parent lane, wait for a needed active lane, or continue locally; then retry only one spawn after a fresh positive capacity check."))
 	      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
     (summary.native_edge_overflow ?? 0) > 0
       ? `Native DB open-edge debt exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are repair debt rather than additional live agents. db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}.`

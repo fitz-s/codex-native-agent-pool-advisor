@@ -37,6 +37,7 @@
 - Current-session terminal lanes still consume local budget until `close_agent` succeeds.
 - `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path; runtime not-found close evidence is the stale-unreachable exception.
 - A zero-budget prompt is only a capacity snapshot. After a successful close or runtime not-found repair, the next hook or `PreToolUse` capacity check replaces the old snapshot; agents must not keep treating stale zero-budget text as current authority.
+- At zero budget, the prompt must include recovery actions rather than only a prohibition. Valid recovery actions are: reuse a compatible current-parent lane, close exactly one listed no-longer-needed lane, wait for a needed active lane, or continue locally.
 - Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; it must not mutate unrelated parent rows.
 - Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. They still count for current-parent admission until close succeeds or an explicit reset removes stale state.
 - Long child transcripts must still be scanned for `task_complete` outside the terminal tail window before an open edge is labeled active.

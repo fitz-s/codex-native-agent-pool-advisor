@@ -1274,6 +1274,9 @@ test("session start emits cap pressure after resume before a spawn is attempted"
     assert.match(output.hookSpecificOutput.additionalContext, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
     assert.match(output.hookSpecificOutput.additionalContext, /When remaining_spawn_budget is 0, do not call spawn_agent/);
     assert.match(output.hookSpecificOutput.additionalContext, /zero-budget snapshot/);
+    assert.match(output.hookSpecificOutput.additionalContext, /ZERO_BUDGET_RECOVERY_REQUIRED=true/);
+    assert.match(output.hookSpecificOutput.additionalContext, /Do not stop at saying the subagent pool is full/);
+    assert.match(output.hookSpecificOutput.additionalContext, /choose one recovery action/);
     assert.match(output.hookSpecificOutput.additionalContext, /next hook\/PreToolUse capacity check/);
   });
 });
@@ -1294,6 +1297,9 @@ test("zero budget guidance rejects send_input and requires capacity refresh afte
     const context = output.hookSpecificOutput.additionalContext;
 
     assert.match(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
+    assert.match(context, /ZERO_BUDGET_RECOVERY_REQUIRED=true/);
+    assert.match(context, /reuse a compatible current-parent lane with send_input/);
+    assert.match(context, /close exactly one listed current-parent lane/);
     assert.match(context, /send_input and wait_agent do not increase the spawn budget/);
     assert.match(context, /If close_agent succeeds, re-check capacity before any spawn/);
     assert.match(context, /older zero-budget snapshot is no longer authoritative/);
