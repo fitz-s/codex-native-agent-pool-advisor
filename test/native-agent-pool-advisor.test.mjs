@@ -1187,6 +1187,68 @@ test("close_agent not found for non-owned target does not release current-parent
   });
 });
 
+test("close_agent not found repairs unique native edge even when hook session is mis-scoped", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open'),('parent1','child4','open'),('parent1','child5','open'),('parent1','child6','open');",
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "wrong-parent",
+      tool_input: { target: "child6" },
+      tool_response: "agent with id child6 not found",
+    });
+
+    assert.equal(
+      await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status order by status;"),
+      "closed|1\nopen|5",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map one file",
+      },
+    });
+    assert.notEqual(output?.decision, "block");
+  });
+});
+
+test("close_agent not found does not repair ambiguous native child edge", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','shared-child','open'),('parent2','shared-child','open');",
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "wrong-parent",
+      tool_input: { target: "shared-child" },
+      tool_response: "agent with id shared-child not found",
+    });
+
+    assert.equal(
+      await sqliteReadonly(
+        home,
+        "select parent_thread_id,status,count(*) from thread_spawn_edges group by parent_thread_id,status order by parent_thread_id;",
+      ),
+      "parent1|open|1\nparent2|open|1",
+    );
+  });
+});
+
 test("authoritative native open edges below cap override stale cap-hit state", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

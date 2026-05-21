@@ -1021,6 +1021,76 @@ async function repairClosedNativeEdgeIds(parentThreadId, closedIds) {
   }
 }
 
+async function repairUniqueMissingNativeEdgeIds(closedIds) {
+  const ids = [...(closedIds ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
+  if (ids.length === 0) return new Map();
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return new Map();
+
+  const selectSql = [
+    "select parent_thread_id,child_thread_id",
+    "from thread_spawn_edges",
+    "where status!='closed'",
+    `and child_thread_id in (${ids.map(sqlString).join(",")})`,
+    "order by child_thread_id,parent_thread_id;",
+  ].join(" ");
+
+  try {
+    const { stdout: selectStdout } = await execFileAsync("sqlite3", ["-json", dbPath, selectSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(selectStdout);
+    const parentsByChild = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const childId = safeString(row?.child_thread_id).trim();
+      const parentId = safeString(row?.parent_thread_id).trim();
+      if (!childId || !parentId) continue;
+      if (!parentsByChild.has(childId)) parentsByChild.set(childId, new Set());
+      parentsByChild.get(childId).add(parentId);
+    }
+
+    const uniquePairs = [];
+    for (const [childId, parentIds] of parentsByChild.entries()) {
+      if (parentIds.size !== 1) continue;
+      uniquePairs.push([childId, [...parentIds][0]]);
+    }
+    if (uniquePairs.length === 0) return new Map();
+
+    const conditions = uniquePairs
+      .map(([childId, parentId]) => `(parent_thread_id=${sqlString(parentId)} and child_thread_id=${sqlString(childId)})`)
+      .join(" or ");
+    const sql = [
+      "pragma busy_timeout=250;",
+      "update thread_spawn_edges",
+      "set status='closed'",
+      "where status!='closed'",
+      `and (${conditions});`,
+      "select changes() as changed;",
+    ].join(" ");
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = Number(parseSqliteJsonOutput(stdout)?.[0]?.changed ?? 0);
+    if (changed <= 0) return new Map();
+
+    const repaired = new Map(uniquePairs);
+    await appendAdvisorLog({
+      event: "native_edge_close_not_found_unique_child_repair",
+      requested: ids.length,
+      changed,
+      repaired: [...repaired.entries()].map(([child_thread_id, parent_thread_id]) => ({
+        child_thread_id,
+        parent_thread_id,
+      })),
+    });
+    return repaired;
+  } catch {
+    return new Map();
+  }
+}
+
 async function repairClosedNativeEdges(parentThreadId, closedIds) {
   return (await repairClosedNativeEdgeIds(parentThreadId, closedIds)).size;
 }
@@ -2320,8 +2390,18 @@ async function main() {
             : [];
           if (missingCloseIds.length > 0) {
             const repairedIds = await repairClosedNativeEdgeIds(identity.poolThreadId, missingCloseIds);
+            const unrepairedMissingIds = missingCloseIds.filter((id) => !repairedIds.has(id));
+            const uniqueRepairedParents = await repairUniqueMissingNativeEdgeIds(unrepairedMissingIds);
             const nativeAuthoritative = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
-            const effectiveIds = nativeAuthoritative ? repairedIds : new Set(missingCloseIds);
+            const currentParentUniqueIds = new Set(
+              [...uniqueRepairedParents.entries()]
+                .filter(([, parentId]) => parentId === identity.poolThreadId)
+                .map(([id]) => id),
+            );
+            const currentParentRepairedIds = new Set([...repairedIds, ...currentParentUniqueIds]);
+            const effectiveIds = nativeAuthoritative
+              ? currentParentRepairedIds
+              : new Set([...missingCloseIds, ...uniqueRepairedParents.keys()]);
             for (const id of effectiveIds) {
               delete session.agents[id];
               nativeThreadEdges.active?.delete(id);

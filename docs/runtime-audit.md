@@ -25,7 +25,7 @@
 - Unscoped spawn hook payloads must block instead of falling back to a shared `cwd` ledger. Capacity is per parent/session; unknown parent identity is unsafe.
 - A readable empty current-parent native edge slice is authoritative for that parent/session. Transcript and child-session fallback are only used when current-parent native evidence is unavailable.
 - Transcript and child-session fallback ignore events older than the reset marker.
-- General evidence collection does not repair native edges. Successful `PostToolUse(close_agent)` for the current parent/session marks a native edge closed and decrements slot pressure; runtime `not found` / `unknown agent` close evidence is also repaired because the lane is no longer reachable by Codex.
+- General evidence collection does not repair native edges. Successful `PostToolUse(close_agent)` for the current parent/session marks a native edge closed and decrements slot pressure; runtime `not found` / `unknown agent` close evidence is also repaired because the lane is no longer reachable by Codex. If the close hook payload is mis-scoped, a target child id repairs only when it maps to exactly one non-closed native edge; ambiguous child ids remain open.
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as `db_open_edge_debt` / `open_edge_overflow`, not as more live agents or `occupied > cap`.
@@ -40,7 +40,7 @@
 - `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path; runtime not-found close evidence is the stale-unreachable exception.
 - A zero-budget prompt is only a capacity snapshot. After a successful close or runtime not-found repair, the next hook or `PreToolUse` capacity check replaces the old snapshot; agents must not keep treating stale zero-budget text as current authority.
 - At zero budget, the prompt must include recovery actions rather than only a prohibition. Valid recovery actions are: reuse a compatible current-parent lane, close exactly one listed no-longer-needed lane, wait for a needed active lane, or continue locally.
-- Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; it must not mutate unrelated parent rows.
+- Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; the only cross-parent fallback is unique-child not-found repair. It must not mutate ambiguous unrelated parent rows.
 - Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. They still count for current-parent admission until close succeeds or an explicit reset removes stale state.
 - Long child transcripts must still be scanned for `task_complete` outside the terminal tail window before an open edge is labeled active.
 - If the advisor state lock or native edge query is unavailable during a supported `PreToolUse(spawn_agent)` event, the hook blocks conservatively.
