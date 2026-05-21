@@ -1235,6 +1235,59 @@ test("authoritative native open edges below cap override stale cap-hit state", a
   });
 });
 
+test("runtime not-found close after cap hit releases current-parent native slot", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open'),('parent1','child4','open'),('parent1','child5','open'),('parent1','child6','open');",
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+      tool_response: "collab spawn failed: agent thread limit reached",
+    });
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "parent1",
+      tool_input: { target: "child6" },
+      tool_response: "agent with id child6 not found",
+    });
+
+    assert.equal(
+      await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status order by status;"),
+      "closed|1\nopen|5",
+    );
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const session = state.sessions["thread:parent1"];
+    assert.ok(Date.parse(session.last_close_at) > Date.parse(session.last_cap_hit_at));
+    assert.equal(session.last_close_failed_at ?? "", "");
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map one more file",
+      },
+    });
+    assert.notEqual(output?.decision, "block");
+  });
+});
+
 test("wait_agent completion does not release a native edge slot", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
