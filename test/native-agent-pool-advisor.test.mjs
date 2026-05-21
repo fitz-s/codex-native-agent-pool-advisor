@@ -2075,6 +2075,64 @@ test("live-check detects native model mismatch for explicit-model spawn", async 
   });
 });
 
+test("live-check reports native DB unavailable instead of model mismatch", async () => {
+  await withHome(async (home) => {
+    const transcript = join(home, "parent-db-missing.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.5\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"critic\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Critic\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, [
+        "--transcript", transcript,
+        "--state-db", join(home, "missing-state.sqlite"),
+        "--allow-missing-guidance",
+      ]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.verdict, "native_db_unavailable");
+    assert.equal(output.checks.find((item) => item.name === "tool_model_matches_native").status, "pass");
+  });
+});
+
+test("live-check reports missing native edge separately from model mismatch", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const transcript = join(home, "parent-edge-missing.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.5\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"critic\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Critic\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.verdict, "native_spawn_edge_missing");
+    assert.equal(output.checks.find((item) => item.name === "tool_model_matches_native").status, "pass");
+    const edgeCheck = output.checks.find((item) => item.name === "native_edges_observed_for_successful_spawns");
+    assert.equal(edgeCheck.status, "fail");
+    assert.match(edgeCheck.evidence, /child1/);
+  });
+});
+
 test("live-check records same-response native spawn batches and fails runtime spawn failures", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

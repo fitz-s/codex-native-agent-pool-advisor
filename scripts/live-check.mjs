@@ -477,8 +477,12 @@ async function main() {
       closed: Boolean(edge?.status === "closed" && closeReleaseTargetSet.has(call.output.agent_id)),
     };
   });
+  const missingNativeEdgeReports = edges.available
+    ? spawnReports.filter((report) => !report.edge)
+    : [];
   const modelMismatchReports = spawnReports.filter((report) => {
     if (!report.call.model) return false;
+    if (!report.edge) return false;
     return report.edge?.model !== report.call.model;
   });
   const explorerFrontierReports = spawnReports.filter((report) => {
@@ -508,6 +512,17 @@ async function main() {
         ? "every successful explicit-model spawn matches the native DB model"
         : modelMismatchReports.map((report) => {
           return `${report.call.output.agent_id}:tool_model=${report.call.model || "?"}, native_model=${report.edge?.model ?? "missing"}`;
+        }).join(", "),
+    ),
+    buildCheck(
+      "native_edges_observed_for_successful_spawns",
+      missingNativeEdgeReports.length === 0,
+      !edges.available
+        ? "skipped because native DB is unavailable"
+        : missingNativeEdgeReports.length === 0
+        ? "every successful spawn has a native DB edge row"
+        : missingNativeEdgeReports.map((report) => {
+          return `${report.call.output.agent_id}:tool_role=${report.call.agent_type || "?"}, tool_model=${report.call.model || "?"}`;
         }).join(", "),
     ),
     buildCheck(
@@ -579,6 +594,10 @@ async function main() {
       ? "native_spawn_model_mismatch"
       : checkStatus === "failed" && missingModelCreated.length > 0
       ? "native_spawn_missing_model_bypassed_advisor"
+      : checkStatus === "failed" && !edges.available
+      ? "native_db_unavailable"
+      : checkStatus === "failed" && missingNativeEdgeReports.length > 0
+      ? "native_spawn_edge_missing"
       : checkStatus === "failed"
       ? "live_check_failed"
       : spawnCalls.length > 0 && !guidanceBeforeFirstSpawn
