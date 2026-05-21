@@ -43,7 +43,9 @@ See [First-Principles Design](docs/first-principles.md) for the full boundary mo
 - Without a Codex runtime reservation primitive, launch sequencing is deliberately conservative: create one new child, let `PostToolUse` and native edge state record the result, then re-check capacity before creating another child. A supported `PreToolUse` surface blocks multiple `spawn_agent` requests in one tool operation because partial batch success is the context-wasting failure this project is designed to avoid.
 - `wait_agent`, child completion notifications, and `send_input` do not by themselves free a native slot.
 - Native `open` rows whose child transcript already has `task_complete` are stale persistence edges. The hook self-heals those rows to `closed` and excludes them from current runtime occupancy.
-- When current-parent lanes exist, prompt-time guidance includes `LANE_REUSE_CHECK_REQUIRED=true` and a lane inventory. That is not a semantic hard block: the hook cannot know whether two tasks are truly the same topic. It gives the parent enough evidence to reuse a compatible lane before spending another native slot.
+- When current-parent lanes exist, prompt-time guidance includes `LANE_REUSE_CHECK_REQUIRED=true` and a compact lane inventory with role, model, status, title, and `updated_at`. That is not a semantic hard block: the hook cannot know whether two tasks are truly the same topic. It gives the parent enough evidence to reuse a compatible lane before spending another native slot.
+- Positive-budget prompt guidance is intentionally short when there is no current-parent lane pressure, invalid spawn shape, narrow spawn intent, unreadable native state, or zero budget. Broad words such as review, research, verify, or parallel do not by themselves trigger a long hook lecture.
+- Explicit negative intent wins before prompt keyword matching: phrases such as "do not spawn agents" or "no subagents" suppress prompt-triggered spawn guidance unless an actual spawn tool payload is visible.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
 - A zero-budget prompt also emits a recovery protocol. The agent should not stop at "the pool is full"; it must choose between reusing a compatible current-parent lane, closing listed no-longer-needed lane(s), waiting for a needed active lane, or continuing locally.
 - The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Explicit agent-target missing evidence such as `unknown agent` or `agent with id ... not found` is also treated as a stale-unreachable lane and repaired to `closed`; unrelated errors such as `endpoint not found` do not free capacity.
@@ -85,10 +87,12 @@ The capacity guard does not decide whether Codex should delegate. If the leader 
 Subagents are context lanes, not one-shot function calls. Before spawning a new child, the parent should inspect current-parent lane inventory from the hook output:
 
 - Reuse with `send_input` when an existing lane has the same topic/domain, compatible role/model, and useful prior context.
-- Keep a completed lane open when near-term follow-up on the same topic is likely; completion does not free the native slot.
-- Close a lane when it is unrelated, stale, wrong-model for the next task, or a slot must be freed for higher-value work.
+- Keep a completed lane open only for the same active task/window when near-term follow-up on the same topic is likely; completion does not free the native slot, but it can preserve valuable context.
+- Close a lane when it is unrelated, stale, wrong-model for the next task, the active task window is done, or a slot must be freed for higher-value work.
 - Do not send orchestration guidance to child lanes. Children report escalation needs upward; the parent owns reuse, close, and relaunch.
 - If zero budget is reported and no reusable lane exists, close listed completed-not-closed candidates first; close active lanes only when the parent knows they are no longer needed.
+
+Before deciding to stay local on subagent-relevant read-heavy or multi-slice work, the leader should consciously choose one path: reuse an existing lane, spawn one new lane and resample capacity, or continue locally because the task is tiny, urgent, user-forbidden, or blocked on evidence the leader is already collecting.
 
 Before spawning, the leader should make a compact task contract:
 
@@ -111,6 +115,8 @@ Route by output contract, risk, and context-state depth, not by complexity adjec
 For broad, compiled, vendor, or large-context repos, do a local `rg`/module map first. Then send Spark exact slices for anchors, not the whole tree. Use mini for synthesis once the slices exist. If two scout lanes fail or compact on context, stop spawning, shrink the slice locally, and reuse or close current lanes before trying again.
 
 When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid, and blocks `agent_type=explorer` paired with forbidden frontier models. The fix is to remove `fork_context` for model-routed lanes, intentionally accept inherited model for exact full-history fork, or change frontier critic/architecture lanes to `agent_type=default`. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
+
+See [Delegation Control Implementation Plan](docs/delegation-control-implementation-plan.md) for the approved follow-up design that keeps the hook small while moving durable delegation policy into `AGENTS.md`.
 
 ## Design Basis
 
@@ -218,6 +224,7 @@ Use explicit expectations when validating a real run:
 node scripts/live-check.mjs \
   --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl \
   --since-line <line_before_test> \
+  --forbid-explorer-model gpt-5.5 \
   --expect-model gpt-5.3-codex-spark \
   --expect-model gpt-5.4-mini \
   --expect-model gpt-5.5 \
@@ -233,6 +240,8 @@ node scripts/live-check.mjs \
   --expect-current-open 6 \
   --allow-missing-guidance
 ```
+
+The live-check JSON includes `current_parent_lanes` with status, role, model, reasoning effort, nickname, title, and `updated_at` for the scoped parent/session. Use that block when validating lane reuse, completed-not-closed pressure, or close accounting.
 
 At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, `observed_free=0`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent. If a later close succeeds, run a fresh hook/live check and use the updated observed snapshot instead of the stale zero-budget prompt.
 

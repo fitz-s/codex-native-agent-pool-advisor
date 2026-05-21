@@ -1652,12 +1652,23 @@ function markClosed(session, payload) {
 
 function looksLikeDelegationPrompt(prompt) {
   const normalized = safeString(prompt).toLowerCase();
-  return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bagents?\b|\bpool\b|\bcap\b|\blimit\b|\bcritics?\b|\breviewers?\b|\breviews?\b|\bverifiers?\b|\bverif(?:y|ier|ication)\b|\bresearchers?\b|\baudit(?:or|ing)?\b|\bdelegate\b|\bparallel\b|\bfan[ -]?out\b|子代理|智能体|代理|上限|满池|名额|槽位|并行|派发|审查代理|验证代理|评审代理|复审代理|验收代理|审查|复核|评审|审计|验证|深度推理|第一性原理)/i.test(normalized);
+  return looksLikeNarrowSpawnIntentPrompt(prompt)
+    || /(?:\bnative\s+(?:pool|cap|limit)\b|\bsubagent\s+(?:pool|cap|limit)\b|\bagent\s+(?:pool|cap|limit)\b|\bpool\b|\bcap\b|\blimit\b|上限|满池|名额|槽位)/i.test(normalized);
+}
+
+function looksLikeNegativeSpawnIntentPrompt(prompt) {
+  const normalized = safeString(prompt).toLowerCase();
+  return /(?:\bdo\s+not\s+(?:spawn|use|create|start|launch)\s+(?:native\s+)?(?:sub)?agents?\b|\bdon't\s+(?:spawn|use|create|start|launch)\s+(?:native\s+)?(?:sub)?agents?\b|\bno\s+(?:native\s+)?subagents?\b|\bno\s+child\s+agents?\b|\bwithout\s+(?:native\s+)?subagents?\b|不要(?:生成|启动|创建|使用|派发).{0,12}(?:子代理|智能体|代理)|不要.{0,12}(?:子代理|智能体|代理)|别(?:生成|启动|创建|使用|派发).{0,12}(?:子代理|智能体|代理))/i.test(normalized);
+}
+
+function looksLikeNarrowSpawnIntentPrompt(prompt) {
+  if (looksLikeNegativeSpawnIntentPrompt(prompt)) return false;
+  const normalized = safeString(prompt).toLowerCase();
+  return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bspawn\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\bstart\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\blaunch\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\bcreate\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\b(?:new|another|one\s+more)\s+(?:explorer|reviewer|verifier|researcher|critic)\b|\btry\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:explorer|reviewer|verifier|researcher|critic)\b|生成.{0,12}(?:子代理|智能体|代理)|启动.{0,12}(?:子代理|智能体|代理)|创建.{0,12}(?:子代理|智能体|代理)|派发.{0,12}(?:子代理|智能体|代理))/i.test(normalized);
 }
 
 function looksLikeSpawnIntentPrompt(prompt) {
-  const normalized = safeString(prompt).toLowerCase();
-  return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bagents?\b|\bexplorers?\b|\breviewers?\b|\bverifiers?\b|\bresearchers?\b|\bcritics?\b|\bparallel\b|\bfan[ -]?out\b|子代理|智能体|代理|explorer|并行|派发|审查代理|验证代理|评审代理|复审代理|调查代理|研究代理)/i.test(normalized);
+  return looksLikeNarrowSpawnIntentPrompt(prompt);
 }
 
 function hasRecentCapacityPressure(session, nowMs) {
@@ -1683,41 +1694,44 @@ function hasPromptCapacityPressure(summary) {
   );
 }
 
+function hasCriticalPromptCapacityPressure(summary, cap) {
+  return Boolean(
+    summary
+      && (
+        remainingSpawnBudget(summary, cap) <= warnRemaining()
+        || summary.native_edge_failed
+        || summary.cap_hit_blocks_spawn
+        || summary.failed_closes > 0
+        || summary.pending_spawn_reservations > 0
+        || (summary.native_edge_overflow ?? 0) > 0
+      ),
+  );
+}
+
 function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSession, promptSummary = null, cap = DEFAULT_AGENT_CAP) {
   if (isChildSession) return false;
   if (eventName === "SessionStart") {
-    const criticalPressure = Boolean(
-      promptSummary
-        && (
-          remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
-          || promptSummary.cap_hit_blocks_spawn
-          || promptSummary.failed_closes > 0
-          || promptSummary.pending_spawn_reservations > 0
-          || (promptSummary.native_edge_overflow ?? 0) > 0
-        ),
-    );
+    const criticalPressure = hasCriticalPromptCapacityPressure(promptSummary, cap);
     if (criticalPressure) return true;
     const last = msFromIso(session.last_capacity_session_guidance_at);
     return !last || nowMs - last > SESSION_CAPACITY_GUIDANCE_TTL_MS;
   }
 
   if (eventName !== "UserPromptSubmit") return false;
+  const negativeSpawnIntent = looksLikeNegativeSpawnIntentPrompt(prompt);
+  const narrowSpawnIntent = looksLikeNarrowSpawnIntentPrompt(prompt);
+  const promptPressure = hasPromptCapacityPressure(promptSummary);
+  const criticalPressure = hasCriticalPromptCapacityPressure(promptSummary, cap);
+  if (negativeSpawnIntent && !promptPressure && !criticalPressure) return false;
   if (
     !looksLikeDelegationPrompt(prompt)
     && !hasRecentCapacityPressure(session, nowMs)
-    && !hasPromptCapacityPressure(promptSummary)
+    && !promptPressure
   ) return false;
 
-  const criticalPressure = Boolean(
-    promptSummary
-      && (
-        remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
-        || promptSummary.cap_hit_blocks_spawn
-        || (promptSummary.native_edge_overflow ?? 0) > 0
-      ),
-  );
   if (criticalPressure) return true;
-  if (looksLikeSpawnIntentPrompt(prompt)) return true;
+  if (narrowSpawnIntent) return true;
+  if (hasLaneInventory(promptSummary)) return true;
 
   const signature = hashText(prompt.trim().toLowerCase());
   const last = msFromIso(session.last_capacity_prompt_guidance_at);
@@ -1802,10 +1816,12 @@ function nativeEdgeSummary(summary) {
 function formatLaneSummary(lane) {
   const id = compactOneLine(lane?.id, 42) || "unknown";
   const parts = [id];
+  const nickname = compactOneLine(lane?.nickname, 24);
   const role = compactOneLine(lane?.role, 24);
   const model = compactOneLine(lane?.model, 36);
   const effort = compactOneLine(lane?.reasoning_effort, 12);
   const title = compactOneLine(lane?.title, 64);
+  if (nickname) parts.push(`nick=${nickname}`);
   if (role) parts.push(`role=${role}`);
   if (model) parts.push(`model=${model}`);
   if (effort) parts.push(`effort=${effort}`);
@@ -1813,34 +1829,46 @@ function formatLaneSummary(lane) {
   return parts.join(" ");
 }
 
-function formatTerminalLaneSummary(lane) {
+function formatLaneUpdatedAt(lane) {
+  const updatedAt = Number(lane?.updated_at);
+  return Number.isFinite(updatedAt) && updatedAt > 0 ? new Date(updatedAt * 1000).toISOString() : "";
+}
+
+function formatLaneInventoryItem(lane, status) {
   const base = formatLaneSummary(lane);
   const details = [];
-  const parent = compactOneLine(lane?.parent_thread_id, 32);
-  const updatedAt = Number(lane?.updated_at);
-  if (parent) details.push(`parent=${parent}`);
-  if (Number.isFinite(updatedAt) && updatedAt > 0) {
-    details.push(`updated=${new Date(updatedAt * 1000).toISOString()}`);
-  }
-  details.push(`close_agent target=${compactOneLine(lane?.id, 42) || "unknown"}`);
+  const updated = formatLaneUpdatedAt(lane);
+  if (status) details.push(`status=${status}`);
+  if (updated) details.push(`updated_at=${updated}`);
+  details.push(`target=${compactOneLine(lane?.id, 42) || "unknown"}`);
   return `${base} (${details.join(", ")})`;
 }
 
-function terminalCloseTargetGuidance(summary) {
+function laneInventoryCounts(summary) {
   const activeLanes = Array.isArray(summary?.native_active_lanes) ? summary.native_active_lanes : [];
   const lanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
-  if (activeLanes.length === 0 && lanes.length === 0) return "";
+  return { activeLanes, terminalLanes: lanes };
+}
+
+function hasLaneInventory(summary) {
+  const { activeLanes, terminalLanes } = laneInventoryCounts(summary);
+  return activeLanes.length > 0 || terminalLanes.length > 0;
+}
+
+function laneInventoryGuidance(summary) {
+  const { activeLanes, terminalLanes } = laneInventoryCounts(summary);
+  if (activeLanes.length === 0 && terminalLanes.length === 0) return "";
   const activeText = activeLanes.length > 0
-    ? `Current-parent open native lanes without task_complete evidence: ${activeLanes.map(formatTerminalLaneSummary).join(" | ")}.`
+    ? `LANES_OPEN=${activeLanes.length}: ${activeLanes.map((lane) => formatLaneInventoryItem(lane, "open")).join(" | ")}.`
     : "";
-  const terminalText = lanes.length > 0
-    ? `Current-parent completed-not-closed native edge candidates: ${lanes.map(formatTerminalLaneSummary).join(" | ")}.`
+  const terminalText = terminalLanes.length > 0
+    ? `LANES_COMPLETED_NOT_CLOSED=${terminalLanes.length}: ${terminalLanes.map((lane) => formatLaneInventoryItem(lane, "completed_not_closed")).join(" | ")}.`
     : "";
   const overflowText = (summary?.native_edge_overflow ?? 0) > 0
     ? `Native DB open-edge debt exceeds the ${summary.native_edge_cap ?? "configured"}-slot runtime cap: db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}. Overflow rows are repair debt, not additional live agents.`
     : "";
-  const reuseText = "LANE_REUSE_CHECK_REQUIRED=true. Before any new spawn, compare the intended task contract against the current-parent lane inventory above. If a same-topic/same-domain lane has compatible model and context, use send_input to reuse that lane instead of spawning. Close a lane only when it is no longer useful, has the wrong role/model for the next task, or a slot must be freed for higher-value work.";
-  return `${activeText} ${terminalText} ${reuseText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
+  const reuseText = "LANE_REUSE_CHECK_REQUIRED=true. Compare the intended task contract against this current-parent lane inventory before spawning. If a same-topic/same-domain lane has compatible model and context, use send_input to reuse it. Completed lanes are reusable context lanes; close only when stale, wrong-topic/model, cap-needed, or the active task window is done.";
+  return `${activeText} ${terminalText} ${reuseText} ${overflowText}`.trim();
 }
 
 function zeroBudgetRecoveryGuidance(summary) {
@@ -1863,17 +1891,22 @@ function zeroBudgetRecoveryGuidance(summary) {
   ].join(" ");
 }
 
-function buildTurnBudgetGuidance(summary, cap) {
+function buildTurnBudgetGuidance(summary, cap, detailed = false) {
   if (!summary) return "";
   const snapshot = capacitySnapshot(summary, cap, 0);
   const hardDirective = snapshot.observed_free === 0
     ? "SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget observed snapshot). observed_free=0, remaining_spawn_budget=0: do not call spawn_agent from this capacity snapshot. First reuse or close known no-longer-needed current-parent lane(s), or continue locally. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state."
     : `SPAWN_AGENT_OBSERVED_FREE=${snapshot.observed_free}. BATCH_SPAWN_GUARANTEE=false. This is an observed snapshot, not an atomic runtime reservation; launch at most one new child, then re-check capacity before another spawn.`;
-  return [
+  const snapshotLine = `Current parent/session native subagent capacity snapshot: occupied=${summary.occupied}/${cap}, ${formatCapacitySnapshot(snapshot)}, slot_pressure_source=${summary.slot_pressure_source}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, pending_spawn_attempts=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`;
+  const base = [
     hardDirective,
-    `Current parent/session native subagent capacity snapshot: occupied=${summary.occupied}/${cap}, ${formatCapacitySnapshot(snapshot)}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`,
+    snapshotLine,
+    laneInventoryGuidance(summary),
+  ];
+  if (!detailed) return base.filter(Boolean).join(" ");
+  return [
+    ...base,
     snapshot.observed_free === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
-    terminalCloseTargetGuidance(summary),
     "The hook has no atomic runtime reservation API. observed_free/remaining_spawn_budget is a compatibility alias for the current observed free count, not a guaranteed batch size.",
     "wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
     "When observed_free is 0, do not call spawn_agent. Continue locally, reuse a compatible lane, or close known no-longer-needed current-parent lane(s) first; send_input and wait_agent do not increase capacity. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
@@ -1898,16 +1931,44 @@ function buildSubagentModelSelectionGuidance() {
   ].join(" ");
 }
 
-function buildCapacityGuidance(eventName, cap, summary = null) {
+function needsDetailedCapacityGuidance(summary, cap, options = {}) {
+  if (!summary) return false;
+  const snapshot = capacitySnapshot(summary, cap, 0);
+  return Boolean(
+    options.narrowSpawnIntent
+      || snapshot.observed_free === 0
+      || summary.native_edge_failed
+      || summary.cap_hit_blocks_spawn
+      || summary.failed_closes > 0
+      || summary.pending_spawn_reservations > 0
+      || (summary.native_edge_overflow ?? 0) > 0
+      || hasLaneInventory(summary),
+  );
+}
+
+function shouldIncludeModelGuidance(summary, cap, options = {}) {
+  if (!summary) return Boolean(options.spawnPayloadVisible || options.narrowSpawnIntent);
+  const snapshot = capacitySnapshot(summary, cap, 0);
+  return Boolean(
+    options.spawnPayloadVisible
+      || options.narrowSpawnIntent
+      || snapshot.observed_free === 0
+      || summary.native_edge_failed
+      || hasLaneInventory(summary),
+  );
+}
+
+function buildCapacityGuidance(eventName, cap, summary = null, options = {}) {
+  const detailed = needsDetailedCapacityGuidance(summary, cap, options);
   return [
-    buildTurnBudgetGuidance(summary, cap),
-    buildSubagentModelSelectionGuidance(),
+    buildTurnBudgetGuidance(summary, cap, detailed),
+    shouldIncludeModelGuidance(summary, cap, options) ? buildSubagentModelSelectionGuidance() : "",
     `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
-    "Without a Codex runtime reservation primitive, this hook cannot guarantee atomic multi-spawn success. Prefer single-spawn-then-resample sequencing; if any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes observed capacity.",
-    "Open children without task_complete evidence can consume slots until close succeeds; stale open edges with task_complete evidence are repaired to closed and excluded from current occupancy.",
-    "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, or explicit reset refreshes budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit.",
-    "Do not restate/retry long child prompts after a capacity failure.",
-    "This protocol does not recommend delegation, reuse, or messaging a child lane; it only prevents wasteful native pool collisions.",
+    detailed ? "Without a Codex runtime reservation primitive, this hook cannot guarantee atomic multi-spawn success. Prefer single-spawn-then-resample sequencing; if any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes observed capacity." : "",
+    detailed ? "Open children without task_complete evidence can consume slots until close succeeds; stale open edges with task_complete evidence are repaired to closed and excluded from current occupancy." : "",
+    detailed ? "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, or explicit reset refreshes budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit." : "",
+    detailed ? "Do not restate/retry long child prompts after a capacity failure." : "",
+    detailed ? "This protocol does not recommend delegation, reuse, or messaging a child lane; it only prevents wasteful native pool collisions." : "",
   ].filter(Boolean).join(" ");
 }
 
@@ -2138,7 +2199,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     `transcript_slot=${summary.transcript_occupied}`,
     `transcript_unresolved=${summary.transcript_unresolved}`,
     `native_slots=${nativeEdgeSummary(summary)}`,
-    `reserved_spawns=${summary.pending_spawn_reservations}`,
+    `pending_spawn_attempts=${summary.pending_spawn_reservations}`,
     `running=${summary.running}`,
     `completed_not_closed=${summary.terminal}`,
     `failed_closes=${summary.failed_closes}`,
@@ -2183,8 +2244,8 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
         ? "Nested spawn denied; no child-side delegation guidance is emitted."
         : (summary.cap_hit_blocks_spawn
           ? "This thread already saw a native pool-exhaustion failure after the last confirmed close/repair/reset; do not retry spawn_agent until a later close/repair/reset succeeds and a newer hook/PreToolUse capacity check reports budget."
-          : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, wait for a needed active lane, or continue locally; then resample capacity and retry only within a fresh positive observed_free snapshot."))
-      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
+          : "This spawn is likely to fail or race another observed pending spawn attempt; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, wait for a needed active lane, or continue locally; then resample capacity and retry only within a fresh positive observed_free snapshot."))
+      : "Completed subagents are reusable context lanes and still consume native slots until closed; observed pending spawn attempts also count until the spawn succeeds, fails, or expires.",
     (summary.native_edge_overflow ?? 0) > 0
       ? `Native DB open-edge debt exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are repair debt rather than additional live agents. db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}.`
       : null,
@@ -2325,8 +2386,11 @@ async function main() {
         state.updated_at = nowIso;
         await writeState(state);
         if (emitCapacity) {
+          const narrowSpawnIntent = eventName === "UserPromptSubmit"
+            ? looksLikeNarrowSpawnIntentPrompt(prompt)
+            : false;
           const contexts = [
-            emitCapacity ? buildCapacityGuidance(eventName, cap, promptSummary) : "",
+            emitCapacity ? buildCapacityGuidance(eventName, cap, promptSummary, { narrowSpawnIntent }) : "",
           ];
           process.stdout.write(`${JSON.stringify(buildPromptGuidanceOutput(eventName, contexts))}\n`);
         }

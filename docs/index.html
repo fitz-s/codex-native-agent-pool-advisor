@@ -401,6 +401,14 @@
               <p>Lists current-parent lanes before spawn-heavy turns so same-topic work can reuse existing context instead of consuming a fresh native slot.</p>
             </article>
             <article class="card">
+              <h3>Attention drift</h3>
+              <p>Keeps positive-budget prompts short unless there is lane pressure, zero budget, invalid spawn shape, or explicit spawn intent.</p>
+            </article>
+            <article class="card">
+              <h3>Silent local drift</h3>
+              <p>Documents the parent-side choice: reuse, spawn one and resample, or stay local for a concrete reason when work is subagent-relevant.</p>
+            </article>
+            <article class="card">
               <h3>Unsafe reset drift</h3>
               <p>Uses dry-run force tokens before clearing native edge state.</p>
             </article>
@@ -440,7 +448,7 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
             </article>
             <article class="card">
               <h3>Live proof</h3>
-              <p><code>live-check</code> reads the actual transcript and SQLite edge state to verify model routes, open-slot counts, close release, and bypass evidence.</p>
+              <p><code>live-check</code> reads the actual transcript and SQLite edge state to verify model routes, forbidden explorer models, lane inventory, open-slot counts, close release, and bypass evidence.</p>
             </article>
           </div>
         </section>
