@@ -1671,7 +1671,7 @@ function hasPromptCapacityPressure(summary) {
     summary
       && (
         summary.occupied > 0
-        || summary.cap_hit_after_last_close
+        || summary.cap_hit_blocks_spawn
         || summary.failed_closes > 0
         || summary.pending_spawn_reservations > 0
       ),
@@ -1685,7 +1685,7 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
       promptSummary
         && (
           remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
-          || promptSummary.cap_hit_after_last_close
+          || promptSummary.cap_hit_blocks_spawn
           || promptSummary.failed_closes > 0
           || promptSummary.pending_spawn_reservations > 0
           || (promptSummary.native_edge_overflow ?? 0) > 0
@@ -1707,7 +1707,7 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
     promptSummary
       && (
         remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
-        || promptSummary.cap_hit_after_last_close
+        || promptSummary.cap_hit_blocks_spawn
         || (promptSummary.native_edge_overflow ?? 0) > 0
       ),
   );
@@ -1734,7 +1734,7 @@ function markCapacityGuidanceEmitted(eventName, prompt, session, nowIso) {
 
 function remainingSpawnBudget(summary, cap) {
   if (!summary) return cap;
-  if (summary.cap_hit_after_last_close) return 0;
+  if (summary.cap_hit_blocks_spawn) return 0;
   return Math.max(0, cap - (summary.occupied ?? 0));
 }
 
@@ -1818,7 +1818,7 @@ function buildTurnBudgetGuidance(summary, cap) {
     : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. Launch at most one spawn_agent before re-checking capacity; each spawn_agent call immediately decrements this local counter.`;
   return [
     hardDirective,
-    `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
+    `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`,
     remaining === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
     terminalCloseTargetGuidance(summary),
     "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
@@ -1849,7 +1849,7 @@ function buildCapacityGuidance(eventName, cap, summary = null) {
     `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
     "Do not batch native spawn_agent calls. Launch at most one native subagent per confirmed free slot, then re-check capacity before another spawn.",
     "Completed children can still consume slots until close succeeds; close only a current-parent lane that the leader knows is no longer needed.",
-    "If this thread already saw a pool-exhaustion failure and no later close is confirmed, do not call spawn_agent again in the same turn even when the local ledger estimates fewer than the cap.",
+    "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close or authoritative native-edge refresh reports budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit.",
     "Do not restate/retry long child prompts after a capacity failure.",
     "This protocol does not recommend delegation, reuse, or messaging a child lane; it only prevents wasteful native pool collisions.",
   ].filter(Boolean).join(" ");
@@ -1952,6 +1952,7 @@ function mergeSummary(
     msFromIso(session.last_close_at),
   );
   const capHitAfterLastClose = lastCapHitMs > 0 && lastCapHitMs > lastCloseMs;
+  const capHitBlocksSpawn = Boolean(capHitAfterLastClose && !nativeAuthoritative);
   let evidenceOccupied = transcriptSlotOccupied;
   let slotPressureSource = "transcript_fallback";
   if (nativeAuthoritative) {
@@ -1962,7 +1963,7 @@ function mergeSummary(
     slotPressureSource = "transcript_events";
   }
   const trackedAdmission = nativeAuthoritative ? 0 : trackedOccupied;
-  const effectiveOccupied = capHitAfterLastClose
+  const effectiveOccupied = capHitBlocksSpawn
     ? capValue
     : clampSlotCount(Math.max(trackedAdmission, evidenceOccupied) + pendingSpawnReservations, capValue);
 
@@ -2007,6 +2008,7 @@ function mergeSummary(
     last_close_at: isoFromMs(lastCloseMs),
     native_pool_reset_at: isoFromMs(resetAtMs),
     cap_hit_after_last_close: capHitAfterLastClose,
+    cap_hit_blocks_spawn: capHitBlocksSpawn,
   };
 }
 
@@ -2028,7 +2030,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   ) {
     return true;
   }
-  return Boolean(summary.cap_hit_after_last_close);
+  return Boolean(summary.cap_hit_blocks_spawn);
 }
 
 function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
@@ -2062,6 +2064,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     `completed_not_closed=${summary.terminal}`,
     `failed_closes=${summary.failed_closes}`,
     `cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}`,
+    `cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}`,
   ];
 
   const context = [
@@ -2088,7 +2091,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 	          ? "Retry at most one explorer spawn after correcting the explicit model route, and only if remaining_spawn_budget is still positive."
 	          : isChildSession
 	          ? "Nested spawn denied; no child-side delegation guidance is emitted."
-	          : (summary.cap_hit_after_last_close
+	          : (summary.cap_hit_blocks_spawn
 	              ? "This thread already saw a native pool-exhaustion failure after the last confirmed close; do not retry spawn_agent until a later close succeeds and a newer hook/PreToolUse capacity check reports budget."
 	              : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close exactly one listed no-longer-needed current-parent lane, wait for a needed active lane, or continue locally; then retry only one spawn after a fresh positive capacity check."))
 	      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",

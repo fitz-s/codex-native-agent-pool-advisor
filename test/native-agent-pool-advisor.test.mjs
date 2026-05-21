@@ -549,6 +549,11 @@ test("wrapped multi-spawn post responses are matched by same-tool ordinal", asyn
     assert.equal(session.agents.child1.status, "running");
     assert.ok(session.last_cap_hit_at);
 
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open'),('parent1','child4','open'),('parent1','child5','open'),('parent1','child6','open');",
+    );
+
     const output = await runHook(home, {
       hook_event_name: "PreToolUse",
       tool_name: "spawn_agent",
@@ -563,6 +568,7 @@ test("wrapped multi-spawn post responses are matched by same-tool ordinal", asyn
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /cap_hit_after_last_close=yes/);
+    assert.match(output.reason, /native_slots=slot_open=6/);
   });
 });
 
@@ -1133,6 +1139,54 @@ test("close_agent not found for non-owned target does not release current-parent
     });
     assert.equal(output.decision, "block");
     assert.match(output.reason, /6\/6 estimated slots occupied/);
+  });
+});
+
+test("authoritative native open edges below cap override stale cap-hit state", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','open'),('parent1','child2','open'),('parent1','child3','open');",
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+      tool_response: "collab spawn failed: agent thread limit reached",
+    });
+
+    const promptOutput = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "open one more explorer",
+    });
+    const context = promptOutput.hookSpecificOutput.additionalContext;
+    assert.match(context, /occupied=3\/6/);
+    assert.match(context, /remaining_spawn_budget=3/);
+    assert.match(context, /cap_hit_after_last_close=yes/);
+    assert.match(context, /cap_hit_blocks_spawn=no/);
+    assert.doesNotMatch(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
+
+    const spawnOutput = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map another file",
+      },
+    });
+    assert.notEqual(spawnOutput?.decision, "block");
   });
 });
 

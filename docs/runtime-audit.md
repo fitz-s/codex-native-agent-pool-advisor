@@ -29,6 +29,7 @@
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as `db_open_edge_debt` / `open_edge_overflow`, not as more live agents or `occupied > cap`.
+- Historical cap-hit evidence is split from admission blocking. `cap_hit_after_last_close=yes` remains visible as diagnostic history, but it blocks a new spawn only when `cap_hit_blocks_spawn=yes`; an authoritative current-parent native edge read below the cap must restore positive budget.
 - `SessionStart` is a first-class guidance surface for parent sessions. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
 - Child sessions receive no proactive prompt-time delegation guidance. A child should not own recursive delegation; it reports escalation needs upward and the parent leader owns reuse, close, and relaunch.
 - Model selection is mandatory for every `spawn_agent` call. Missing `model` inherits the parent model; the default explicit choice is mini unless the leader judges that Spark or 5.5 fits the work better. This is hard-blocked only when Codex emits a supported `PreToolUse` event for the spawn path.
