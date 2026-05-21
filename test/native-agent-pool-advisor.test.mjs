@@ -273,6 +273,31 @@ test("unrelated parent native open edges do not emit zero budget on current prom
   });
 });
 
+test("prompt-time guidance requires lane reuse check when current-parent lanes exist", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+    await sqlite(
+      home,
+      "insert into threads values ('child1','/tmp/child1.jsonl','Zeus oracle wiring verifier','explorer','gpt-5.4-mini','medium','Pasteur','/repo',1779076009);",
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "Spawn another verifier for Zeus oracle wiring.",
+    });
+    const context = output.hookSpecificOutput.additionalContext;
+
+    assert.match(context, /SPAWN_AGENT_OBSERVED_FREE=5/);
+    assert.match(context, /LANE_REUSE_CHECK_REQUIRED=true/);
+    assert.match(context, /Zeus oracle wiring verifier/);
+    assert.match(context, /model=gpt-5\.4-mini/);
+    assert.match(context, /use send_input to reuse that lane instead of spawning/);
+    assert.match(context, /Close a lane only when it is no longer useful/);
+  });
+});
+
 test("blocks wrapped spawn that would inherit the parent frontier model", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

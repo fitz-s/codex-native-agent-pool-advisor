@@ -17,6 +17,8 @@ This hook makes that category of waste visible and harder to repeat. It injects 
 
 Model routing is secondary but explicit. The hook requires every subagent spawn to include a deliberate model choice, with mini as the default when there is no stronger reason. That prevents accidental inheritance of the parent frontier model while still letting the leader choose Spark for scout work or 5.5 for critic/high-risk work.
 
+The original goal is not "close every child as soon as possible." It is to keep useful subagent context off the main thread without wasting slots. The parent leader should reuse same-topic lanes with `send_input`, close only obsolete or wrong-model lanes, and launch new children only after capacity and model choice are explicit.
+
 ## Compatibility
 
 - Works with Codex Desktop and Codex CLI when they read the same `~/.codex/hooks.json`, hook events, and native SQLite state layout.
@@ -26,6 +28,8 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - `doctor` does not prove that a future native `spawn_agent` call will emit `PreToolUse`. Use `node scripts/live-check.mjs --transcript <path>` against a real Codex transcript for end-to-end evidence.
 
 ## Runtime Model
+
+See [First-Principles Design](docs/first-principles.md) for the full boundary model.
 
 - Spawn admission is scoped to the current parent/session. The advisor reads native `thread_spawn_edges` rows where `parent_thread_id` matches the current parent thread; rows from other parent sessions do not affect this turn's budget.
 - There is no global runtime pool counter in normal admission. Global reset tools are operator repair surfaces for stale state, not spawn-budget authority.
@@ -39,6 +43,7 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Without a Codex runtime reservation primitive, launch sequencing is deliberately conservative: create one new child, let `PostToolUse` and native edge state record the result, then re-check capacity before creating another child. A supported `PreToolUse` surface blocks multiple `spawn_agent` requests in one tool operation because partial batch success is the context-wasting failure this project is designed to avoid.
 - `wait_agent`, child completion notifications, and `send_input` do not by themselves free a native slot.
 - Native `open` rows whose child transcript already has `task_complete` are stale persistence edges. The hook self-heals those rows to `closed` and excludes them from current runtime occupancy.
+- When current-parent lanes exist, prompt-time guidance includes `LANE_REUSE_CHECK_REQUIRED=true` and a lane inventory. That is not a semantic hard block: the hook cannot know whether two tasks are truly the same topic. It gives the parent enough evidence to reuse a compatible lane before spending another native slot.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
 - A zero-budget prompt also emits a recovery protocol. The agent should not stop at "the pool is full"; it must choose between reusing a compatible current-parent lane, closing listed no-longer-needed lane(s), waiting for a needed active lane, or continuing locally.
 - The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Explicit agent-target missing evidence such as `unknown agent` or `agent with id ... not found` is also treated as a stale-unreachable lane and repaired to `closed`; unrelated errors such as `endpoint not found` do not free capacity.
@@ -74,6 +79,16 @@ The installer is idempotent: repeated installs should leave one registration per
 ## Mandatory Model Selection
 
 The capacity guard does not decide whether Codex should delegate. If the leader has already chosen to spawn, the hook requires the leader to make the model-selection judgment explicit instead of inheriting the parent model by accident.
+
+## Lane Reuse Protocol
+
+Subagents are context lanes, not one-shot function calls. Before spawning a new child, the parent should inspect current-parent lane inventory from the hook output:
+
+- Reuse with `send_input` when an existing lane has the same topic/domain, compatible role/model, and useful prior context.
+- Keep a completed lane open when near-term follow-up on the same topic is likely; completion does not free the native slot.
+- Close a lane when it is unrelated, stale, wrong-model for the next task, or a slot must be freed for higher-value work.
+- Do not send orchestration guidance to child lanes. Children report escalation needs upward; the parent owns reuse, close, and relaunch.
+- If zero budget is reported and no reusable lane exists, close listed completed-not-closed candidates first; close active lanes only when the parent knows they are no longer needed.
 
 Before spawning, the leader should make a compact task contract:
 

@@ -1789,7 +1789,8 @@ function terminalCloseTargetGuidance(summary) {
   const overflowText = (summary?.native_edge_overflow ?? 0) > 0
     ? `Native DB open-edge debt exceeds the ${summary.native_edge_cap ?? "configured"}-slot runtime cap: db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}. Overflow rows are repair debt, not additional live agents.`
     : "";
-  return `${activeText} ${terminalText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
+  const reuseText = "LANE_REUSE_CHECK_REQUIRED=true. Before any new spawn, compare the intended task contract against the current-parent lane inventory above. If a same-topic/same-domain lane has compatible model and context, use send_input to reuse that lane instead of spawning. Close a lane only when it is no longer useful, has the wrong role/model for the next task, or a slot must be freed for higher-value work.";
+  return `${activeText} ${terminalText} ${reuseText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
 }
 
 function zeroBudgetRecoveryGuidance(summary) {
