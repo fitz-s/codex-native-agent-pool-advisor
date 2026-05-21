@@ -33,15 +33,15 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
 - `occupied` is a saturated current-parent runtime slot estimate and is never reported above the cap. Extra current-parent `open` rows are surfaced separately as `db_open_edge_debt` and `open_edge_overflow`; they are persistent-state repair debt, not additional live subagents.
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
-- A historical cap-hit before the latest successful close is diagnostic. A runtime cap-hit after the latest successful close is authoritative pressure: the hook reports `cap_hit_blocks_spawn=yes` and blocks further spawns until a close/repair or explicit reset refreshes capacity, even if SQLite currently shows fewer than six open rows.
+- A historical cap-hit before the latest successful close/repair/reset is diagnostic. A runtime cap-hit after that point blocks further spawns only when current native edge state is unreadable. If current parent/session native rows are readable, admission follows the scoped open-edge count plus pending reservations; stale `task_complete` open edges self-heal to `closed` and do not turn a one-open state into zero budget.
 - Positive `remaining_spawn_budget` is physical capacity. Multiple subagents may be launched together when `requested_spawns <= remaining_spawn_budget` and each lane has an independent task contract.
-- `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
-- A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
+- `wait_agent`, child completion notifications, and `send_input` do not by themselves free a native slot.
+- Native `open` rows whose child transcript already has `task_complete` are stale persistence edges. The hook self-heals those rows to `closed` and excludes them from current runtime occupancy.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
 - A zero-budget prompt also emits a recovery protocol. The agent should not stop at "the pool is full"; it must choose between reusing a compatible current-parent lane, closing listed no-longer-needed lane(s), waiting for a needed active lane, or continuing locally.
 - The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Runtime `not found` / `unknown agent` close evidence is also treated as a stale-unreachable lane and repaired to `closed`; other close failures do not free capacity.
 - Runtime `not found` close evidence releases a stale-unreachable lane when the current parent owns the matching native edge row. If a PostToolUse payload is mis-scoped but the target child has exactly one non-closed native edge anywhere in the DB, the hook repairs that unique parent/child row; ambiguous or unknown targets do not free capacity.
-- Child transcript terminal detection checks beyond the tail window when needed, so a long transcript with an earlier `task_complete` does not get mislabeled as an active open lane.
+- Child transcript terminal detection checks beyond the tail window when needed, so a long transcript with an earlier `task_complete` can still be repaired instead of being mislabeled as an active open lane.
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
 - Child sessions do not receive proactive prompt-time delegation guidance. A child that needs more delegation should report that recommendation upward; the parent leader owns slot closure and relaunch.
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
@@ -207,7 +207,7 @@ node scripts/live-check.mjs \
   --expect-all-closed \
   --allow-missing-guidance
 
-# Capacity: six successful child lanes still occupy six slots until close_agent succeeds.
+# Capacity: six still-open child lanes without task_complete evidence occupy six slots.
 node scripts/live-check.mjs \
   --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl \
   --since-line <line_before_capacity_test> \

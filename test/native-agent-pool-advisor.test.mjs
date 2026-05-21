@@ -701,7 +701,7 @@ test("wrapped multi-spawn post responses preserve distinct successful agent ids"
   });
 });
 
-test("native open edges with task_complete transcripts still occupy capacity until closed", async () => {
+test("native open edges with task_complete transcripts are self-healed and do not occupy capacity", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const values = [];
@@ -721,10 +721,13 @@ test("native open edges with task_complete transcripts still occupy capacity unt
       session_id: "parent1",
       prompt: "spawn agent status",
     });
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=6\/6/);
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_slots=slot_open=0, slot_terminal=6/);
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /successful close_agent result or runtime not-found close evidence decrements/);
-    assert.match(promptOutput.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /occupied=0\/6/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /native_slots=slot_open=0, slot_terminal=0/);
+    assert.match(promptOutput.hookSpecificOutput.additionalContext, /remaining_spawn_budget=6/);
+    assert.equal(
+      await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status order by status;"),
+      "closed|6",
+    );
 
     const spawnOutput = await runHook(home, {
       hook_event_name: "PreToolUse",
@@ -737,9 +740,7 @@ test("native open edges with task_complete transcripts still occupy capacity unt
         message: "map files",
       },
     });
-    assert.equal(spawnOutput.decision, "block");
-    assert.match(spawnOutput.reason, /6\/6/);
-    assert.match(spawnOutput.reason, /slot_terminal=6/);
+    assert.notEqual(spawnOutput?.decision, "block");
   });
 });
 
@@ -749,7 +750,7 @@ test("overfull native open-edge evidence saturates occupied at the runtime cap",
     const values = [];
     for (let index = 1; index <= 8; index += 1) {
       const id = `child${index}`;
-      const path = await writeTaskCompleteTranscript(home, id);
+      const path = await writeFalseTaskCompleteTranscript(home, id);
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
@@ -799,7 +800,7 @@ test("transcript close after a cap hit does not override current-parent overfull
     const values = [];
     for (let index = 1; index <= 8; index += 1) {
       const id = `child${index}`;
-      const path = await writeTaskCompleteTranscript(home, id);
+      const path = await writeFalseTaskCompleteTranscript(home, id);
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
@@ -830,7 +831,7 @@ test("transcript close after a cap hit does not override current-parent overfull
     assert.match(context, /occupied=6\/6/);
     assert.match(context, /remaining_spawn_budget=0/);
     assert.match(context, /slot_pressure_source=native_open_edges_saturated/);
-    assert.match(context, /native_slots=slot_open=0, slot_terminal=6, slot_estimate=6\/6, db_open_edge_debt=8/);
+    assert.match(context, /native_slots=slot_open=6, slot_terminal=0, slot_estimate=6\/6, db_open_edge_debt=8/);
     assert.doesNotMatch(context, /terminal_open=8/);
     assert.doesNotMatch(context, /native_global/);
 
@@ -847,7 +848,7 @@ test("transcript close after a cap hit does not override current-parent overfull
       },
     });
     assert.equal(spawnOutput.decision, "block");
-    assert.match(spawnOutput.reason, /native_slots=slot_open=0, slot_terminal=6, slot_estimate=6\/6, db_open_edge_debt=8/);
+    assert.match(spawnOutput.reason, /native_slots=slot_open=6, slot_terminal=0, slot_estimate=6\/6, db_open_edge_debt=8/);
     assert.doesNotMatch(spawnOutput.reason, /terminal_open=8/);
     assert.doesNotMatch(spawnOutput.reason, /native_global/);
   });
@@ -959,7 +960,7 @@ test("task_complete text in non-event transcript records does not mark native ed
   });
 });
 
-test("task_complete outside terminal tail still marks native edge terminal", async () => {
+test("task_complete outside terminal tail still repairs stale open native edge", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const path = await writeEarlyTaskCompleteLongTranscript(home, "child1");
@@ -976,8 +977,12 @@ test("task_complete outside terminal tail still marks native edge terminal", asy
     });
 
     const context = output.hookSpecificOutput.additionalContext;
-    assert.match(context, /native_slots=slot_open=0, slot_terminal=1/);
-    assert.match(context, /db_open_edge_debt=1/);
+    assert.match(context, /native_slots=slot_open=0, slot_terminal=0/);
+    assert.match(context, /db_open_edge_debt=0/);
+    assert.equal(
+      await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status order by status;"),
+      "closed|1",
+    );
   });
 });
 
@@ -1291,7 +1296,7 @@ test("close_agent not found does not repair ambiguous native child edge", async 
   });
 });
 
-test("runtime cap hit after latest close blocks despite authoritative native count below cap", async () => {
+test("runtime cap hit does not override authoritative current-parent native count below cap", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -1318,12 +1323,12 @@ test("runtime cap hit after latest close blocks despite authoritative native cou
       prompt: "open one more explorer",
     });
     const context = promptOutput.hookSpecificOutput.additionalContext;
-    assert.match(context, /SPAWN_AGENT_DISABLED_THIS_TURN=true/);
-    assert.match(context, /occupied=6\/6/);
-    assert.match(context, /remaining_spawn_budget=0/);
+    assert.match(context, /SPAWN_AGENT_LOCAL_COUNTER_START=3/);
+    assert.match(context, /occupied=3\/6/);
+    assert.match(context, /remaining_spawn_budget=3/);
     assert.match(context, /native_slots=slot_open=3/);
     assert.match(context, /cap_hit_after_last_close=yes/);
-    assert.match(context, /cap_hit_blocks_spawn=yes/);
+    assert.match(context, /cap_hit_blocks_spawn=no/);
 
     const spawnOutput = await runHook(home, {
       hook_event_name: "PreToolUse",
@@ -1336,9 +1341,7 @@ test("runtime cap hit after latest close blocks despite authoritative native cou
         message: "map another file",
       },
     });
-    assert.equal(spawnOutput.decision, "block");
-    assert.match(spawnOutput.reason, /cap_hit_blocks_spawn=yes/);
-    assert.match(spawnOutput.reason, /pool-exhaustion failure after the last confirmed close\/repair\/reset/);
+    assert.notEqual(spawnOutput?.decision, "block");
   });
 });
 

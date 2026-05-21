@@ -28,24 +28,23 @@
 - General evidence collection does not repair native edges. Successful `PostToolUse(close_agent)` for the current parent/session marks a native edge closed and decrements slot pressure; runtime `not found` / `unknown agent` close evidence is also repaired because the lane is no longer reachable by Codex. If the close hook payload is mis-scoped, a target child id repairs only when it maps to exactly one non-closed native edge; ambiguous child ids remain open.
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
-- Prompt-time spawn allowance is the physical remaining capacity for the current parent/session. `remaining_spawn_budget=3` means up to three children may be launched in that response if each has an independent task contract. If any spawn returns a capacity failure, later prompts must treat that runtime cap-hit as authoritative until a close/repair/reset refreshes capacity.
+- Prompt-time spawn allowance is the physical remaining capacity for the current parent/session. `remaining_spawn_budget=3` means up to three children may be launched in that response if each has an independent task contract. If any spawn returns a capacity failure, later prompts must treat that runtime cap-hit as diagnostic unless current native edge state is unreadable; when native rows are readable, the scoped open-edge count plus pending reservations owns admission.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as `db_open_edge_debt` / `open_edge_overflow`, not as more live agents or `occupied > cap`.
-- Historical cap-hit evidence is split from admission blocking. `cap_hit_after_last_close=yes` blocks new spawns when the cap-hit happened after the latest successful close/repair/reset, even if current-parent SQLite edge count looks below cap. A later successful close/repair must refresh `last_close_at`, or an explicit reset marker must cut off older cap-hit evidence, before positive budget is trusted again.
+- Historical cap-hit evidence is split from admission blocking. `cap_hit_after_last_close=yes` with readable current native rows must not inflate a below-cap parent/session to `occupied=6/6`. It blocks only when native rows are unavailable, where the hook cannot safely distinguish a real full runtime pool from a stale prompt snapshot.
 - `SessionStart` is a first-class guidance surface for parent sessions. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
 - Child sessions receive no proactive prompt-time delegation guidance. A child should not own recursive delegation; it reports escalation needs upward and the parent leader owns reuse, close, and relaunch.
 - Model selection is mandatory for every non-fork `spawn_agent` call. Missing `model` inherits the parent model; the default explicit choice is mini unless the leader judges that Spark or 5.5 fits the work better. This is hard-blocked only when Codex emits a supported `PreToolUse` event for the spawn path.
 - `fork_context=true` is a runtime shape exception, not a model-routing strategy. If Codex rejects `fork_context=true` with `model`, the agent should remove `fork_context` and pass compact context for Spark/mini/frontier routing, or omit `model` only when exact full-history fork is more important than model choice. That shape failure must not be treated as native-pool exhaustion.
 - Explorer model routing is an allow-list plus advisory contract guidance, not a single hard-coded model and not a task-shape blocker. Spark is for near-instant scout/probe work, mini is the default reasoning/light-executor lane, and 5.5 is for critic/architecture/security/high-risk/final-approval work.
 - Complex explorer prompts on Spark are allowed when Spark is used as a bounded scout/anchor collector. The hook only advises the agent to cap scope/output or escalate synthesis/edit/final-approval follow-up to mini or a frontier reviewer.
-- Current-session terminal lanes still consume local budget until `close_agent` succeeds.
-- `send_input`, `wait_agent`, and child `task_complete` evidence do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path; runtime not-found close evidence is the stale-unreachable exception.
+- `send_input` and `wait_agent` do not reduce current-parent pressure. A successful `close_agent` is the normal decrement path; runtime not-found close evidence and child-transcript `task_complete` repair are stale-unreachable/stale-completed exceptions.
 - A zero-budget prompt is only a capacity snapshot. After a successful close or runtime not-found repair, the next hook or `PreToolUse` capacity check replaces the old snapshot; agents must not keep treating stale zero-budget text as current authority.
 - At zero budget, the prompt must include recovery actions rather than only a prohibition. Valid recovery actions are: reuse a compatible current-parent lane, close listed no-longer-needed lane(s), wait for a needed active lane, or continue locally.
 - Successful `close_agent` repair is keyed by current parent/session plus `child_thread_id`; the only cross-parent fallback is unique-child not-found repair. It must not mutate ambiguous unrelated parent rows.
-- Native SQLite `open` edges whose child transcript has `task_complete` are completed-not-closed candidates. They still count for current-parent admission until close succeeds or an explicit reset removes stale state.
+- Native SQLite `open` edges whose child transcript has `task_complete` are stale-completed repair candidates. The hook repairs them to `closed` and excludes them from current-parent admission.
 - Long child transcripts must still be scanned for `task_complete` outside the terminal tail window before an open edge is labeled active.
 - If the advisor state lock or native edge query is unavailable during a supported `PreToolUse(spawn_agent)` event, the hook blocks conservatively.
-- Automatic hook maintenance does not prune Codex SQLite. SQLite mutation is limited to successful close-agent repair and the explicit reset tool.
+- Automatic hook maintenance does not prune unrelated Codex SQLite history. SQLite mutation is limited to current-parent close-agent repair, unique not-found repair, stale `task_complete` open-edge repair, and the explicit reset tool.
 
 ## End-To-End Runtime Finding
 
@@ -76,7 +75,7 @@ The capacity E2E should stop at six real child lanes. At `open=6`, the live `Use
 
 ## Remaining Risk
 
-The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. In current observed Desktop native-spawn behavior, that assumption has already failed. That is why `SessionStart` and `UserPromptSubmit` both inject budget/model guidance, and why `PostToolUse` cap-hit evidence must override optimistic SQLite counts until a later close/repair/reset refreshes capacity.
+The hook cannot prove that every future Codex Desktop or CLI spawn path will emit `PreToolUse`. In current observed Desktop native-spawn behavior, that assumption has already failed. That is why `SessionStart` and `UserPromptSubmit` both inject budget/model guidance, and why `PostToolUse` cap-hit evidence is preserved as a warning while readable current-parent native rows remain the admission source.
 
 The reset script intentionally mutates `thread_spawn_edges`. It should be treated as an operator repair command, not normal hook execution.
 

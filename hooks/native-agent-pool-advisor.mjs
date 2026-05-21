@@ -1153,6 +1153,7 @@ async function discoverNativeThreadEdges(parentThreadId) {
     if (!Array.isArray(rows)) return edges;
 
     edges.checked = true;
+    const terminalRepairCandidates = [];
     for (const row of rows) {
       const childId = safeString(row?.child_thread_id).trim();
       if (!childId) continue;
@@ -1172,9 +1173,20 @@ async function discoverNativeThreadEdges(parentThreadId) {
         edges.closed.add(childId);
       } else {
         if (await transcriptHasTaskComplete(safeString(row?.rollout_path).trim())) {
-          edges.terminal.add(childId);
+          terminalRepairCandidates.push(childId);
         } else {
           edges.active.add(childId);
+        }
+      }
+    }
+    if (terminalRepairCandidates.length > 0) {
+      const repairedIds = await repairClosedNativeEdgeIds(parentThreadId, terminalRepairCandidates);
+      edges.repaired = repairedIds.size;
+      for (const childId of terminalRepairCandidates) {
+        if (repairedIds.has(childId)) {
+          edges.closed.add(childId);
+        } else {
+          edges.terminal.add(childId);
         }
       }
     }
@@ -1941,7 +1953,7 @@ function buildCapacityGuidance(eventName, cap, summary = null) {
     buildSubagentModelSelectionGuidance(),
     `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
     "Batch native spawn_agent calls only when requested_spawns <= remaining_spawn_budget and each lane has an independent task contract. If any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes budget.",
-    "Completed children can still consume slots until close succeeds; close only a current-parent lane that the leader knows is no longer needed.",
+    "Open children without task_complete evidence can consume slots until close succeeds; stale open edges with task_complete evidence are repaired to closed and excluded from current occupancy.",
     "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, or explicit reset refreshes budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit.",
     "Do not restate/retry long child prompts after a capacity failure.",
     "This protocol does not recommend delegation, reuse, or messaging a child lane; it only prevents wasteful native pool collisions.",
@@ -2047,7 +2059,7 @@ function mergeSummary(
   const lastCapHitMs = rawLastCapHitMs > resetAtMs ? rawLastCapHitMs : 0;
   const lastCloseMs = Math.max(rawLastCloseMs, resetAtMs);
   const capHitAfterLastClose = lastCapHitMs > 0 && lastCapHitMs > lastCloseMs;
-  const capHitBlocksSpawn = Boolean(capHitAfterLastClose);
+  const capHitBlocksSpawn = Boolean(capHitAfterLastClose && !nativeAuthoritative);
   let evidenceOccupied = transcriptSlotOccupied;
   let slotPressureSource = "transcript_fallback";
   if (nativeAuthoritative) {
