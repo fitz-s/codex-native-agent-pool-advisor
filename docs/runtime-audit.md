@@ -68,7 +68,7 @@ The live checker supports expectation-based E2E gates:
 
 - `--expect-model <model>` verifies that a successful `spawn_agent` tool input and its native SQLite child row both used that model. Repeat it to cover Spark, mini, and frontier lanes.
 - `--expect-current-open <n>` verifies the current parent/session open-edge count after the scanned transcript window.
-- `--expect-all-closed` verifies every successful spawn in the scanned window has both a successful close call and a closed native edge.
+- `--expect-all-closed` verifies every successful spawn in the scanned window has a closed native edge plus either successful close output or verified not-found release evidence. Transport failures such as `endpoint not found` are not release evidence.
 - `--require-guidance` treats missing prompt-time advisor markers as a failure; `--allow-missing-guidance` keeps model/capacity verification independent from Codex transcript marker availability.
 - Live-check records same-response spawn batches, including nested `multi_tool_use.parallel` agent calls, so real runtime transcripts can expose batch attempts and partial failures. Under the current no-reservation protocol, those batches are not considered valid just because they fit the observed free-slot count. Live-check fails when spawn outputs are missing, spawn/close outputs show runtime/tool failure, missing-model child creation occurs, or expectation mismatches.
 

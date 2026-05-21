@@ -2084,7 +2084,7 @@ test("live-check parses nested multi-tool spawn calls", async () => {
   });
 });
 
-test("live-check treats failed close_agent outputs as failed closes", async () => {
+test("live-check treats close_agent not-found release evidence as closed", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -2106,6 +2106,39 @@ test("live-check treats failed close_agent outputs as failed closes", async () =
       ].join("\n"),
     );
 
+    const output = JSON.parse((await runScript(liveCheckPath, home, [
+      "--transcript", transcript,
+      "--expect-all-closed",
+      "--allow-missing-guidance",
+    ])).stdout);
+    assert.equal(output.checks.find((check) => check.name === "successful_spawns_closed").status, "pass");
+    assert.equal(output.model_routes[0].closed_after_spawn, true);
+    assert.equal(output.close_calls[0].output_failed, true);
+  });
+});
+
+test("live-check still rejects endpoint-not-found close failures", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      [
+        "insert into thread_spawn_edges values ('parent1','child1','closed');",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Endpoint Fail','explorer','gpt-5.3-codex-spark','low','One','/tmp',1779075987);",
+      ].join(""),
+    );
+    const transcript = join(home, "parent-endpoint-fail.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"{\\"agent_id\\":\\"child1\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child1\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"transport error: endpoint not found"}}',
+      ].join("\n"),
+    );
+
     let error;
     try {
       await runScript(liveCheckPath, home, ["--transcript", transcript, "--expect-all-closed", "--allow-missing-guidance"]);
@@ -2115,6 +2148,7 @@ test("live-check treats failed close_agent outputs as failed closes", async () =
     assert.equal(error?.code, 2);
     const output = JSON.parse(error.stdout);
     assert.equal(output.checks.find((check) => check.name === "successful_spawns_closed").status, "fail");
+    assert.equal(output.model_routes[0].closed_after_spawn, false);
     assert.equal(output.close_calls[0].output_failed, true);
   });
 });

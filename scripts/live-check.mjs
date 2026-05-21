@@ -36,7 +36,14 @@ const CLOSE_FAILURE_PATTERNS = [
   /unable to close/i,
   /cannot close/i,
   /could not close/i,
+  /endpoint not found/i,
   /无法关闭/,
+];
+const CLOSE_RELEASE_NOT_FOUND_PATTERNS = [
+  /unknown agent/i,
+  /agent (?:with id [A-Za-z0-9_.:-]+ )?not found/i,
+  /no such agent/i,
+  /invalid agent(?: id)?/i,
 ];
 
 function usage() {
@@ -49,7 +56,7 @@ function usage() {
     "  --since-line <n>              Scan transcript records starting at this 1-based line.",
     "  --expect-model <model>        Require a successful spawn whose tool input and native DB edge both use this model. Repeatable.",
     "  --expect-current-open <n>     Require this parent/session to have exactly n open native edges after the scanned window.",
-    "  --expect-all-closed           Require every successful spawn in the scanned window to have a successful close and closed DB edge.",
+    "  --expect-all-closed           Require every successful spawn in the scanned window to have closed DB edge plus close success or verified not-found release evidence.",
     "  --require-guidance            Fail if no advisor guidance marker appears before the first scanned spawn.",
     "  --allow-missing-guidance      Do not fail when the runtime transcript lacks prompt-time advisor markers.",
     "",
@@ -193,6 +200,11 @@ function outputLooksFailed(value) {
 function closeOutputLooksFailed(value) {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
   return outputLooksFailed(value) || CLOSE_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function closeOutputReleasesLane(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  return !closeOutputLooksFailed(value) || CLOSE_RELEASE_NOT_FOUND_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 function toolOutputLooksFailed(toolName, value) {
@@ -431,9 +443,9 @@ async function main() {
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
   const edgeByChild = new Map(edges.rows.map((row) => [row.child_thread_id, row]));
   const successfulSpawns = spawnCalls.filter((call) => call.output?.agent_id && !call.output.failed);
-  const closeTargetSet = new Set(
+  const closeReleaseTargetSet = new Set(
     transcript.calls
-      .filter((call) => call.name === "close_agent" && call.target && call.output && !call.output.failed)
+      .filter((call) => call.name === "close_agent" && call.target && call.output && closeOutputReleasesLane(call.output.output))
       .map((call) => call.target),
   );
   const openRows = edges.rows.filter((row) => row.status === "open");
@@ -443,7 +455,7 @@ async function main() {
       call,
       edge,
       tool_model_matches_native: Boolean(call.model && edge?.model === call.model),
-      closed: Boolean(edge?.status === "closed" && closeTargetSet.has(call.output.agent_id)),
+      closed: Boolean(edge?.status === "closed" && closeReleaseTargetSet.has(call.output.agent_id)),
     };
   });
   const modelMismatchReports = spawnReports.filter((report) => {
@@ -520,7 +532,7 @@ async function main() {
       notClosed.length === 0,
       notClosed.length === 0
         ? "every successful spawn in the scanned window has a successful close and closed native edge"
-        : notClosed.map((report) => `${report.call.output.agent_id}:edge=${report.edge?.status ?? "missing"}, close=${closeTargetSet.has(report.call.output.agent_id)}`).join(", "),
+        : notClosed.map((report) => `${report.call.output.agent_id}:edge=${report.edge?.status ?? "missing"}, close_release=${closeReleaseTargetSet.has(report.call.output.agent_id)}`).join(", "),
     ));
   }
   const checkStatus = summarizeChecks(checks);
