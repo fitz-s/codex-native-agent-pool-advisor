@@ -17,6 +17,8 @@ This hook makes that category of waste visible and harder to repeat. It injects 
 
 Model routing is secondary but explicit. The hook requires every subagent spawn to include a deliberate model choice, with mini as the default when there is no stronger reason. That prevents accidental inheritance of the parent frontier model while still letting the leader choose Spark for scout work or 5.5 for critic/high-risk work.
 
+The original goal is not "close every child as soon as possible." It is to keep useful subagent context off the main thread without wasting slots. The parent leader should reuse same-topic lanes with `send_input`, close only obsolete or wrong-model lanes, and launch new children only after capacity and model choice are explicit.
+
 ## Compatibility
 
 - Works with Codex Desktop and Codex CLI when they read the same `~/.codex/hooks.json`, hook events, and native SQLite state layout.
@@ -27,6 +29,8 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 
 ## Runtime Model
 
+See [First-Principles Design](docs/first-principles.md) for the full boundary model.
+
 - Spawn admission is scoped to the current parent/session. The advisor reads native `thread_spawn_edges` rows where `parent_thread_id` matches the current parent thread; rows from other parent sessions do not affect this turn's budget.
 - There is no global runtime pool counter in normal admission. Global reset tools are operator repair surfaces for stale state, not spawn-budget authority.
 - A spawn hook payload without `session_id`, `thread_id`, transcript `session_meta`, or `parent_thread_id` is unscoped and blocks conservatively. It must not fall back to a shared working-directory bucket.
@@ -35,9 +39,11 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Successful `spawn_agent` consumes a slot immediately in the local ledger. If native `thread_spawn_edges` is readable but has not caught up yet, that ledger lag still counts against admission until a matching native row appears, the lane closes, or the local running-lane TTL expires.
 - A capacity-failed spawn consumes no new slot but sets pressure to full.
 - A historical cap-hit before the latest successful close/repair/reset is diagnostic. A runtime cap-hit after that point blocks further spawns only when current native edge state is unreadable. If current parent/session native rows are readable, admission follows the scoped open-edge count plus pending reservations; stale `task_complete` open edges self-heal to `closed` and do not turn a one-open state into zero budget.
-- Positive `remaining_spawn_budget` is physical capacity. Multiple subagents may be launched together when `requested_spawns <= remaining_spawn_budget` and each lane has an independent task contract.
+- `observed_free` is the current parent/session free-slot snapshot. `remaining_spawn_budget` is kept only as a compatibility alias for that observed count; it is not an atomic runtime reservation and should not be treated as a guaranteed batch size.
+- Without a Codex runtime reservation primitive, launch sequencing is deliberately conservative: create one new child, let `PostToolUse` and native edge state record the result, then re-check capacity before creating another child. A supported `PreToolUse` surface blocks multiple `spawn_agent` requests in one tool operation because partial batch success is the context-wasting failure this project is designed to avoid.
 - `wait_agent`, child completion notifications, and `send_input` do not by themselves free a native slot.
 - Native `open` rows whose child transcript already has `task_complete` are stale persistence edges. The hook self-heals those rows to `closed` and excludes them from current runtime occupancy.
+- When current-parent lanes exist, prompt-time guidance includes `LANE_REUSE_CHECK_REQUIRED=true` and a lane inventory. That is not a semantic hard block: the hook cannot know whether two tasks are truly the same topic. It gives the parent enough evidence to reuse a compatible lane before spending another native slot.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
 - A zero-budget prompt also emits a recovery protocol. The agent should not stop at "the pool is full"; it must choose between reusing a compatible current-parent lane, closing listed no-longer-needed lane(s), waiting for a needed active lane, or continuing locally.
 - The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Explicit agent-target missing evidence such as `unknown agent` or `agent with id ... not found` is also treated as a stale-unreachable lane and repaired to `closed`; unrelated errors such as `endpoint not found` do not free capacity.
@@ -48,8 +54,7 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
 - Full-history fork is the exception to model routing. If the runtime rejects `fork_context=true` together with `model`, use either `fork_context=true` without `model` and accept inherited parent model, or remove `fork_context` and pass a compact context packet with an explicit Spark/mini/frontier model. A fork/model shape failure is not native-pool exhaustion and should be retried only with corrected shape and positive budget.
 - The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection with an output cap and stop condition. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.
-- Explorer model allow-list defaults to `gpt-5.3-codex-spark,gpt-5.4-mini`, so lookup lanes cannot silently spend `gpt-5.5`.
-- The hook does not block Spark because a prompt looks "complex"; it emits a pre-spawn decision contract and lets the parent agent choose. `Analyze`, `review`, `read-only`, and `bounded` are not model choices by themselves.
+- The hook does not choose the model from `agent_type`, but the native role/model shape must still be coherent. `agent_type=explorer` with a forbidden frontier model such as `gpt-5.5` is blocked; use `agent_type=default` for frontier critic/architecture/high-risk judgment and keep explorer lanes on Spark or mini.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
@@ -75,6 +80,16 @@ The installer is idempotent: repeated installs should leave one registration per
 
 The capacity guard does not decide whether Codex should delegate. If the leader has already chosen to spawn, the hook requires the leader to make the model-selection judgment explicit instead of inheriting the parent model by accident.
 
+## Lane Reuse Protocol
+
+Subagents are context lanes, not one-shot function calls. Before spawning a new child, the parent should inspect current-parent lane inventory from the hook output:
+
+- Reuse with `send_input` when an existing lane has the same topic/domain, compatible role/model, and useful prior context.
+- Keep a completed lane open when near-term follow-up on the same topic is likely; completion does not free the native slot.
+- Close a lane when it is unrelated, stale, wrong-model for the next task, or a slot must be freed for higher-value work.
+- Do not send orchestration guidance to child lanes. Children report escalation needs upward; the parent owns reuse, close, and relaunch.
+- If zero budget is reported and no reusable lane exists, close listed completed-not-closed candidates first; close active lanes only when the parent knows they are no longer needed.
+
 Before spawning, the leader should make a compact task contract:
 
 - `output`: anchors, evidence table, synthesis, patch, critique, or final approval.
@@ -89,13 +104,13 @@ Before spawning, the leader should make a compact task contract:
 | --- | --- | --- |
 | `gpt-5.3-codex-spark` | Near-instant scout work: grep/file maps, symbol lookup, log filtering, candidate file:line anchors, hypothesis sampling, bounded large-text scans, and fast evidence collection inside larger reasoning workflows. Usually `reasoning_effort=low`, but non-low effort is allowed when intentional. | Do not ask it to own final approval, broad synthesis, edits, or repeated compaction. If the task expands, it should stop and return anchors plus an escalation recommendation. |
 | `gpt-5.4-mini` | Default subagent lane; reasoning explorer / light executor work: multi-hop code-path traces, semantic classification, config+test synthesis, small low-risk fixes, compact evidence reports, and bounded verification that needs a durable conclusion. Use `reasoning_effort=medium` or `high` when judgment matters. | Not the default for disposable grep if Spark is available. Do not use as final authority for architecture, security, live-money, or high-risk implementation. |
-| `gpt-5.5` | Critic, architecture, security judgment, high-risk implementation, and final approval. | Do not use for ordinary explorer/scout lanes or broad grep/file scans. |
+| `gpt-5.5` | Critic, architecture, security judgment, high-risk implementation, and final approval. | Do not use for ordinary explorer/scout lanes or broad grep/file scans. If using native `spawn_agent`, use `agent_type=default`, not `agent_type=explorer`. |
 
 Route by output contract, risk, and context-state depth, not by complexity adjectives. A complex parent task can use Spark well if the child prompt asks for bounded scout output such as "return 12 file:line anchors and stop." A mini lane is better when the child owns synthesis, a small edit, or a durable low-risk verification result.
 
 For broad, compiled, vendor, or large-context repos, do a local `rg`/module map first. Then send Spark exact slices for anchors, not the whole tree. Use mini for synthesis once the slices exist. If two scout lanes fail or compact on context, stop spawning, shrink the slice locally, and reuse or close current lanes before trying again.
 
-When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid; the fix is to remove `fork_context` for model-routed lanes or intentionally accept inherited model for exact full-history fork. It also blocks explorer spawns that choose a model outside the configured explorer allow-list, and only advises when a Spark or mini prompt looks mismatched to the lane. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
+When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid, and blocks `agent_type=explorer` paired with forbidden frontier models. The fix is to remove `fork_context` for model-routed lanes, intentionally accept inherited model for exact full-history fork, or change frontier critic/architecture lanes to `agent_type=default`. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
 
 ## Design Basis
 
@@ -109,14 +124,15 @@ This project follows OpenAI's public agent guidance rather than a local complexi
 ## Configuration
 
 Create `$CODEX_HOME/native-agent-pool-advisor.config.json` when your Codex install uses different model names, a different fallback cap, or a different native state DB name.
-If only `models.explorer` is set, the first model is treated as preferred and the second as fallback.
+If only `models.explorer` is set, the first model is treated as the scout guidance model and the second as the default fallback guidance model. This is prompt guidance only; it is not an `agent_type` allow-list.
 
 ```json
 {
   "models": {
     "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
     "explorerPreferred": "gpt-5.3-codex-spark",
-    "explorerFallback": "gpt-5.4-mini"
+    "explorerFallback": "gpt-5.4-mini",
+    "explorerForbidden": ["gpt-5.5"]
   },
   "defaults": {
     "agentCap": 6,
@@ -130,9 +146,10 @@ If only `models.explorer` is set, the first model is treated as preferred and th
 
 Environment overrides are also supported:
 
-- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated explorer allow-list. This does not change the global default: omitted model is still invalid, and is blocked when Codex emits a supported `PreToolUse` event for the spawn path.
+- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated compatibility shortcut for scout/default guidance models. This does not create an `agent_type` allow-list; omitted model is still invalid, and is blocked when Codex emits a supported `PreToolUse` event for the spawn path.
 - `NATIVE_AGENT_POOL_EXPLORER_MODEL`: preferred explorer model.
 - `NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL`: fallback explorer model.
+- `NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS`: comma-separated models that must not be paired with native `agent_type=explorer`; defaults to `gpt-5.5`.
 - `NATIVE_AGENT_POOL_DEFAULT_CAP`: fallback cap when `[agents].max_threads` is absent.
 - `NATIVE_AGENT_POOL_WARN_REMAINING`: advisory threshold near the cap.
 - `NATIVE_AGENT_POOL_STATE_DB_PATH` or `NATIVE_AGENT_POOL_STATE_DB_NAME`: native DB override.
@@ -184,7 +201,7 @@ npm run check
 npm test
 ```
 
-The test suite covers hook-script behavior: wrapper-spawn blocking, multi-spawn budget accounting, native-DB-lag ledger accounting, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
+The test suite covers hook-script behavior: wrapper-spawn blocking, no-reservation multi-spawn blocking, native-DB-lag ledger accounting, explicit model enforcement when `PreToolUse` is emitted, strict model/fork shape normalization, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
 
 For real end-to-end evidence from Codex Desktop or CLI, inspect the actual parent transcript after a spawn attempt:
 
@@ -217,7 +234,7 @@ node scripts/live-check.mjs \
   --allow-missing-guidance
 ```
 
-At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent. If a later close succeeds, run a fresh hook/live check and use the updated budget instead of the stale zero-budget prompt.
+At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, `observed_free=0`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent. If a later close succeeds, run a fresh hook/live check and use the updated observed snapshot instead of the stale zero-budget prompt.
 
 ## Known Limits
 

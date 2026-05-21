@@ -29,6 +29,7 @@ const COMMAND_NAME = "native-agent-pool-advisor";
 const DEFAULT_STATE_DB_NAME = "state_5.sqlite";
 const DEFAULT_EXPLORER_MODEL = "gpt-5.3-codex-spark";
 const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.4-mini";
+const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.5"];
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
 let runtimeOptionsCache = {
@@ -38,7 +39,7 @@ let runtimeOptionsCache = {
   stateDbPathOverride: "",
   explorerPreferredModel: DEFAULT_EXPLORER_MODEL,
   explorerFallbackModel: DEFAULT_EXPLORER_FALLBACK_MODEL,
-  explorerAllowedModels: [DEFAULT_EXPLORER_MODEL, DEFAULT_EXPLORER_FALLBACK_MODEL],
+  explorerForbiddenModels: [...DEFAULT_EXPLORER_FORBIDDEN_MODELS],
 };
 
 function safeString(value) {
@@ -148,10 +149,6 @@ function parseStringList(value) {
     .filter(Boolean);
 }
 
-function uniqueStrings(values) {
-  return [...new Set(values.map((value) => safeString(value).trim()).filter(Boolean))];
-}
-
 function readFirstString(...values) {
   for (const value of values) {
     const text = safeString(value).trim();
@@ -208,6 +205,14 @@ async function loadRuntimeOptions() {
     explicitExplorerModels[0],
     DEFAULT_EXPLORER_FALLBACK_MODEL,
   );
+  const forbiddenExplorerModels = parseStringList(
+    process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS
+      ?? models.explorer_forbidden
+      ?? models.explorerForbidden
+      ?? models.forbiddenExplorer
+      ?? models.forbidden_explorer
+      ?? DEFAULT_EXPLORER_FORBIDDEN_MODELS,
+  );
 
   runtimeOptionsCache = {
     defaultAgentCap: readFirstPositiveInteger(
@@ -236,11 +241,9 @@ async function loadRuntimeOptions() {
     ),
     explorerPreferredModel: preferred,
     explorerFallbackModel: fallback,
-    explorerAllowedModels: uniqueStrings([
-      ...explicitExplorerModels,
-      preferred,
-      fallback,
-    ]),
+    explorerForbiddenModels: forbiddenExplorerModels.length > 0
+      ? forbiddenExplorerModels
+      : [...DEFAULT_EXPLORER_FORBIDDEN_MODELS],
   };
 }
 
@@ -273,13 +276,12 @@ function explorerFallbackModel() {
   return runtimeOptionsCache.explorerFallbackModel || DEFAULT_EXPLORER_FALLBACK_MODEL;
 }
 
-function explorerModels() {
-  const models = runtimeOptionsCache.explorerAllowedModels ?? [];
-  return models.length > 0 ? models : [DEFAULT_EXPLORER_MODEL, DEFAULT_EXPLORER_FALLBACK_MODEL];
-}
-
-function explorerModelListText() {
-  return explorerModels().join(", ");
+function explorerForbiddenModels() {
+  const configured = Array.isArray(runtimeOptionsCache.explorerForbiddenModels)
+    ? runtimeOptionsCache.explorerForbiddenModels
+    : [];
+  const models = configured.map((model) => safeString(model).trim()).filter(Boolean);
+  return models.length > 0 ? models : [...DEFAULT_EXPLORER_FORBIDDEN_MODELS];
 }
 
 function warnRemaining() {
@@ -1338,63 +1340,26 @@ function toolInput(payload) {
   return safeObject(payload.tool_input ?? payload.toolInput) ?? {};
 }
 
-function requestedAgentType(payload) {
-  const input = toolInput(payload);
-  return safeString(input.agent_type ?? input.agentType ?? input.role).trim().toLowerCase();
-}
-
-function requestedModel(payload) {
-  const input = toolInput(payload);
-  return safeString(input.model).trim();
-}
-
-function isExplorerSpawnInput(payload) {
-  return ["explore", "explorer"].includes(requestedAgentType(payload));
-}
-
-function hasExplorerModelRouteViolation(payload) {
-  if (!isExplorerSpawnInput(payload)) return false;
-  return !explorerModels().includes(requestedModel(payload));
-}
-
-function operationAgentType(operation) {
-  return safeString(operation?.input?.agent_type ?? operation?.input?.agentType ?? operation?.input?.role)
-    .trim()
-    .toLowerCase();
-}
-
 function operationModel(operation) {
   return safeString(operation?.input?.model).trim();
 }
 
+function normalizeAgentRole(value) {
+  return safeString(value).trim().toLowerCase().replace(/^functions\./, "");
+}
+
+function operationAgentRole(operation) {
+  return normalizeAgentRole(
+    operation?.input?.agent_type
+      ?? operation?.input?.agentType
+      ?? operation?.input?.role
+      ?? operation?.input?.type,
+  );
+}
+
 function operationForkContext(operation) {
   const value = operation?.input?.fork_context ?? operation?.input?.forkContext;
-  if (typeof value === "boolean") return value;
-  return /^(?:1|true|yes)$/i.test(safeString(value).trim());
-}
-
-function operationReasoningEffort(operation) {
-  return safeString(operation?.input?.reasoning_effort ?? operation?.input?.reasoningEffort).trim();
-}
-
-function operationPromptText(operation) {
-  const input = safeObject(operation?.input) ?? {};
-  const parts = [
-    input.message,
-    input.prompt,
-    input.task,
-    input.instructions,
-    input.input,
-  ].map(safeString).filter(Boolean);
-  if (Array.isArray(input.items)) {
-    for (const item of input.items) {
-      if (item && typeof item === "object") {
-        parts.push(safeString(item.text));
-        parts.push(safeString(item.name));
-      }
-    }
-  }
-  return parts.filter(Boolean).join("\n");
+  return value === true;
 }
 
 function hasSpawnOperation(operations) {
@@ -1403,15 +1368,6 @@ function hasSpawnOperation(operations) {
 
 function spawnOperationCount(operations) {
   return operations.filter((operation) => operation.name === "spawn_agent").length;
-}
-
-function hasExplorerModelRouteViolationInOperations(operations) {
-  return operations.some((operation) => {
-    if (operation.name !== "spawn_agent") return false;
-    if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    if (operationForkContext(operation) && !operationModel(operation)) return false;
-    return !explorerModels().includes(operationModel(operation));
-  });
 }
 
 function hasForkContextModelConflictInOperations(operations) {
@@ -1436,78 +1392,20 @@ function hasMissingSpawnModelInOperations(operations) {
   });
 }
 
-function countMatches(text, pattern) {
-  return [...safeString(text).matchAll(pattern)].length;
-}
-
-function hasDistinctExplorerFallback() {
-  const preferred = explorerModel();
-  const fallback = explorerFallbackModel();
-  return Boolean(fallback && preferred && fallback !== preferred && explorerModels().includes(fallback));
-}
-
-function looksLikeComplexExplorerPrompt(text) {
-  const raw = safeString(text);
-  const normalized = raw.toLowerCase();
-  if (!normalized.trim()) return false;
-
-  const arrows = countMatches(raw, /(?:->|→)/g);
-  const fileRefs = countMatches(raw, /\b[\w./-]+\.(?:py|ts|tsx|js|mjs|json|toml|yaml|yml|md)\b/g);
-  const reasoningHits = countMatches(
-    normalized,
-    /\b(?:analy[sz]e|trace|classify|determine|whether|verify|validate|audit|review|root cause|policy|strategy|strategic|mathematical|math|sizing|discount|fallback|tests?|settings?|config|runtime|execution|posterior|kelly|semantic|intent|branch|end-to-end|e2e|verdict|conclusion)\b/g,
-  );
-  const hasDomainReasoningMarker = /(?:mathematic|strategic|posterior|kelly|execution-policy|policy mismatch|semantic|live order|limit price|fallbacks?)/i.test(raw);
-  const asksForClassification = /(?:return whether|classify|verdict|conclusion|is intended|bug|mismatch)/i.test(raw);
-
-  return (
-    raw.length > 900
-    || (arrows >= 2 && reasoningHits >= 3)
-    || (fileRefs >= 4 && reasoningHits >= 3)
-    || (hasDomainReasoningMarker && reasoningHits >= 3)
-    || (asksForClassification && reasoningHits >= 4)
-  );
-}
-
-function hasPreferredExplorerContractAdvisoryInOperations(operations) {
-  if (!hasDistinctExplorerFallback()) return false;
-  return operations.some((operation) => {
+function explorerForbiddenModelViolations(operations) {
+  const forbidden = new Set(explorerForbiddenModels().map((model) => model.toLowerCase()));
+  return operations.filter((operation) => {
     if (operation.name !== "spawn_agent") return false;
-    if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    if (operationModel(operation) !== explorerModel()) return false;
-    const effort = operationReasoningEffort(operation);
-    return (effort && effort !== "low") || looksLikeComplexExplorerPrompt(operationPromptText(operation));
+    if (operationForkContext(operation)) return false;
+    const role = operationAgentRole(operation);
+    if (role !== "explorer" && role !== "explore") return false;
+    const model = operationModel(operation).toLowerCase();
+    return Boolean(model && forbidden.has(model));
   });
 }
 
-function looksLikeNarrowScanPrompt(text) {
-  const raw = safeString(text);
-  const normalized = raw.toLowerCase();
-  if (!normalized.trim()) return false;
-  const scanHits = countMatches(
-    normalized,
-    /\b(?:rg|grep|find|search|lookup|map|list|scan|symbols?|references?|callers?|callees?|file:line|anchors?)\b/g,
-  );
-  const conclusionHits = countMatches(
-    normalized,
-    /\b(?:analy[sz]e|synthesize|classify|determine|verdict|conclusion|approve|revise|block|fix|edit|implement)\b/g,
-  );
-  return raw.length <= 500 && scanHits >= 1 && conclusionHits === 0;
-}
-
-function hasFallbackExplorerContractAdvisoryInOperations(operations) {
-  if (!hasDistinctExplorerFallback()) return false;
-  return operations.some((operation) => {
-    if (operation.name !== "spawn_agent") return false;
-    if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    if (operationModel(operation) !== explorerFallbackModel()) return false;
-    return looksLikeNarrowScanPrompt(operationPromptText(operation));
-  });
-}
-
-function hasExplorerContractAdvisoryInOperations(operations) {
-  return hasPreferredExplorerContractAdvisoryInOperations(operations)
-    || hasFallbackExplorerContractAdvisoryInOperations(operations);
+function hasExplorerForbiddenModelInOperations(operations) {
+  return explorerForbiddenModelViolations(operations).length > 0;
 }
 
 function toolResponse(payload) {
@@ -1845,6 +1743,53 @@ function remainingSpawnBudget(summary, cap) {
   return Math.max(0, cap - (summary.occupied ?? 0));
 }
 
+function capacityGuaranteeLevel(summary) {
+  if (!summary) return "unavailable";
+  if (summary.native_edge_failed) return "unavailable";
+  if (summary.native_edge_authoritative) return "observed_native_snapshot";
+  if (summary.transcript_slot_reliable) return "observed_transcript_snapshot";
+  if (summary.transcript_scanned) return "fallback_transcript_snapshot";
+  return "fallback_ledger_snapshot";
+}
+
+function capacitySnapshot(summary, cap, requestedSpawns = 0) {
+  const capValue = slotCap(cap);
+  const requested = Math.max(0, Math.floor(Number(requestedSpawns) || 0));
+  const observedUsed = summary?.cap_hit_blocks_spawn
+    ? capValue
+    : clampSlotCount(summary?.occupied ?? 0, capValue);
+  const observedFree = summary?.cap_hit_blocks_spawn ? 0 : Math.max(0, capValue - observedUsed);
+  return {
+    total_cap: capValue,
+    observed_used: observedUsed,
+    observed_free: observedFree,
+    remaining_spawn_budget: observedFree,
+    requested_spawns: requested,
+    close_needed_for_request: Math.max(0, requested - observedFree),
+    close_needed_for_one: observedFree > 0 ? 0 : 1,
+    runtime_reservation: false,
+    batch_guarantee: false,
+    guarantee_level: capacityGuaranteeLevel(summary),
+    recommended_protocol: requested > 1 ? "single_spawn_then_resample" : "single_spawn_or_reuse_then_resample",
+  };
+}
+
+function formatCapacitySnapshot(snapshot) {
+  return [
+    `total_cap=${snapshot.total_cap}`,
+    `observed_used=${snapshot.observed_used}`,
+    `observed_free=${snapshot.observed_free}`,
+    `remaining_spawn_budget=${snapshot.remaining_spawn_budget}`,
+    `requested_spawns=${snapshot.requested_spawns}`,
+    `close_needed_for_request=${snapshot.close_needed_for_request}`,
+    `close_needed_for_one=${snapshot.close_needed_for_one}`,
+    `guarantee_level=${snapshot.guarantee_level}`,
+    `runtime_reservation=${snapshot.runtime_reservation ? "true" : "false"}`,
+    `batch_guarantee=${snapshot.batch_guarantee ? "true" : "false"}`,
+    `recommended_protocol=${snapshot.recommended_protocol}`,
+  ].join(", ");
+}
+
 function nativeEdgeSummary(summary) {
   if (summary?.native_edge_failed) return "unavailable";
   if (summary?.native_edge_checked) {
@@ -1894,7 +1839,8 @@ function terminalCloseTargetGuidance(summary) {
   const overflowText = (summary?.native_edge_overflow ?? 0) > 0
     ? `Native DB open-edge debt exceeds the ${summary.native_edge_cap ?? "configured"}-slot runtime cap: db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}. Overflow rows are repair debt, not additional live agents.`
     : "";
-  return `${activeText} ${terminalText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
+  const reuseText = "LANE_REUSE_CHECK_REQUIRED=true. Before any new spawn, compare the intended task contract against the current-parent lane inventory above. If a same-topic/same-domain lane has compatible model and context, use send_input to reuse that lane instead of spawning. Close a lane only when it is no longer useful, has the wrong role/model for the next task, or a slot must be freed for higher-value work.";
+  return `${activeText} ${terminalText} ${reuseText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
 }
 
 function zeroBudgetRecoveryGuidance(summary) {
@@ -1912,24 +1858,25 @@ function zeroBudgetRecoveryGuidance(summary) {
     "Before any new spawn, choose one recovery action: reuse a compatible current-parent lane with send_input, close listed current-parent lane(s) that are no longer needed, wait for an active lane if its result is needed, or continue locally.",
     candidateText,
     hasListedLane
-      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and then obey the refreshed remaining_spawn_budget; multiple independent lanes are allowed when budget permits."
+      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and use the refreshed observed_free snapshot; without runtime reservation, launch at most one child before sampling again."
       : "If live state says fewer lanes exist than the hook snapshot, run a fresh hook/live check and use the newer scoped budget."
   ].join(" ");
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
   if (!summary) return "";
-  const remaining = remainingSpawnBudget(summary, cap);
-  const hardDirective = remaining === 0
-    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget snapshot). remaining_spawn_budget=0: do not call spawn_agent from this capacity snapshot. First close known no-longer-needed current-parent lane(s) or continue locally. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state."
-    : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. You may launch up to this many spawn_agent calls from this capacity snapshot; each spawn_agent call immediately decrements this local counter.`;
+  const snapshot = capacitySnapshot(summary, cap, 0);
+  const hardDirective = snapshot.observed_free === 0
+    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget observed snapshot). observed_free=0, remaining_spawn_budget=0: do not call spawn_agent from this capacity snapshot. First reuse or close known no-longer-needed current-parent lane(s), or continue locally. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state."
+    : `SPAWN_AGENT_OBSERVED_FREE=${snapshot.observed_free}. BATCH_SPAWN_GUARANTEE=false. This is an observed snapshot, not an atomic runtime reservation; launch at most one new child, then re-check capacity before another spawn.`;
   return [
     hardDirective,
-    `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`,
-    remaining === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
+    `Current parent/session native subagent capacity snapshot: occupied=${summary.occupied}/${cap}, ${formatCapacitySnapshot(snapshot)}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`,
+    snapshot.observed_free === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
     terminalCloseTargetGuidance(summary),
-    "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
-    "When remaining_spawn_budget is 0, do not call spawn_agent. Continue locally or close known no-longer-needed current-parent lane(s) first; send_input and wait_agent do not increase the spawn budget. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
+    "The hook has no atomic runtime reservation API. observed_free/remaining_spawn_budget is a compatibility alias for the current observed free count, not a guaranteed batch size.",
+    "wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
+    "When observed_free is 0, do not call spawn_agent. Continue locally, reuse a compatible lane, or close known no-longer-needed current-parent lane(s) first; send_input and wait_agent do not increase capacity. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
   ].filter(Boolean).join(" ");
 }
 
@@ -1941,9 +1888,10 @@ function buildSubagentModelSelectionGuidance() {
     `Use model="${explorerModel()}" only for read-only scout output: grep/file maps, symbol/log filters, candidate file:line anchors, or hypotheses with a strict output cap and no durable verdict.`,
     `Use model="${explorerFallbackModel()}" for multi-hop tracing, compact synthesis, bounded verification, config/test interpretation, or light low-risk execution where the child owns a durable conclusion.`,
     `Use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`,
+    `Do not set agent_type=explorer with model="${explorerForbiddenModels().join("|")}". Frontier critic/architecture/high-risk lanes must use agent_type=default; explorer lanes must use ${explorerModel()} or ${explorerFallbackModel()}.`,
     "Do not combine fork_context=true with model. If you need Spark/mini/frontier model routing, remove fork_context and pass a compact context packet in message/items. Use fork_context=true without model only when exact full-history context matters more than model routing; that path may inherit the parent model.",
     "If you cannot state the child output cap and stop condition, do not use Spark; slice locally first or choose mini.",
-    "Do not launch more lanes than the confirmed free-slot count. Multiple child lanes are allowed when each has an independent task contract and the batch size is within remaining_spawn_budget.",
+    "Capacity is a separate decision: without runtime reservation, do not submit multiple spawn_agent calls in one tool batch; spawn one child, let runtime record it, then re-check observed_free.",
     "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Spark exact slices to anchor, and use mini/frontier for synthesis.",
     "This judgment step is mandatory; never omit model, because omitted model inherits the parent frontier model.",
     "This is a spawn-shape guard, not a recommendation to create a subagent.",
@@ -1955,7 +1903,7 @@ function buildCapacityGuidance(eventName, cap, summary = null) {
     buildTurnBudgetGuidance(summary, cap),
     buildSubagentModelSelectionGuidance(),
     `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
-    "Batch native spawn_agent calls only when requested_spawns <= remaining_spawn_budget and each lane has an independent task contract. If any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes budget.",
+    "Without a Codex runtime reservation primitive, this hook cannot guarantee atomic multi-spawn success. Prefer single-spawn-then-resample sequencing; if any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes observed capacity.",
     "Open children without task_complete evidence can consume slots until close succeeds; stale open edges with task_complete evidence are repaired to closed and excluded from current occupancy.",
     "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, or explicit reset refreshes budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit.",
     "Do not restate/retry long child prompts after a capacity failure.",
@@ -2143,8 +2091,10 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   if (isChildSession) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
-  if (hasExplorerModelRouteViolationInOperations(ops)) return true;
+  if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.native_edge_failed) return true;
+  if ((summary.pending_spawn_reservations ?? 0) > 0) return true;
+  if (requestedSpawns > 1) return true;
   if (summary.occupied + requestedSpawns > cap) return true;
   if (!summary.native_edge_authoritative && summary.tracked_occupied + requestedSpawns > cap) return true;
   if (
@@ -2160,10 +2110,11 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
 function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   const ops = operations ?? agentOperations({}, name);
   if (ops.length === 0) return false;
+  if (hasMissingSpawnModelInOperations(ops)) return true;
+  if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
   if (hasForkContextModelInheritanceInOperations(ops)) return true;
-  if (hasExplorerContractAdvisoryInOperations(ops)) return true;
   const threshold = Math.max(1, cap - warnRemaining());
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
 }
@@ -2174,13 +2125,13 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const missingSpawnModel = checkSpawnShape && hasMissingSpawnModelInOperations(ops);
   const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
   const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
-  const explorerModelRouteViolation = checkSpawnShape && hasExplorerModelRouteViolationInOperations(ops);
-  const preferredExplorerContractAdvisory = checkSpawnShape && hasPreferredExplorerContractAdvisoryInOperations(ops);
-  const fallbackExplorerContractAdvisory = checkSpawnShape && hasFallbackExplorerContractAdvisoryInOperations(ops);
+  const explorerForbiddenModel = checkSpawnShape && hasExplorerForbiddenModelInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
+  const snapshot = capacitySnapshot(summary, cap, requestedSpawns);
+  const multiSpawnWithoutReservation = requestedSpawns > 1 && !snapshot.runtime_reservation;
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
-    `requested_spawns=${requestedSpawns}`,
+    formatCapacitySnapshot(snapshot),
     `slot_pressure_source=${summary.slot_pressure_source}`,
     `ledger_slot=${summary.tracked_occupied}`,
     `ledger_unresolved=${summary.tracked_unresolved}`,
@@ -2198,38 +2149,41 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const context = [
     parts.join(", ") + ".",
     forkContextModelConflict
-      ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry corrected independent spawn call(s) only while remaining_spawn_budget is still positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
+      ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry one corrected spawn only after a refreshed observed_free snapshot is positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
       : null,
     missingSpawnModel
-      ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+      ? (blockSpawn
+        ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+        : `Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision unless fork_context=true was intentionally used for exact full-history inheritance. Future non-fork spawns must include the model field in the tool input.`)
+      : null,
+    explorerForbiddenModel
+      ? (blockSpawn
+        ? `Explorer/frontier route violation: native agent_type=explorer cannot use model="${explorerForbiddenModels().join("|")}". Explorer lanes are for scout/anchor work and should use ${explorerModel()} or ${explorerFallbackModel()}; if this is truly critic, architecture, security, high-risk, live-money judgment, or final approval, change the native role to agent_type=default and keep the explicit frontier model.`
+        : `Explorer/frontier route violation observed after tool execution: a spawn_agent call used native agent_type=explorer with a forbidden frontier model. Future frontier critic/architecture lanes must use agent_type=default; future explorer lanes must use ${explorerModel()} or ${explorerFallbackModel()}.`)
       : null,
     forkContextModelInheritance
       ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for explorer/scout/mini routing, remove fork_context and pass compact context instead."
       : null,
-    explorerModelRouteViolation
-      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for capped scout/probe anchors and ${explorerFallbackModel()} for reasoning explorer, synthesis, verification, or light executor work. Do not inherit a frontier model for read-only lookup.`
-      : null,
-    preferredExplorerContractAdvisory
-      ? `Explorer route advisory, not a block: ${explorerModel()} is useful even inside complex work when the output contract is scout/anchor collection. Keep the prompt bounded with exact scope, file:line evidence, output cap, and stop condition; if the child must synthesize a durable verdict, edit files, approve a claim, or repeatedly compact, route that follow-up to ${explorerFallbackModel()} or a frontier reviewer.`
-      : null,
-    fallbackExplorerContractAdvisory
-      ? `Explorer route advisory, not a block: this looks like a narrow scan that ${explorerModel()} can usually handle faster. ${explorerFallbackModel()} remains valid when you want more synthesis, resilience, or light execution, but do not spend the reasoning lane on disposable grep unless the context lane is already useful.`
+    multiSpawnWithoutReservation
+      ? "Multiple spawn_agent calls in one tool operation are blocked because observed_free is not an atomic runtime reservation. Split the batch: launch one child, let PostToolUse/native state record the result, then re-check observed_free before the next child."
       : null,
     blockSpawn && isChildSession
       ? "Nested native spawn is blocked: child sessions cannot create subagents; the parent leader owns delegation."
       : null,
     blockSpawn
       ? (forkContextModelConflict
-        ? "Correct the spawn shape and retry only the corrected independent spawn call(s) that still fit remaining_spawn_budget; do not treat this as a consumed native slot or as proof the pool is full."
+        ? "Correct the spawn shape and retry only one corrected spawn call after the refreshed observed_free check; do not treat this as a consumed native slot or as proof the pool is full."
         : missingSpawnModel
-        ? "Retry only after making model-selection judgment explicit for each spawn; Analyze/read-only/bounded labels are not enough, and requested_spawns must still fit remaining_spawn_budget."
-        : explorerModelRouteViolation
-        ? "Retry explorer spawn call(s) only after correcting each explicit model route, and only if requested_spawns still fit remaining_spawn_budget."
+        ? "Retry only after making model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and the corrected call must still fit observed_free."
+        : explorerForbiddenModel
+        ? "Retry only after correcting the role/model shape: explorer with Spark/mini for scout work, or default with explicit frontier model for critic/architecture/high-risk judgment. Do not re-label a frontier critic lane as explorer."
+        : multiSpawnWithoutReservation
+        ? "Retry as a single spawn call, then resample capacity before launching another child; do not restate every child prompt after a batch block."
         : isChildSession
         ? "Nested spawn denied; no child-side delegation guidance is emitted."
         : (summary.cap_hit_blocks_spawn
           ? "This thread already saw a native pool-exhaustion failure after the last confirmed close/repair/reset; do not retry spawn_agent until a later close/repair/reset succeeds and a newer hook/PreToolUse capacity check reports budget."
-          : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, wait for a needed active lane, or continue locally; then retry only within a fresh positive capacity budget."))
+          : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, wait for a needed active lane, or continue locally; then resample capacity and retry only within a fresh positive observed_free snapshot."))
       : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
     (summary.native_edge_overflow ?? 0) > 0
       ? `Native DB open-edge debt exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are repair debt rather than additional live agents. db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}.`
@@ -2269,7 +2223,7 @@ function buildLockUnavailableAdvisory(eventName, cap, isChildSession, operations
     hasSpawn
       ? (isChildSession
         ? "Blocking nested spawn_agent; child sessions cannot create subagents."
-        : `Blocking spawn_agent conservatively. The native cap is ${cap}; retry only after the lock clears and requested_spawns fit the refreshed budget, or continue locally.`)
+        : `Blocking spawn_agent conservatively. The native cap is ${cap}; retry only after the lock clears and a refreshed observed_free snapshot can be read, or continue locally.`)
       : "Serialize agent-pool operations until the lock clears.",
     isChildSession ? "This is a child session; nested native spawn remains disallowed." : null,
   ].filter(Boolean).join(" ");

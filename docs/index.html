@@ -356,9 +356,9 @@
 <span class="bad">runtime:</span> native subagent pool is full
 <span class="dim">agent:</span> closing old agents, retrying long prompt...
 
-<span class="good">advisor:</span> occupied=5/6, remaining_spawn_budget=1
-<span class="good">advisor:</span> requested_spawns=2 would exceed cap
-<span class="good">advisor:</span> launch one, or close a current-parent lane first</pre>
+<span class="good">advisor:</span> occupied=5/6, observed_free=1
+<span class="good">advisor:</span> requested_spawns=2, close_needed_for_request=1
+<span class="good">advisor:</span> no batch guarantee: launch one, or close a current-parent lane first</pre>
           </div>
         </section>
 
@@ -374,7 +374,7 @@
             </article>
             <article class="card">
               <h3>Invisible cap hits</h3>
-              <p>Reads per-parent native edge state and injects occupied/remaining budget before launch-heavy turns.</p>
+              <p>Reads per-parent native edge state and injects occupied/observed-free capacity before launch-heavy turns.</p>
             </article>
             <article class="card">
               <h3>Blind retry loops</h3>
@@ -382,7 +382,7 @@
             </article>
             <article class="card">
               <h3>Batch overbooking</h3>
-              <p>Counts nested wrapper calls so two requested spawns consume two slots before approval.</p>
+              <p>Blocks multi-spawn tool batches on supported hook surfaces because observed capacity is not an atomic runtime reservation.</p>
             </article>
             <article class="card">
               <h3>Stale open rows</h3>
@@ -394,7 +394,11 @@
             </article>
             <article class="card">
               <h3>Model drift</h3>
-              <p>Requires read-only explorer work to set an explicit configured model when the spawn is visible to the hook, and makes missing-model bypasses detectable after the fact.</p>
+              <p>Requires every non-fork spawn to set an explicit model when the spawn is visible to the hook, and makes missing-model bypasses detectable after the fact.</p>
+            </article>
+            <article class="card">
+              <h3>Lane churn</h3>
+              <p>Lists current-parent lanes before spawn-heavy turns so same-topic work can reuse existing context instead of consuming a fresh native slot.</p>
             </article>
             <article class="card">
               <h3>Unsafe reset drift</h3>
@@ -457,7 +461,7 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
             </article>
             <article class="card">
               <h3>Model advisory</h3>
-              <p>Explorer model hints are secondary. The primary guard is still the six-slot pool budget, exact close accounting, and stale-open diagnosis.</p>
+              <p>Model hints are secondary. The primary guard is still the six-slot pool budget, exact close accounting, explicit model input, lane reuse, and stale-open diagnosis.</p>
             </article>
           </div>
           <div class="split">
@@ -465,7 +469,11 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
               <tbody>
                 <tr>
                   <th><code>models.explorer</code></th>
-                  <td>Allowed read-only explorer models. Defaults to Spark plus mini fallback. If this is the only model setting, the first entry is preferred and the second is fallback.</td>
+                  <td>Compatibility shortcut for scout/default guidance model names. It is prompt guidance only, not an <code>agent_type</code> allow-list.</td>
+                </tr>
+                <tr>
+                  <th><code>models.explorerForbidden</code></th>
+                  <td>Models that cannot be paired with native <code>agent_type=explorer</code>; default frontier critic lanes should use <code>agent_type=default</code>.</td>
                 </tr>
                 <tr>
                   <th><code>defaults.agentCap</code></th>
@@ -486,7 +494,8 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
   "models": {
     "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
     "explorerPreferred": "gpt-5.3-codex-spark",
-    "explorerFallback": "gpt-5.4-mini"
+    "explorerFallback": "gpt-5.4-mini",
+    "explorerForbidden": ["gpt-5.5"]
   },
   "defaults": {
     "agentCap": 6,
@@ -503,7 +512,7 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
         <section>
           <div class="section-heading">
             <h2>Model routing is secondary</h2>
-            <p>The main product is not a model taxonomy. It is a runtime guardrail against failed native spawns and the attention drift that follows them.</p>
+            <p>The main product is not a model taxonomy. It is a runtime guardrail against failed native spawns and the attention drift that follows them. The full boundary model is in <a href="first-principles.md">first-principles.md</a>.</p>
           </div>
           <div class="grid">
             <article class="card">
@@ -516,7 +525,11 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
             </article>
             <article class="card">
               <h3>Hook boundary</h3>
-              <p>The hook only enforces observable runtime safety. It does not decide whether Spark, mini, or frontier owns the next reasoning step.</p>
+              <p>The hook enforces observable runtime safety and spawn-shape coherence. The parent still chooses the model, but frontier lanes must not be disguised as native explorer lanes.</p>
+            </article>
+            <article class="card">
+              <h3>Reuse before spawn</h3>
+              <p>When the hook prints <code>LANE_REUSE_CHECK_REQUIRED</code>, compare the new task to listed lanes and use <code>send_input</code> for compatible same-topic context.</p>
             </article>
           </div>
         </section>

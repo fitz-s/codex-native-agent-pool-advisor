@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const GUIDANCE_MARKERS = [
   "SUBAGENT_MODEL_SELECTION_REQUIRED",
+  "SPAWN_AGENT_OBSERVED_FREE",
   "SPAWN_AGENT_LOCAL_COUNTER_START",
   "SPAWN_AGENT_DISABLED_THIS_TURN",
   "Native agent pool guard",
@@ -35,8 +36,16 @@ const CLOSE_FAILURE_PATTERNS = [
   /unable to close/i,
   /cannot close/i,
   /could not close/i,
+  /endpoint not found/i,
   /无法关闭/,
 ];
+const CLOSE_RELEASE_NOT_FOUND_PATTERNS = [
+  /unknown agent/i,
+  /agent (?:with id [A-Za-z0-9_.:-]+ )?not found/i,
+  /no such agent/i,
+  /invalid agent(?: id)?/i,
+];
+const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.5"];
 
 function usage() {
   return [
@@ -48,7 +57,7 @@ function usage() {
     "  --since-line <n>              Scan transcript records starting at this 1-based line.",
     "  --expect-model <model>        Require a successful spawn whose tool input and native DB edge both use this model. Repeatable.",
     "  --expect-current-open <n>     Require this parent/session to have exactly n open native edges after the scanned window.",
-    "  --expect-all-closed           Require every successful spawn in the scanned window to have a successful close and closed DB edge.",
+    "  --expect-all-closed           Require every successful spawn in the scanned window to have closed DB edge plus close success or verified not-found release evidence.",
     "  --require-guidance            Fail if no advisor guidance marker appears before the first scanned spawn.",
     "  --allow-missing-guidance      Do not fail when the runtime transcript lacks prompt-time advisor markers.",
     "",
@@ -141,6 +150,35 @@ function preview(value, length = 140) {
   return text.length > length ? `${text.slice(0, length - 3)}...` : text;
 }
 
+function explicitString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeRole(value) {
+  return explicitString(value).toLowerCase();
+}
+
+function forbiddenExplorerModels() {
+  const raw = typeof process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS === "string"
+    ? process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS
+    : "";
+  const models = raw.split(",").map((item) => item.trim()).filter(Boolean);
+  return new Set((models.length > 0 ? models : DEFAULT_EXPLORER_FORBIDDEN_MODELS).map((model) => model.toLowerCase()));
+}
+
+function isExplorerRole(value) {
+  const role = normalizeRole(value);
+  return role === "explorer" || role === "explore";
+}
+
+function hasExplicitString(value) {
+  return explicitString(value).length > 0;
+}
+
+function hasBooleanForkContext(args) {
+  return (args?.fork_context ?? args?.forkContext) === true;
+}
+
 function parseOutputAgentId(value) {
   const parsed = typeof value === "string" ? safeJson(value) : value;
   if (parsed && typeof parsed === "object" && typeof parsed.agent_id === "string") return parsed.agent_id;
@@ -180,6 +218,11 @@ function outputLooksFailed(value) {
 function closeOutputLooksFailed(value) {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
   return outputLooksFailed(value) || CLOSE_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function closeOutputReleasesLane(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  return !closeOutputLooksFailed(value) || CLOSE_RELEASE_NOT_FOUND_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 function toolOutputLooksFailed(toolName, value) {
@@ -279,11 +322,12 @@ function readTranscript(text, sinceLine) {
           source: "direct",
           name,
           agent_type: args.agent_type ?? "",
-          model: args.model ?? "",
+          model: explicitString(args.model),
           reasoning_effort: args.reasoning_effort ?? "",
+          fork_context: hasBooleanForkContext(args),
           target: args.target ?? "",
           message_preview: preview(args.message),
-          has_model: Boolean(args.model),
+          has_model: hasExplicitString(args.model),
         });
         if (name === "spawn_agent") {
           pendingSpawnBatch.push(lineNumber);
@@ -305,11 +349,12 @@ function readTranscript(text, sinceLine) {
             source: "nested",
             name: operation.name,
             agent_type: args.agent_type ?? "",
-            model: args.model ?? "",
+            model: explicitString(args.model),
             reasoning_effort: args.reasoning_effort ?? "",
+            fork_context: hasBooleanForkContext(args),
             target: args.target ?? "",
             message_preview: preview(args.message),
-            has_model: Boolean(args.model),
+            has_model: hasExplicitString(args.model),
           });
           if (operation.name === "spawn_agent") pendingSpawnBatch.push(lineNumber);
           else flushSpawnBatch();
@@ -410,15 +455,16 @@ async function main() {
   const spawnBatches = transcript.spawnBatches ?? [];
   const failedSpawnCalls = spawnCalls.filter((call) => call.output?.failed);
   const spawnCallsMissingOutput = spawnCalls.filter((call) => !call.output);
-  const missingModelSpawns = spawnCalls.filter((call) => !call.has_model);
+  const missingModelSpawns = spawnCalls.filter((call) => !call.fork_context && !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
+  const explorerForbidden = forbiddenExplorerModels();
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
   const edgeByChild = new Map(edges.rows.map((row) => [row.child_thread_id, row]));
   const successfulSpawns = spawnCalls.filter((call) => call.output?.agent_id && !call.output.failed);
-  const closeTargetSet = new Set(
+  const closeReleaseTargetSet = new Set(
     transcript.calls
-      .filter((call) => call.name === "close_agent" && call.target && call.output && !call.output.failed)
+      .filter((call) => call.name === "close_agent" && call.target && call.output && closeOutputReleasesLane(call.output.output))
       .map((call) => call.target),
   );
   const openRows = edges.rows.filter((row) => row.status === "open");
@@ -428,8 +474,22 @@ async function main() {
       call,
       edge,
       tool_model_matches_native: Boolean(call.model && edge?.model === call.model),
-      closed: Boolean(edge?.status === "closed" && closeTargetSet.has(call.output.agent_id)),
+      closed: Boolean(edge?.status === "closed" && closeReleaseTargetSet.has(call.output.agent_id)),
     };
+  });
+  const missingNativeEdgeReports = edges.available
+    ? spawnReports.filter((report) => !report.edge)
+    : [];
+  const modelMismatchReports = spawnReports.filter((report) => {
+    if (!report.call.model) return false;
+    if (!report.edge) return false;
+    return report.edge?.model !== report.call.model;
+  });
+  const explorerFrontierReports = spawnReports.filter((report) => {
+    if (report.call.fork_context) return false;
+    if (!report.call.has_model) return false;
+    const toolModel = explicitString(report.call.model).toLowerCase();
+    return isExplorerRole(report.call.agent_type) && explorerForbidden.has(toolModel);
   });
   const expectedModels = Array.isArray(args.expectModels) ? args.expectModels.filter(Boolean) : [];
   const checks = [
@@ -444,6 +504,35 @@ async function main() {
       missingModelCreated.length === 0
         ? "no missing-model spawn created a child"
         : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
+    ),
+    buildCheck(
+      "tool_model_matches_native",
+      modelMismatchReports.length === 0,
+      modelMismatchReports.length === 0
+        ? "every successful explicit-model spawn matches the native DB model"
+        : modelMismatchReports.map((report) => {
+          return `${report.call.output.agent_id}:tool_model=${report.call.model || "?"}, native_model=${report.edge?.model ?? "missing"}`;
+        }).join(", "),
+    ),
+    buildCheck(
+      "native_edges_observed_for_successful_spawns",
+      missingNativeEdgeReports.length === 0,
+      !edges.available
+        ? "skipped because native DB is unavailable"
+        : missingNativeEdgeReports.length === 0
+        ? "every successful spawn has a native DB edge row"
+        : missingNativeEdgeReports.map((report) => {
+          return `${report.call.output.agent_id}:tool_role=${report.call.agent_type || "?"}, tool_model=${report.call.model || "?"}`;
+        }).join(", "),
+    ),
+    buildCheck(
+      "no_explorer_frontier_spawn_created",
+      explorerFrontierReports.length === 0,
+      explorerFrontierReports.length === 0
+        ? "no non-fork explorer spawn used a forbidden frontier model"
+        : explorerFrontierReports.map((report) => {
+          return `${report.call.output.agent_id}:tool_role=${report.call.agent_type || "?"}, tool_model=${report.call.model || "?"}, native_role=${report.edge?.agent_role ?? "missing"}, native_model=${report.edge?.model ?? "missing"}`;
+        }).join(", "),
     ),
     buildCheck(
       "spawn_outputs_observed",
@@ -492,15 +581,23 @@ async function main() {
       notClosed.length === 0,
       notClosed.length === 0
         ? "every successful spawn in the scanned window has a successful close and closed native edge"
-        : notClosed.map((report) => `${report.call.output.agent_id}:edge=${report.edge?.status ?? "missing"}, close=${closeTargetSet.has(report.call.output.agent_id)}`).join(", "),
+        : notClosed.map((report) => `${report.call.output.agent_id}:edge=${report.edge?.status ?? "missing"}, close_release=${closeReleaseTargetSet.has(report.call.output.agent_id)}`).join(", "),
     ));
   }
   const checkStatus = summarizeChecks(checks);
 
   const result = {
     ok: checkStatus !== "failed",
-    verdict: checkStatus === "failed" && missingModelCreated.length > 0
+    verdict: checkStatus === "failed" && explorerFrontierReports.length > 0
+      ? "native_explorer_frontier_model_violation"
+      : checkStatus === "failed" && modelMismatchReports.length > 0
+      ? "native_spawn_model_mismatch"
+      : checkStatus === "failed" && missingModelCreated.length > 0
       ? "native_spawn_missing_model_bypassed_advisor"
+      : checkStatus === "failed" && !edges.available
+      ? "native_db_unavailable"
+      : checkStatus === "failed" && missingNativeEdgeReports.length > 0
+      ? "native_spawn_edge_missing"
       : checkStatus === "failed"
       ? "live_check_failed"
       : spawnCalls.length > 0 && !guidanceBeforeFirstSpawn
@@ -521,11 +618,13 @@ async function main() {
       agent_type: call.agent_type,
       model: call.model || null,
       reasoning_effort: call.reasoning_effort || null,
+      fork_context: call.fork_context,
       has_model: call.has_model,
       output_line: call.output?.line ?? null,
       created_agent_id: call.output?.agent_id || null,
       output_failed: call.output?.failed ?? null,
       native_edge: call.output?.agent_id ? edgeByChild.get(call.output.agent_id) ?? null : null,
+      explorer_frontier_violation: explorerFrontierReports.some((report) => report.call === call),
       message_preview: call.message_preview,
     })),
     model_routes: spawnReports.map((report) => ({
