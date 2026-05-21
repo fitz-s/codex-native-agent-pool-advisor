@@ -628,7 +628,7 @@ test("blocks wrapped multi-spawn without runtime reservation even when observed 
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /requested_spawns=2/);
-    assert.match(output.reason, /batch_guarantee=no/);
+    assert.match(output.reason, /batch_guarantee=false/);
     assert.match(output.reason, /not an atomic runtime reservation/);
     assert.match(output.reason, /launch one child/);
   });

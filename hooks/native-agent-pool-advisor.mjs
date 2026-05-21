@@ -1886,8 +1886,8 @@ function formatCapacitySnapshot(snapshot) {
     `close_needed_for_request=${snapshot.close_needed_for_request}`,
     `close_needed_for_one=${snapshot.close_needed_for_one}`,
     `guarantee_level=${snapshot.guarantee_level}`,
-    `runtime_reservation=${snapshot.runtime_reservation ? "yes" : "no"}`,
-    `batch_guarantee=${snapshot.batch_guarantee ? "yes" : "no"}`,
+    `runtime_reservation=${snapshot.runtime_reservation ? "true" : "false"}`,
+    `batch_guarantee=${snapshot.batch_guarantee ? "true" : "false"}`,
     `recommended_protocol=${snapshot.recommended_protocol}`,
   ].join(", ");
 }
