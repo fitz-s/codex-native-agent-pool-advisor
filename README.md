@@ -54,7 +54,7 @@ See [First-Principles Design](docs/first-principles.md) for the full boundary mo
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
 - Full-history fork is the exception to model routing. If the runtime rejects `fork_context=true` together with `model`, use either `fork_context=true` without `model` and accept inherited parent model, or remove `fork_context` and pass a compact context packet with an explicit Spark/mini/frontier model. A fork/model shape failure is not native-pool exhaustion and should be retried only with corrected shape and positive budget.
 - The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection with an output cap and stop condition. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.
-- The hook does not choose by `agent_type`. It enforces the explicit `model` field, not a role label. `Analyze`, `review`, `read-only`, and `bounded` are not model choices by themselves.
+- The hook does not choose the model from `agent_type`, but the native role/model shape must still be coherent. `agent_type=explorer` with a forbidden frontier model such as `gpt-5.5` is blocked; use `agent_type=default` for frontier critic/architecture/high-risk judgment and keep explorer lanes on Spark or mini.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
@@ -104,13 +104,13 @@ Before spawning, the leader should make a compact task contract:
 | --- | --- | --- |
 | `gpt-5.3-codex-spark` | Near-instant scout work: grep/file maps, symbol lookup, log filtering, candidate file:line anchors, hypothesis sampling, bounded large-text scans, and fast evidence collection inside larger reasoning workflows. Usually `reasoning_effort=low`, but non-low effort is allowed when intentional. | Do not ask it to own final approval, broad synthesis, edits, or repeated compaction. If the task expands, it should stop and return anchors plus an escalation recommendation. |
 | `gpt-5.4-mini` | Default subagent lane; reasoning explorer / light executor work: multi-hop code-path traces, semantic classification, config+test synthesis, small low-risk fixes, compact evidence reports, and bounded verification that needs a durable conclusion. Use `reasoning_effort=medium` or `high` when judgment matters. | Not the default for disposable grep if Spark is available. Do not use as final authority for architecture, security, live-money, or high-risk implementation. |
-| `gpt-5.5` | Critic, architecture, security judgment, high-risk implementation, and final approval. | Do not use for ordinary explorer/scout lanes or broad grep/file scans. |
+| `gpt-5.5` | Critic, architecture, security judgment, high-risk implementation, and final approval. | Do not use for ordinary explorer/scout lanes or broad grep/file scans. If using native `spawn_agent`, use `agent_type=default`, not `agent_type=explorer`. |
 
 Route by output contract, risk, and context-state depth, not by complexity adjectives. A complex parent task can use Spark well if the child prompt asks for bounded scout output such as "return 12 file:line anchors and stop." A mini lane is better when the child owns synthesis, a small edit, or a durable low-risk verification result.
 
 For broad, compiled, vendor, or large-context repos, do a local `rg`/module map first. Then send Spark exact slices for anchors, not the whole tree. Use mini for synthesis once the slices exist. If two scout lanes fail or compact on context, stop spawning, shrink the slice locally, and reuse or close current lanes before trying again.
 
-When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid; the fix is to remove `fork_context` for model-routed lanes or intentionally accept inherited model for exact full-history fork. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
+When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid, and blocks `agent_type=explorer` paired with forbidden frontier models. The fix is to remove `fork_context` for model-routed lanes, intentionally accept inherited model for exact full-history fork, or change frontier critic/architecture lanes to `agent_type=default`. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
 
 ## Design Basis
 
@@ -131,7 +131,8 @@ If only `models.explorer` is set, the first model is treated as the scout guidan
   "models": {
     "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
     "explorerPreferred": "gpt-5.3-codex-spark",
-    "explorerFallback": "gpt-5.4-mini"
+    "explorerFallback": "gpt-5.4-mini",
+    "explorerForbidden": ["gpt-5.5"]
   },
   "defaults": {
     "agentCap": 6,
@@ -148,6 +149,7 @@ Environment overrides are also supported:
 - `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated compatibility shortcut for scout/default guidance models. This does not create an `agent_type` allow-list; omitted model is still invalid, and is blocked when Codex emits a supported `PreToolUse` event for the spawn path.
 - `NATIVE_AGENT_POOL_EXPLORER_MODEL`: preferred explorer model.
 - `NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL`: fallback explorer model.
+- `NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS`: comma-separated models that must not be paired with native `agent_type=explorer`; defaults to `gpt-5.5`.
 - `NATIVE_AGENT_POOL_DEFAULT_CAP`: fallback cap when `[agents].max_threads` is absent.
 - `NATIVE_AGENT_POOL_WARN_REMAINING`: advisory threshold near the cap.
 - `NATIVE_AGENT_POOL_STATE_DB_PATH` or `NATIVE_AGENT_POOL_STATE_DB_NAME`: native DB override.

@@ -452,7 +452,7 @@ test("post-tool advisory reports missing model when spawn hook was bypassed", as
   });
 });
 
-test("allows explicit frontier model for critic roles", async () => {
+test("allows explicit frontier model for default critic lanes", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const output = await runHook(home, {
@@ -460,7 +460,7 @@ test("allows explicit frontier model for critic roles", async () => {
       tool_name: "spawn_agent",
       session_id: "parent1",
       tool_input: {
-        agent_type: "critic",
+        agent_type: "default",
         model: "gpt-5.5",
         reasoning_effort: "high",
         message: "Review architecture risk.",
@@ -530,7 +530,7 @@ test("pending pre-spawn reservation serializes same-turn follow-up spawns", asyn
   });
 });
 
-test("does not block explicit frontier model solely because agent_type is explorer", async () => {
+test("blocks explorer role when it explicitly selects a frontier model", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const output = await runHook(home, {
@@ -545,8 +545,32 @@ test("does not block explicit frontier model solely because agent_type is explor
       },
     });
 
+    assert.equal(output?.decision, "block");
+    assert.match(output.reason, /Explorer\/frontier route violation/);
+    assert.match(output.reason, /agent_type=default/);
+    assert.match(output.reason, /Explorer lanes/);
+  });
+});
+
+test("post-tool advisory reports explorer frontier route violation when spawn hook was bypassed", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.5",
+        reasoning_effort: "high",
+        message: "Architecture critic lane using explicit frontier model.",
+      },
+      tool_response: { agent_id: "child1", nickname: "Hubble" },
+    });
+
     assert.notEqual(output?.decision, "block");
-    assert.doesNotMatch(output?.hookSpecificOutput?.additionalContext ?? "", /Explorer native spawn is blocked/);
+    assert.match(output.hookSpecificOutput.additionalContext, /Explorer\/frontier route violation observed after tool execution/);
+    assert.match(output.hookSpecificOutput.additionalContext, /frontier critic\/architecture lanes must use agent_type=default/i);
   });
 });
 
@@ -1978,6 +2002,41 @@ test("live-check allows boolean fork_context spawn without explicit model", asyn
     assert.equal(output.ok, true);
     assert.equal(output.spawn_calls[0].fork_context, true);
     assert.equal(output.spawn_calls[0].has_model, false);
+  });
+});
+
+test("live-check detects explorer role using explicit frontier model", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','closed');"
+        + "insert into threads values ('child1','/tmp/child.jsonl','Frontier Explorer','explorer','gpt-5.5','high','Hubble','/tmp',1779074894);",
+    );
+    const transcript = join(home, "parent-explorer-frontier.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.5\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"Architecture critic lane using explicit frontier model.\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Hubble\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.verdict, "native_explorer_frontier_model_violation");
+    const check = output.checks.find((item) => item.name === "no_explorer_frontier_spawn_created");
+    assert.equal(check.status, "fail");
+    assert.match(check.evidence, /tool_role=explorer/);
+    assert.match(check.evidence, /native_model=gpt-5\.5/);
+    assert.equal(output.spawn_calls[0].explorer_frontier_violation, true);
   });
 });
 

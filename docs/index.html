@@ -472,6 +472,10 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
                   <td>Compatibility shortcut for scout/default guidance model names. It is prompt guidance only, not an <code>agent_type</code> allow-list.</td>
                 </tr>
                 <tr>
+                  <th><code>models.explorerForbidden</code></th>
+                  <td>Models that cannot be paired with native <code>agent_type=explorer</code>; default frontier critic lanes should use <code>agent_type=default</code>.</td>
+                </tr>
+                <tr>
                   <th><code>defaults.agentCap</code></th>
                   <td>Fallback cap when <code>[agents].max_threads</code> is absent.</td>
                 </tr>
@@ -490,7 +494,8 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
   "models": {
     "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
     "explorerPreferred": "gpt-5.3-codex-spark",
-    "explorerFallback": "gpt-5.4-mini"
+    "explorerFallback": "gpt-5.4-mini",
+    "explorerForbidden": ["gpt-5.5"]
   },
   "defaults": {
     "agentCap": 6,
@@ -520,7 +525,7 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
             </article>
             <article class="card">
               <h3>Hook boundary</h3>
-              <p>The hook only enforces observable runtime safety. It requires explicit model input, but the parent leader still decides whether Spark, mini, or frontier owns the next reasoning step.</p>
+              <p>The hook enforces observable runtime safety and spawn-shape coherence. The parent still chooses the model, but frontier lanes must not be disguised as native explorer lanes.</p>
             </article>
             <article class="card">
               <h3>Reuse before spawn</h3>

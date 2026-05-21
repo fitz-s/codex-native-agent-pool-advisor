@@ -39,8 +39,9 @@ The correct system preserves subagents as context-isolation lanes while making f
 3. Model boundary:
    - Every non-fork `spawn_agent` tool input must include a non-empty string `model`.
    - Boolean `fork_context=true` without `model` is the only inheritance exception.
-   - `agent_type` is never the model-routing authority.
-   - `live-check` must catch missing-model bypasses and tool-model/native-model mismatches.
+   - `agent_type` is never the semantic model-routing authority, but the native role/model pair must be coherent.
+   - `agent_type=explorer` with a forbidden frontier model is invalid shape; use `agent_type=default` for frontier critic/architecture/high-risk lanes.
+   - `live-check` must catch missing-model bypasses, tool-model/native-model mismatches, and explorer/frontier role-shape violations.
 
 4. Lane lifecycle:
    - Treat subagents as reusable context lanes.

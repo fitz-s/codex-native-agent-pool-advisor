@@ -29,6 +29,7 @@ const COMMAND_NAME = "native-agent-pool-advisor";
 const DEFAULT_STATE_DB_NAME = "state_5.sqlite";
 const DEFAULT_EXPLORER_MODEL = "gpt-5.3-codex-spark";
 const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.4-mini";
+const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.5"];
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
 let runtimeOptionsCache = {
@@ -38,6 +39,7 @@ let runtimeOptionsCache = {
   stateDbPathOverride: "",
   explorerPreferredModel: DEFAULT_EXPLORER_MODEL,
   explorerFallbackModel: DEFAULT_EXPLORER_FALLBACK_MODEL,
+  explorerForbiddenModels: [...DEFAULT_EXPLORER_FORBIDDEN_MODELS],
 };
 
 function safeString(value) {
@@ -203,6 +205,14 @@ async function loadRuntimeOptions() {
     explicitExplorerModels[0],
     DEFAULT_EXPLORER_FALLBACK_MODEL,
   );
+  const forbiddenExplorerModels = parseStringList(
+    process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS
+      ?? models.explorer_forbidden
+      ?? models.explorerForbidden
+      ?? models.forbiddenExplorer
+      ?? models.forbidden_explorer
+      ?? DEFAULT_EXPLORER_FORBIDDEN_MODELS,
+  );
 
   runtimeOptionsCache = {
     defaultAgentCap: readFirstPositiveInteger(
@@ -231,6 +241,9 @@ async function loadRuntimeOptions() {
     ),
     explorerPreferredModel: preferred,
     explorerFallbackModel: fallback,
+    explorerForbiddenModels: forbiddenExplorerModels.length > 0
+      ? forbiddenExplorerModels
+      : [...DEFAULT_EXPLORER_FORBIDDEN_MODELS],
   };
 }
 
@@ -261,6 +274,14 @@ function explorerModel() {
 
 function explorerFallbackModel() {
   return runtimeOptionsCache.explorerFallbackModel || DEFAULT_EXPLORER_FALLBACK_MODEL;
+}
+
+function explorerForbiddenModels() {
+  const configured = Array.isArray(runtimeOptionsCache.explorerForbiddenModels)
+    ? runtimeOptionsCache.explorerForbiddenModels
+    : [];
+  const models = configured.map((model) => safeString(model).trim()).filter(Boolean);
+  return models.length > 0 ? models : [...DEFAULT_EXPLORER_FORBIDDEN_MODELS];
 }
 
 function warnRemaining() {
@@ -1323,6 +1344,19 @@ function operationModel(operation) {
   return safeString(operation?.input?.model).trim();
 }
 
+function normalizeAgentRole(value) {
+  return safeString(value).trim().toLowerCase().replace(/^functions\./, "");
+}
+
+function operationAgentRole(operation) {
+  return normalizeAgentRole(
+    operation?.input?.agent_type
+      ?? operation?.input?.agentType
+      ?? operation?.input?.role
+      ?? operation?.input?.type,
+  );
+}
+
 function operationForkContext(operation) {
   const value = operation?.input?.fork_context ?? operation?.input?.forkContext;
   return value === true;
@@ -1356,6 +1390,22 @@ function hasMissingSpawnModelInOperations(operations) {
     if (operationForkContext(operation)) return false;
     return !operationModel(operation);
   });
+}
+
+function explorerForbiddenModelViolations(operations) {
+  const forbidden = new Set(explorerForbiddenModels().map((model) => model.toLowerCase()));
+  return operations.filter((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    if (operationForkContext(operation)) return false;
+    const role = operationAgentRole(operation);
+    if (role !== "explorer" && role !== "explore") return false;
+    const model = operationModel(operation).toLowerCase();
+    return Boolean(model && forbidden.has(model));
+  });
+}
+
+function hasExplorerForbiddenModelInOperations(operations) {
+  return explorerForbiddenModelViolations(operations).length > 0;
 }
 
 function toolResponse(payload) {
@@ -1838,6 +1888,7 @@ function buildSubagentModelSelectionGuidance() {
     `Use model="${explorerModel()}" only for read-only scout output: grep/file maps, symbol/log filters, candidate file:line anchors, or hypotheses with a strict output cap and no durable verdict.`,
     `Use model="${explorerFallbackModel()}" for multi-hop tracing, compact synthesis, bounded verification, config/test interpretation, or light low-risk execution where the child owns a durable conclusion.`,
     `Use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`,
+    `Do not set agent_type=explorer with model="${explorerForbiddenModels().join("|")}". Frontier critic/architecture/high-risk lanes must use agent_type=default; explorer lanes must use ${explorerModel()} or ${explorerFallbackModel()}.`,
     "Do not combine fork_context=true with model. If you need Spark/mini/frontier model routing, remove fork_context and pass a compact context packet in message/items. Use fork_context=true without model only when exact full-history context matters more than model routing; that path may inherit the parent model.",
     "If you cannot state the child output cap and stop condition, do not use Spark; slice locally first or choose mini.",
     "Capacity is a separate decision: without runtime reservation, do not submit multiple spawn_agent calls in one tool batch; spawn one child, let runtime record it, then re-check observed_free.",
@@ -2040,6 +2091,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   if (isChildSession) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
+  if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.native_edge_failed) return true;
   if ((summary.pending_spawn_reservations ?? 0) > 0) return true;
   if (requestedSpawns > 1) return true;
@@ -2059,6 +2111,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   const ops = operations ?? agentOperations({}, name);
   if (ops.length === 0) return false;
   if (hasMissingSpawnModelInOperations(ops)) return true;
+  if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
   if (hasForkContextModelInheritanceInOperations(ops)) return true;
@@ -2072,6 +2125,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const missingSpawnModel = checkSpawnShape && hasMissingSpawnModelInOperations(ops);
   const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
   const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
+  const explorerForbiddenModel = checkSpawnShape && hasExplorerForbiddenModelInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
   const snapshot = capacitySnapshot(summary, cap, requestedSpawns);
   const multiSpawnWithoutReservation = requestedSpawns > 1 && !snapshot.runtime_reservation;
@@ -2102,6 +2156,11 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
         ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
         : `Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision unless fork_context=true was intentionally used for exact full-history inheritance. Future non-fork spawns must include the model field in the tool input.`)
       : null,
+    explorerForbiddenModel
+      ? (blockSpawn
+        ? `Explorer/frontier route violation: native agent_type=explorer cannot use model="${explorerForbiddenModels().join("|")}". Explorer lanes are for scout/anchor work and should use ${explorerModel()} or ${explorerFallbackModel()}; if this is truly critic, architecture, security, high-risk, live-money judgment, or final approval, change the native role to agent_type=default and keep the explicit frontier model.`
+        : `Explorer/frontier route violation observed after tool execution: a spawn_agent call used native agent_type=explorer with a forbidden frontier model. Future frontier critic/architecture lanes must use agent_type=default; future explorer lanes must use ${explorerModel()} or ${explorerFallbackModel()}.`)
+      : null,
     forkContextModelInheritance
       ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for explorer/scout/mini routing, remove fork_context and pass compact context instead."
       : null,
@@ -2116,6 +2175,8 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
         ? "Correct the spawn shape and retry only one corrected spawn call after the refreshed observed_free check; do not treat this as a consumed native slot or as proof the pool is full."
         : missingSpawnModel
         ? "Retry only after making model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and the corrected call must still fit observed_free."
+        : explorerForbiddenModel
+        ? "Retry only after correcting the role/model shape: explorer with Spark/mini for scout work, or default with explicit frontier model for critic/architecture/high-risk judgment. Do not re-label a frontier critic lane as explorer."
         : multiSpawnWithoutReservation
         ? "Retry as a single spawn call, then resample capacity before launching another child; do not restate every child prompt after a batch block."
         : isChildSession

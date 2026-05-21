@@ -45,6 +45,7 @@ const CLOSE_RELEASE_NOT_FOUND_PATTERNS = [
   /no such agent/i,
   /invalid agent(?: id)?/i,
 ];
+const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.5"];
 
 function usage() {
   return [
@@ -151,6 +152,23 @@ function preview(value, length = 140) {
 
 function explicitString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeRole(value) {
+  return explicitString(value).toLowerCase();
+}
+
+function forbiddenExplorerModels() {
+  const raw = typeof process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS === "string"
+    ? process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS
+    : "";
+  const models = raw.split(",").map((item) => item.trim()).filter(Boolean);
+  return new Set((models.length > 0 ? models : DEFAULT_EXPLORER_FORBIDDEN_MODELS).map((model) => model.toLowerCase()));
+}
+
+function isExplorerRole(value) {
+  const role = normalizeRole(value);
+  return role === "explorer" || role === "explore";
 }
 
 function hasExplicitString(value) {
@@ -439,6 +457,7 @@ async function main() {
   const spawnCallsMissingOutput = spawnCalls.filter((call) => !call.output);
   const missingModelSpawns = spawnCalls.filter((call) => !call.fork_context && !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
+  const explorerForbidden = forbiddenExplorerModels();
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
   const edgeByChild = new Map(edges.rows.map((row) => [row.child_thread_id, row]));
@@ -462,6 +481,12 @@ async function main() {
     if (!report.call.model) return false;
     return report.edge?.model !== report.call.model;
   });
+  const explorerFrontierReports = spawnReports.filter((report) => {
+    if (report.call.fork_context) return false;
+    if (!report.call.has_model) return false;
+    const toolModel = explicitString(report.call.model).toLowerCase();
+    return isExplorerRole(report.call.agent_type) && explorerForbidden.has(toolModel);
+  });
   const expectedModels = Array.isArray(args.expectModels) ? args.expectModels.filter(Boolean) : [];
   const checks = [
     buildCheck(
@@ -483,6 +508,15 @@ async function main() {
         ? "every successful explicit-model spawn matches the native DB model"
         : modelMismatchReports.map((report) => {
           return `${report.call.output.agent_id}:tool_model=${report.call.model || "?"}, native_model=${report.edge?.model ?? "missing"}`;
+        }).join(", "),
+    ),
+    buildCheck(
+      "no_explorer_frontier_spawn_created",
+      explorerFrontierReports.length === 0,
+      explorerFrontierReports.length === 0
+        ? "no non-fork explorer spawn used a forbidden frontier model"
+        : explorerFrontierReports.map((report) => {
+          return `${report.call.output.agent_id}:tool_role=${report.call.agent_type || "?"}, tool_model=${report.call.model || "?"}, native_role=${report.edge?.agent_role ?? "missing"}, native_model=${report.edge?.model ?? "missing"}`;
         }).join(", "),
     ),
     buildCheck(
@@ -539,7 +573,9 @@ async function main() {
 
   const result = {
     ok: checkStatus !== "failed",
-    verdict: checkStatus === "failed" && modelMismatchReports.length > 0
+    verdict: checkStatus === "failed" && explorerFrontierReports.length > 0
+      ? "native_explorer_frontier_model_violation"
+      : checkStatus === "failed" && modelMismatchReports.length > 0
       ? "native_spawn_model_mismatch"
       : checkStatus === "failed" && missingModelCreated.length > 0
       ? "native_spawn_missing_model_bypassed_advisor"
@@ -569,6 +605,7 @@ async function main() {
       created_agent_id: call.output?.agent_id || null,
       output_failed: call.output?.failed ?? null,
       native_edge: call.output?.agent_id ? edgeByChild.get(call.output.agent_id) ?? null : null,
+      explorer_frontier_violation: explorerFrontierReports.some((report) => report.call === call),
       message_preview: call.message_preview,
     })),
     model_routes: spawnReports.map((report) => ({
