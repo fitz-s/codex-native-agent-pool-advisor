@@ -356,9 +356,9 @@
 <span class="bad">runtime:</span> native subagent pool is full
 <span class="dim">agent:</span> closing old agents, retrying long prompt...
 
-<span class="good">advisor:</span> occupied=5/6, remaining_spawn_budget=1
-<span class="good">advisor:</span> requested_spawns=2 would exceed cap
-<span class="good">advisor:</span> launch one, or close a current-parent lane first</pre>
+<span class="good">advisor:</span> occupied=5/6, observed_free=1
+<span class="good">advisor:</span> requested_spawns=2, close_needed_for_request=1
+<span class="good">advisor:</span> no batch guarantee: launch one, or close a current-parent lane first</pre>
           </div>
         </section>
 
@@ -374,7 +374,7 @@
             </article>
             <article class="card">
               <h3>Invisible cap hits</h3>
-              <p>Reads per-parent native edge state and injects occupied/remaining budget before launch-heavy turns.</p>
+              <p>Reads per-parent native edge state and injects occupied/observed-free capacity before launch-heavy turns.</p>
             </article>
             <article class="card">
               <h3>Blind retry loops</h3>
@@ -382,7 +382,7 @@
             </article>
             <article class="card">
               <h3>Batch overbooking</h3>
-              <p>Counts nested wrapper calls so two requested spawns consume two slots before approval.</p>
+              <p>Blocks multi-spawn tool batches on supported hook surfaces because observed capacity is not an atomic runtime reservation.</p>
             </article>
             <article class="card">
               <h3>Stale open rows</h3>

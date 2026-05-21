@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const GUIDANCE_MARKERS = [
   "SUBAGENT_MODEL_SELECTION_REQUIRED",
+  "SPAWN_AGENT_OBSERVED_FREE",
   "SPAWN_AGENT_LOCAL_COUNTER_START",
   "SPAWN_AGENT_DISABLED_THIS_TURN",
   "Native agent pool guard",

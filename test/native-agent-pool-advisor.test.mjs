@@ -262,9 +262,11 @@ test("unrelated parent native open edges do not emit zero budget on current prom
     });
     const context = output.hookSpecificOutput.additionalContext;
 
-    assert.match(context, /^SPAWN_AGENT_LOCAL_COUNTER_START=6/);
+    assert.match(context, /^SPAWN_AGENT_OBSERVED_FREE=6/);
+    assert.match(context, /BATCH_SPAWN_GUARANTEE=false/);
+    assert.match(context, /observed_free=6/);
     assert.match(context, /remaining_spawn_budget=6/);
-    assert.doesNotMatch(context, /remaining_spawn_budget is diagnostic capacity, not a batch size/);
+    assert.match(context, /not a guaranteed batch size/);
     assert.match(context, /native_slots=slot_open=0/);
     assert.doesNotMatch(context, /native_global/);
     assert.doesNotMatch(context, /Global native/);
@@ -400,6 +402,42 @@ test("allows mini fallback model for explorer spawns by default", async () => {
     const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
     assert.equal(reservations.length, 1);
     assert.equal(reservations[0].count, 1);
+  });
+});
+
+test("pending pre-spawn reservation serializes same-turn follow-up spawns", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+
+    const first = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "medium",
+        message: "trace first slice",
+      },
+    });
+    assert.notEqual(first?.decision, "block");
+
+    const second = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "medium",
+        message: "trace second slice",
+      },
+    });
+
+    assert.equal(second.decision, "block");
+    assert.match(second.reason, /reserved_spawns=1/);
+    assert.match(second.reason, /pending spawn reservation/);
+    assert.match(second.reason, /resample capacity/);
   });
 });
 
@@ -556,7 +594,7 @@ test("blocks wrapped multi-spawn when requested spawn count exceeds remaining ca
   });
 });
 
-test("allows wrapped multi-spawn when requested count fits remaining capacity", async () => {
+test("blocks wrapped multi-spawn without runtime reservation even when observed capacity fits", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
 
@@ -588,11 +626,11 @@ test("allows wrapped multi-spawn when requested count fits remaining capacity", 
       },
     });
 
-    assert.notEqual(output?.decision, "block");
-    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
-    const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
-    assert.equal(reservations.length, 1);
-    assert.equal(reservations[0].count, 2);
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /requested_spawns=2/);
+    assert.match(output.reason, /batch_guarantee=no/);
+    assert.match(output.reason, /not an atomic runtime reservation/);
+    assert.match(output.reason, /launch one child/);
   });
 });
 
@@ -1435,7 +1473,8 @@ test("runtime cap hit does not override authoritative current-parent native coun
       prompt: "open one more explorer",
     });
     const context = promptOutput.hookSpecificOutput.additionalContext;
-    assert.match(context, /SPAWN_AGENT_LOCAL_COUNTER_START=3/);
+    assert.match(context, /SPAWN_AGENT_OBSERVED_FREE=3/);
+    assert.match(context, /BATCH_SPAWN_GUARANTEE=false/);
     assert.match(context, /occupied=3\/6/);
     assert.match(context, /remaining_spawn_budget=3/);
     assert.match(context, /native_slots=slot_open=3/);
@@ -1646,7 +1685,7 @@ test("session start emits cap pressure after resume before a spawn is attempted"
     assert.match(output.hookSpecificOutput.additionalContext, /occupied=6\/6/);
     assert.match(output.hookSpecificOutput.additionalContext, /remaining_spawn_budget=0/);
     assert.match(output.hookSpecificOutput.additionalContext, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
-    assert.match(output.hookSpecificOutput.additionalContext, /When remaining_spawn_budget is 0, do not call spawn_agent/);
+    assert.match(output.hookSpecificOutput.additionalContext, /When observed_free is 0, do not call spawn_agent/);
     assert.match(output.hookSpecificOutput.additionalContext, /zero-budget snapshot/);
     assert.match(output.hookSpecificOutput.additionalContext, /ZERO_BUDGET_RECOVERY_REQUIRED=true/);
     assert.match(output.hookSpecificOutput.additionalContext, /Do not stop at saying the subagent pool is full/);
@@ -1674,7 +1713,7 @@ test("zero budget guidance rejects send_input and requires capacity refresh afte
     assert.match(context, /ZERO_BUDGET_RECOVERY_REQUIRED=true/);
     assert.match(context, /reuse a compatible current-parent lane with send_input/);
     assert.match(context, /close listed current-parent lane\(s\)/);
-    assert.match(context, /send_input and wait_agent do not increase the spawn budget/);
+    assert.match(context, /send_input and wait_agent do not increase capacity/);
     assert.match(context, /If close_agent succeeds, re-check capacity before any spawn/);
     assert.match(context, /older zero-budget snapshot is no longer authoritative/);
   });
@@ -1701,7 +1740,7 @@ test("prompt-time guidance requires explicit model-selection judgment when spawn
     assert.match(context, /model=\"gpt-5\.5\"/);
     assert.match(context, /strict output cap/);
     assert.match(context, /If you cannot state the child output cap and stop condition, do not use Spark/);
-    assert.match(context, /Multiple child lanes are allowed when each has an independent task contract/);
+    assert.match(context, /do not submit multiple spawn_agent calls in one tool batch/);
     assert.match(context, /large-context repos, first make a local module\/file map/);
     assert.match(context, /This judgment step is mandatory/);
     assert.match(context, /omitted model inherits the parent frontier model/);

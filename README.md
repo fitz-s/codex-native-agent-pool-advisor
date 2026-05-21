@@ -35,7 +35,8 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Successful `spawn_agent` consumes a slot immediately in the local ledger. If native `thread_spawn_edges` is readable but has not caught up yet, that ledger lag still counts against admission until a matching native row appears, the lane closes, or the local running-lane TTL expires.
 - A capacity-failed spawn consumes no new slot but sets pressure to full.
 - A historical cap-hit before the latest successful close/repair/reset is diagnostic. A runtime cap-hit after that point blocks further spawns only when current native edge state is unreadable. If current parent/session native rows are readable, admission follows the scoped open-edge count plus pending reservations; stale `task_complete` open edges self-heal to `closed` and do not turn a one-open state into zero budget.
-- Positive `remaining_spawn_budget` is physical capacity. Multiple subagents may be launched together when `requested_spawns <= remaining_spawn_budget` and each lane has an independent task contract.
+- `observed_free` is the current parent/session free-slot snapshot. `remaining_spawn_budget` is kept only as a compatibility alias for that observed count; it is not an atomic runtime reservation and should not be treated as a guaranteed batch size.
+- Without a Codex runtime reservation primitive, launch sequencing is deliberately conservative: create one new child, let `PostToolUse` and native edge state record the result, then re-check capacity before creating another child. A supported `PreToolUse` surface blocks multiple `spawn_agent` requests in one tool operation because partial batch success is the context-wasting failure this project is designed to avoid.
 - `wait_agent`, child completion notifications, and `send_input` do not by themselves free a native slot.
 - Native `open` rows whose child transcript already has `task_complete` are stale persistence edges. The hook self-heals those rows to `closed` and excludes them from current runtime occupancy.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
@@ -184,7 +185,7 @@ npm run check
 npm test
 ```
 
-The test suite covers hook-script behavior: wrapper-spawn blocking, multi-spawn budget accounting, native-DB-lag ledger accounting, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
+The test suite covers hook-script behavior: wrapper-spawn blocking, no-reservation multi-spawn blocking, native-DB-lag ledger accounting, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
 
 For real end-to-end evidence from Codex Desktop or CLI, inspect the actual parent transcript after a spawn attempt:
 
@@ -217,7 +218,7 @@ node scripts/live-check.mjs \
   --allow-missing-guidance
 ```
 
-At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent. If a later close succeeds, run a fresh hook/live check and use the updated budget instead of the stale zero-budget prompt.
+At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, `observed_free=0`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent. If a later close succeeds, run a fresh hook/live check and use the updated observed snapshot instead of the stale zero-budget prompt.
 
 ## Known Limits
 
