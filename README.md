@@ -49,8 +49,7 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
 - Full-history fork is the exception to model routing. If the runtime rejects `fork_context=true` together with `model`, use either `fork_context=true` without `model` and accept inherited parent model, or remove `fork_context` and pass a compact context packet with an explicit Spark/mini/frontier model. A fork/model shape failure is not native-pool exhaustion and should be retried only with corrected shape and positive budget.
 - The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection with an output cap and stop condition. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.
-- Explorer model allow-list defaults to `gpt-5.3-codex-spark,gpt-5.4-mini`, so lookup lanes cannot silently spend `gpt-5.5`.
-- The hook does not block Spark because a prompt looks "complex"; it emits a pre-spawn decision contract and lets the parent agent choose. `Analyze`, `review`, `read-only`, and `bounded` are not model choices by themselves.
+- The hook does not choose by `agent_type`. It enforces the explicit `model` field, not a role label. `Analyze`, `review`, `read-only`, and `bounded` are not model choices by themselves.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
@@ -96,7 +95,7 @@ Route by output contract, risk, and context-state depth, not by complexity adjec
 
 For broad, compiled, vendor, or large-context repos, do a local `rg`/module map first. Then send Spark exact slices for anchors, not the whole tree. Use mini for synthesis once the slices exist. If two scout lanes fail or compact on context, stop spawning, shrink the slice locally, and reuse or close current lanes before trying again.
 
-When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid; the fix is to remove `fork_context` for model-routed lanes or intentionally accept inherited model for exact full-history fork. It also blocks explorer spawns that choose a model outside the configured explorer allow-list, and only advises when a Spark or mini prompt looks mismatched to the lane. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
+When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid; the fix is to remove `fork_context` for model-routed lanes or intentionally accept inherited model for exact full-history fork. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
 
 ## Design Basis
 
@@ -110,7 +109,7 @@ This project follows OpenAI's public agent guidance rather than a local complexi
 ## Configuration
 
 Create `$CODEX_HOME/native-agent-pool-advisor.config.json` when your Codex install uses different model names, a different fallback cap, or a different native state DB name.
-If only `models.explorer` is set, the first model is treated as preferred and the second as fallback.
+If only `models.explorer` is set, the first model is treated as the scout guidance model and the second as the default fallback guidance model. This is prompt guidance only; it is not an `agent_type` allow-list.
 
 ```json
 {
@@ -131,7 +130,7 @@ If only `models.explorer` is set, the first model is treated as preferred and th
 
 Environment overrides are also supported:
 
-- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated explorer allow-list. This does not change the global default: omitted model is still invalid, and is blocked when Codex emits a supported `PreToolUse` event for the spawn path.
+- `NATIVE_AGENT_POOL_EXPLORER_MODELS`: comma-separated compatibility shortcut for scout/default guidance models. This does not create an `agent_type` allow-list; omitted model is still invalid, and is blocked when Codex emits a supported `PreToolUse` event for the spawn path.
 - `NATIVE_AGENT_POOL_EXPLORER_MODEL`: preferred explorer model.
 - `NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL`: fallback explorer model.
 - `NATIVE_AGENT_POOL_DEFAULT_CAP`: fallback cap when `[agents].max_threads` is absent.
@@ -185,7 +184,7 @@ npm run check
 npm test
 ```
 
-The test suite covers hook-script behavior: wrapper-spawn blocking, no-reservation multi-spawn blocking, native-DB-lag ledger accounting, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
+The test suite covers hook-script behavior: wrapper-spawn blocking, no-reservation multi-spawn blocking, native-DB-lag ledger accounting, explicit model enforcement when `PreToolUse` is emitted, strict model/fork shape normalization, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
 
 For real end-to-end evidence from Codex Desktop or CLI, inspect the actual parent transcript after a spawn attempt:
 

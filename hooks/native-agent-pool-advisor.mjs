@@ -38,7 +38,6 @@ let runtimeOptionsCache = {
   stateDbPathOverride: "",
   explorerPreferredModel: DEFAULT_EXPLORER_MODEL,
   explorerFallbackModel: DEFAULT_EXPLORER_FALLBACK_MODEL,
-  explorerAllowedModels: [DEFAULT_EXPLORER_MODEL, DEFAULT_EXPLORER_FALLBACK_MODEL],
 };
 
 function safeString(value) {
@@ -148,10 +147,6 @@ function parseStringList(value) {
     .filter(Boolean);
 }
 
-function uniqueStrings(values) {
-  return [...new Set(values.map((value) => safeString(value).trim()).filter(Boolean))];
-}
-
 function readFirstString(...values) {
   for (const value of values) {
     const text = safeString(value).trim();
@@ -236,11 +231,6 @@ async function loadRuntimeOptions() {
     ),
     explorerPreferredModel: preferred,
     explorerFallbackModel: fallback,
-    explorerAllowedModels: uniqueStrings([
-      ...explicitExplorerModels,
-      preferred,
-      fallback,
-    ]),
   };
 }
 
@@ -271,15 +261,6 @@ function explorerModel() {
 
 function explorerFallbackModel() {
   return runtimeOptionsCache.explorerFallbackModel || DEFAULT_EXPLORER_FALLBACK_MODEL;
-}
-
-function explorerModels() {
-  const models = runtimeOptionsCache.explorerAllowedModels ?? [];
-  return models.length > 0 ? models : [DEFAULT_EXPLORER_MODEL, DEFAULT_EXPLORER_FALLBACK_MODEL];
-}
-
-function explorerModelListText() {
-  return explorerModels().join(", ");
 }
 
 function warnRemaining() {
@@ -1338,63 +1319,13 @@ function toolInput(payload) {
   return safeObject(payload.tool_input ?? payload.toolInput) ?? {};
 }
 
-function requestedAgentType(payload) {
-  const input = toolInput(payload);
-  return safeString(input.agent_type ?? input.agentType ?? input.role).trim().toLowerCase();
-}
-
-function requestedModel(payload) {
-  const input = toolInput(payload);
-  return safeString(input.model).trim();
-}
-
-function isExplorerSpawnInput(payload) {
-  return ["explore", "explorer"].includes(requestedAgentType(payload));
-}
-
-function hasExplorerModelRouteViolation(payload) {
-  if (!isExplorerSpawnInput(payload)) return false;
-  return !explorerModels().includes(requestedModel(payload));
-}
-
-function operationAgentType(operation) {
-  return safeString(operation?.input?.agent_type ?? operation?.input?.agentType ?? operation?.input?.role)
-    .trim()
-    .toLowerCase();
-}
-
 function operationModel(operation) {
   return safeString(operation?.input?.model).trim();
 }
 
 function operationForkContext(operation) {
   const value = operation?.input?.fork_context ?? operation?.input?.forkContext;
-  if (typeof value === "boolean") return value;
-  return /^(?:1|true|yes)$/i.test(safeString(value).trim());
-}
-
-function operationReasoningEffort(operation) {
-  return safeString(operation?.input?.reasoning_effort ?? operation?.input?.reasoningEffort).trim();
-}
-
-function operationPromptText(operation) {
-  const input = safeObject(operation?.input) ?? {};
-  const parts = [
-    input.message,
-    input.prompt,
-    input.task,
-    input.instructions,
-    input.input,
-  ].map(safeString).filter(Boolean);
-  if (Array.isArray(input.items)) {
-    for (const item of input.items) {
-      if (item && typeof item === "object") {
-        parts.push(safeString(item.text));
-        parts.push(safeString(item.name));
-      }
-    }
-  }
-  return parts.filter(Boolean).join("\n");
+  return value === true;
 }
 
 function hasSpawnOperation(operations) {
@@ -1403,15 +1334,6 @@ function hasSpawnOperation(operations) {
 
 function spawnOperationCount(operations) {
   return operations.filter((operation) => operation.name === "spawn_agent").length;
-}
-
-function hasExplorerModelRouteViolationInOperations(operations) {
-  return operations.some((operation) => {
-    if (operation.name !== "spawn_agent") return false;
-    if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    if (operationForkContext(operation) && !operationModel(operation)) return false;
-    return !explorerModels().includes(operationModel(operation));
-  });
 }
 
 function hasForkContextModelConflictInOperations(operations) {
@@ -1434,80 +1356,6 @@ function hasMissingSpawnModelInOperations(operations) {
     if (operationForkContext(operation)) return false;
     return !operationModel(operation);
   });
-}
-
-function countMatches(text, pattern) {
-  return [...safeString(text).matchAll(pattern)].length;
-}
-
-function hasDistinctExplorerFallback() {
-  const preferred = explorerModel();
-  const fallback = explorerFallbackModel();
-  return Boolean(fallback && preferred && fallback !== preferred && explorerModels().includes(fallback));
-}
-
-function looksLikeComplexExplorerPrompt(text) {
-  const raw = safeString(text);
-  const normalized = raw.toLowerCase();
-  if (!normalized.trim()) return false;
-
-  const arrows = countMatches(raw, /(?:->|→)/g);
-  const fileRefs = countMatches(raw, /\b[\w./-]+\.(?:py|ts|tsx|js|mjs|json|toml|yaml|yml|md)\b/g);
-  const reasoningHits = countMatches(
-    normalized,
-    /\b(?:analy[sz]e|trace|classify|determine|whether|verify|validate|audit|review|root cause|policy|strategy|strategic|mathematical|math|sizing|discount|fallback|tests?|settings?|config|runtime|execution|posterior|kelly|semantic|intent|branch|end-to-end|e2e|verdict|conclusion)\b/g,
-  );
-  const hasDomainReasoningMarker = /(?:mathematic|strategic|posterior|kelly|execution-policy|policy mismatch|semantic|live order|limit price|fallbacks?)/i.test(raw);
-  const asksForClassification = /(?:return whether|classify|verdict|conclusion|is intended|bug|mismatch)/i.test(raw);
-
-  return (
-    raw.length > 900
-    || (arrows >= 2 && reasoningHits >= 3)
-    || (fileRefs >= 4 && reasoningHits >= 3)
-    || (hasDomainReasoningMarker && reasoningHits >= 3)
-    || (asksForClassification && reasoningHits >= 4)
-  );
-}
-
-function hasPreferredExplorerContractAdvisoryInOperations(operations) {
-  if (!hasDistinctExplorerFallback()) return false;
-  return operations.some((operation) => {
-    if (operation.name !== "spawn_agent") return false;
-    if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    if (operationModel(operation) !== explorerModel()) return false;
-    const effort = operationReasoningEffort(operation);
-    return (effort && effort !== "low") || looksLikeComplexExplorerPrompt(operationPromptText(operation));
-  });
-}
-
-function looksLikeNarrowScanPrompt(text) {
-  const raw = safeString(text);
-  const normalized = raw.toLowerCase();
-  if (!normalized.trim()) return false;
-  const scanHits = countMatches(
-    normalized,
-    /\b(?:rg|grep|find|search|lookup|map|list|scan|symbols?|references?|callers?|callees?|file:line|anchors?)\b/g,
-  );
-  const conclusionHits = countMatches(
-    normalized,
-    /\b(?:analy[sz]e|synthesize|classify|determine|verdict|conclusion|approve|revise|block|fix|edit|implement)\b/g,
-  );
-  return raw.length <= 500 && scanHits >= 1 && conclusionHits === 0;
-}
-
-function hasFallbackExplorerContractAdvisoryInOperations(operations) {
-  if (!hasDistinctExplorerFallback()) return false;
-  return operations.some((operation) => {
-    if (operation.name !== "spawn_agent") return false;
-    if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
-    if (operationModel(operation) !== explorerFallbackModel()) return false;
-    return looksLikeNarrowScanPrompt(operationPromptText(operation));
-  });
-}
-
-function hasExplorerContractAdvisoryInOperations(operations) {
-  return hasPreferredExplorerContractAdvisoryInOperations(operations)
-    || hasFallbackExplorerContractAdvisoryInOperations(operations);
 }
 
 function toolResponse(payload) {
@@ -2191,7 +2039,6 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   if (isChildSession) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
-  if (hasExplorerModelRouteViolationInOperations(ops)) return true;
   if (summary.native_edge_failed) return true;
   if ((summary.pending_spawn_reservations ?? 0) > 0) return true;
   if (requestedSpawns > 1) return true;
@@ -2210,10 +2057,10 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
 function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   const ops = operations ?? agentOperations({}, name);
   if (ops.length === 0) return false;
+  if (hasMissingSpawnModelInOperations(ops)) return true;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
   if (hasForkContextModelInheritanceInOperations(ops)) return true;
-  if (hasExplorerContractAdvisoryInOperations(ops)) return true;
   const threshold = Math.max(1, cap - warnRemaining());
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
 }
@@ -2224,9 +2071,6 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const missingSpawnModel = checkSpawnShape && hasMissingSpawnModelInOperations(ops);
   const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
   const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
-  const explorerModelRouteViolation = checkSpawnShape && hasExplorerModelRouteViolationInOperations(ops);
-  const preferredExplorerContractAdvisory = checkSpawnShape && hasPreferredExplorerContractAdvisoryInOperations(ops);
-  const fallbackExplorerContractAdvisory = checkSpawnShape && hasFallbackExplorerContractAdvisoryInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
   const snapshot = capacitySnapshot(summary, cap, requestedSpawns);
   const multiSpawnWithoutReservation = requestedSpawns > 1 && !snapshot.runtime_reservation;
@@ -2253,22 +2097,15 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry one corrected spawn only after a refreshed observed_free snapshot is positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
       : null,
     missingSpawnModel
-      ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+      ? (blockSpawn
+        ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+        : `Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision unless fork_context=true was intentionally used for exact full-history inheritance. Future non-fork spawns must include the model field in the tool input.`)
       : null,
     forkContextModelInheritance
       ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for explorer/scout/mini routing, remove fork_context and pass compact context instead."
       : null,
-    explorerModelRouteViolation
-      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for capped scout/probe anchors and ${explorerFallbackModel()} for reasoning explorer, synthesis, verification, or light executor work. Do not inherit a frontier model for read-only lookup.`
-      : null,
     multiSpawnWithoutReservation
       ? "Multiple spawn_agent calls in one tool operation are blocked because observed_free is not an atomic runtime reservation. Split the batch: launch one child, let PostToolUse/native state record the result, then re-check observed_free before the next child."
-      : null,
-    preferredExplorerContractAdvisory
-      ? `Explorer route advisory, not a block: ${explorerModel()} is useful even inside complex work when the output contract is scout/anchor collection. Keep the prompt bounded with exact scope, file:line evidence, output cap, and stop condition; if the child must synthesize a durable verdict, edit files, approve a claim, or repeatedly compact, route that follow-up to ${explorerFallbackModel()} or a frontier reviewer.`
-      : null,
-    fallbackExplorerContractAdvisory
-      ? `Explorer route advisory, not a block: this looks like a narrow scan that ${explorerModel()} can usually handle faster. ${explorerFallbackModel()} remains valid when you want more synthesis, resilience, or light execution, but do not spend the reasoning lane on disposable grep unless the context lane is already useful.`
       : null,
     blockSpawn && isChildSession
       ? "Nested native spawn is blocked: child sessions cannot create subagents; the parent leader owns delegation."
@@ -2278,8 +2115,6 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
         ? "Correct the spawn shape and retry only one corrected spawn call after the refreshed observed_free check; do not treat this as a consumed native slot or as proof the pool is full."
         : missingSpawnModel
         ? "Retry only after making model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and the corrected call must still fit observed_free."
-        : explorerModelRouteViolation
-        ? "Retry explorer spawn only after correcting the explicit model route, and only if the refreshed observed_free snapshot still has capacity."
         : multiSpawnWithoutReservation
         ? "Retry as a single spawn call, then resample capacity before launching another child; do not restate every child prompt after a batch block."
         : isChildSession

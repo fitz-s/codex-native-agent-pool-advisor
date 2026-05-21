@@ -142,6 +142,18 @@ function preview(value, length = 140) {
   return text.length > length ? `${text.slice(0, length - 3)}...` : text;
 }
 
+function explicitString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function hasExplicitString(value) {
+  return explicitString(value).length > 0;
+}
+
+function hasBooleanForkContext(args) {
+  return (args?.fork_context ?? args?.forkContext) === true;
+}
+
 function parseOutputAgentId(value) {
   const parsed = typeof value === "string" ? safeJson(value) : value;
   if (parsed && typeof parsed === "object" && typeof parsed.agent_id === "string") return parsed.agent_id;
@@ -280,11 +292,12 @@ function readTranscript(text, sinceLine) {
           source: "direct",
           name,
           agent_type: args.agent_type ?? "",
-          model: args.model ?? "",
+          model: explicitString(args.model),
           reasoning_effort: args.reasoning_effort ?? "",
+          fork_context: hasBooleanForkContext(args),
           target: args.target ?? "",
           message_preview: preview(args.message),
-          has_model: Boolean(args.model),
+          has_model: hasExplicitString(args.model),
         });
         if (name === "spawn_agent") {
           pendingSpawnBatch.push(lineNumber);
@@ -306,11 +319,12 @@ function readTranscript(text, sinceLine) {
             source: "nested",
             name: operation.name,
             agent_type: args.agent_type ?? "",
-            model: args.model ?? "",
+            model: explicitString(args.model),
             reasoning_effort: args.reasoning_effort ?? "",
+            fork_context: hasBooleanForkContext(args),
             target: args.target ?? "",
             message_preview: preview(args.message),
-            has_model: Boolean(args.model),
+            has_model: hasExplicitString(args.model),
           });
           if (operation.name === "spawn_agent") pendingSpawnBatch.push(lineNumber);
           else flushSpawnBatch();
@@ -411,7 +425,7 @@ async function main() {
   const spawnBatches = transcript.spawnBatches ?? [];
   const failedSpawnCalls = spawnCalls.filter((call) => call.output?.failed);
   const spawnCallsMissingOutput = spawnCalls.filter((call) => !call.output);
-  const missingModelSpawns = spawnCalls.filter((call) => !call.has_model);
+  const missingModelSpawns = spawnCalls.filter((call) => !call.fork_context && !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
@@ -432,6 +446,10 @@ async function main() {
       closed: Boolean(edge?.status === "closed" && closeTargetSet.has(call.output.agent_id)),
     };
   });
+  const modelMismatchReports = spawnReports.filter((report) => {
+    if (!report.call.model) return false;
+    return report.edge?.model !== report.call.model;
+  });
   const expectedModels = Array.isArray(args.expectModels) ? args.expectModels.filter(Boolean) : [];
   const checks = [
     buildCheck(
@@ -445,6 +463,15 @@ async function main() {
       missingModelCreated.length === 0
         ? "no missing-model spawn created a child"
         : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
+    ),
+    buildCheck(
+      "tool_model_matches_native",
+      modelMismatchReports.length === 0,
+      modelMismatchReports.length === 0
+        ? "every successful explicit-model spawn matches the native DB model"
+        : modelMismatchReports.map((report) => {
+          return `${report.call.output.agent_id}:tool_model=${report.call.model || "?"}, native_model=${report.edge?.model ?? "missing"}`;
+        }).join(", "),
     ),
     buildCheck(
       "spawn_outputs_observed",
@@ -500,7 +527,9 @@ async function main() {
 
   const result = {
     ok: checkStatus !== "failed",
-    verdict: checkStatus === "failed" && missingModelCreated.length > 0
+    verdict: checkStatus === "failed" && modelMismatchReports.length > 0
+      ? "native_spawn_model_mismatch"
+      : checkStatus === "failed" && missingModelCreated.length > 0
       ? "native_spawn_missing_model_bypassed_advisor"
       : checkStatus === "failed"
       ? "live_check_failed"
@@ -522,6 +551,7 @@ async function main() {
       agent_type: call.agent_type,
       model: call.model || null,
       reasoning_effort: call.reasoning_effort || null,
+      fork_context: call.fork_context,
       has_model: call.has_model,
       output_line: call.output?.line ?? null,
       created_agent_id: call.output?.agent_id || null,

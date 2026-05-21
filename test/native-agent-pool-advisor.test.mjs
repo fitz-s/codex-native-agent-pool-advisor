@@ -318,6 +318,29 @@ test("blocks non-explorer spawns that omit explicit model selection", async () =
   });
 });
 
+test("treats null blank and non-string model values as missing model selection", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const badModels = [null, "", "   ", { name: "gpt-5.4-mini" }];
+    for (let index = 0; index < badModels.length; index += 1) {
+      const output = await runHook(home, {
+        hook_event_name: "PreToolUse",
+        tool_name: "spawn_agent",
+        session_id: `parent-bad-model-${index}`,
+        tool_input: {
+          agent_type: "explorer",
+          model: badModels[index],
+          reasoning_effort: "low",
+          message: "map files",
+        },
+      });
+
+      assert.equal(output.decision, "block");
+      assert.match(output.reason, /explicit model/);
+    }
+  });
+});
+
 test("blocks fork_context spawn when it also specifies model", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -342,6 +365,26 @@ test("blocks fork_context spawn when it also specifies model", async () => {
   });
 });
 
+test("does not treat string fork_context as the model-inheritance exception", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        fork_context: "true",
+        reasoning_effort: "medium",
+        message: "Trace with exact full history.",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /explicit model/);
+  });
+});
+
 test("allows fork_context without model but warns about inherited model exception", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -360,6 +403,27 @@ test("allows fork_context without model but warns about inherited model exceptio
     assert.notEqual(output?.decision, "block");
     assert.match(output.hookSpecificOutput.additionalContext, /Fork-context model inheritance exception/);
     assert.match(output.hookSpecificOutput.additionalContext, /remove fork_context and pass compact context/);
+  });
+});
+
+test("post-tool advisory reports missing model when spawn hook was bypassed", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+      tool_response: { agent_id: "child1", nickname: "Scout" },
+    });
+
+    assert.notEqual(output?.decision, "block");
+    assert.match(output.hookSpecificOutput.additionalContext, /Missing model route violation observed after tool execution/);
+    assert.match(output.hookSpecificOutput.additionalContext, /spawn_agent ran without an explicit model/);
   });
 });
 
@@ -441,7 +505,7 @@ test("pending pre-spawn reservation serializes same-turn follow-up spawns", asyn
   });
 });
 
-test("advises on broad spark explorer prompts without blocking the spawn", async () => {
+test("does not block explicit frontier model solely because agent_type is explorer", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const output = await runHook(home, {
@@ -450,106 +514,14 @@ test("advises on broad spark explorer prompts without blocking the spawn", async
       session_id: "parent1",
       tool_input: {
         agent_type: "explorer",
-        model: "gpt-5.3-codex-spark",
-        reasoning_effort: "low",
-        message: [
-          "Read-only investigation in /repo.",
-          "Task: analyze whether submitted live order prices were mathematically/strategically correct or too far below ask to ever fill.",
-          "Trace posterior -> snapshot VWMP/best ask -> compute_native_limit_price -> passive/marketable branch -> Kelly sizing and discounts/fallbacks.",
-          "Inspect src/engine/cycle_runtime.py, src/contracts/semantic_types.py, src/contracts/execution_intent.py, src/engine/evaluator.py, settings, and tests.",
-          "Return whether this is intended post_only maker behavior, a limit price math bug, a Kelly/discount fallback, or an execution-policy mismatch.",
-        ].join(" "),
+        model: "gpt-5.5",
+        reasoning_effort: "high",
+        message: "Architecture critic lane using explicit frontier model.",
       },
     });
 
     assert.notEqual(output?.decision, "block");
-    assert.match(output.hookSpecificOutput.additionalContext, /Explorer route advisory, not a block/);
-    assert.match(output.hookSpecificOutput.additionalContext, /scout\/anchor collection/);
-    assert.match(output.hookSpecificOutput.additionalContext, /gpt-5\.4-mini/);
-  });
-});
-
-test("advises on non-low reasoning spark explorer route without blocking", async () => {
-  await withHome(async (home) => {
-    await createNativeTables(home);
-    const output = await runHook(home, {
-      hook_event_name: "PreToolUse",
-      tool_name: "spawn_agent",
-      session_id: "parent1",
-      tool_input: {
-        agent_type: "explorer",
-        model: "gpt-5.3-codex-spark",
-        reasoning_effort: "medium",
-        message: "Find all references to compute_native_limit_price.",
-      },
-    });
-
-    assert.notEqual(output?.decision, "block");
-    assert.match(output.hookSpecificOutput.additionalContext, /Explorer route advisory, not a block/);
-    assert.match(output.hookSpecificOutput.additionalContext, /output contract is scout\/anchor collection/);
-    assert.match(output.hookSpecificOutput.additionalContext, /gpt-5\.4-mini/);
-  });
-});
-
-test("advises when mini is used for disposable narrow scans but still allows it", async () => {
-  await withHome(async (home) => {
-    await createNativeTables(home);
-    const output = await runHook(home, {
-      hook_event_name: "PreToolUse",
-      tool_name: "spawn_agent",
-      session_id: "parent1",
-      tool_input: {
-        agent_type: "explorer",
-        model: "gpt-5.4-mini",
-        reasoning_effort: "low",
-        message: "Find all references to compute_native_limit_price.",
-      },
-    });
-
-    assert.notEqual(output?.decision, "block");
-    assert.match(output.hookSpecificOutput.additionalContext, /narrow scan/);
-    assert.match(output.hookSpecificOutput.additionalContext, /gpt-5\.3-codex-spark/);
-  });
-});
-
-test("explorer model allow-list can be customized by advisor config", async () => {
-  await withHome(async (home) => {
-    await createNativeTables(home);
-    await writeFile(
-      join(home, "native-agent-pool-advisor.config.json"),
-      JSON.stringify({
-        models: {
-          explorer: ["local-scan", "local-mini"],
-        },
-      }),
-    );
-
-    const allowed = await runHook(home, {
-      hook_event_name: "PreToolUse",
-      tool_name: "spawn_agent",
-      session_id: "parent1",
-      tool_input: {
-        agent_type: "explorer",
-        model: "local-mini",
-        reasoning_effort: "low",
-        message: "map files",
-      },
-    });
-    assert.notEqual(allowed?.decision, "block");
-
-    const blocked = await runHook(home, {
-      hook_event_name: "PreToolUse",
-      tool_name: "spawn_agent",
-      session_id: "parent2",
-      tool_input: {
-        agent_type: "explorer",
-        model: "gpt-5.3-codex-spark",
-        reasoning_effort: "low",
-        message: "map files",
-      },
-    });
-    assert.equal(blocked.decision, "block");
-    assert.match(blocked.reason, /local-scan, local-mini/);
+    assert.doesNotMatch(output?.hookSpecificOutput?.additionalContext ?? "", /Explorer native spawn is blocked/);
   });
 });
 
@@ -1922,6 +1894,100 @@ test("live-check detects real missing-model native spawn bypass evidence", async
     assert.equal(output.spawn_calls[0].has_model, false);
     assert.equal(output.spawn_calls[0].created_agent_id, "child1");
     assert.equal(output.spawn_calls[0].native_edge.model, "gpt-5.5");
+  });
+});
+
+test("live-check treats blank model as missing model bypass evidence", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','closed');"
+        + "insert into threads values ('child1','/tmp/child.jsonl','Blank Model','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+    );
+    const transcript = join(home, "parent-blank-model.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"   \\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"blank model test\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Mencius\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.verdict, "native_spawn_missing_model_bypassed_advisor");
+    assert.equal(output.spawn_calls[0].has_model, false);
+  });
+});
+
+test("live-check allows boolean fork_context spawn without explicit model", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','closed');"
+        + "insert into threads values ('child1','/tmp/child.jsonl','Fork Model','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+    );
+    const transcript = join(home, "parent-fork-model.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"fork_context\\":true,\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"exact history fork\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Mencius\\"}"}}',
+      ].join("\n"),
+    );
+
+    const output = JSON.parse((await runScript(liveCheckPath, home, [
+      "--transcript", transcript,
+      "--allow-missing-guidance",
+    ])).stdout);
+    assert.equal(output.ok, true);
+    assert.equal(output.spawn_calls[0].fork_context, true);
+    assert.equal(output.spawn_calls[0].has_model, false);
+  });
+});
+
+test("live-check detects native model mismatch for explicit-model spawn", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','closed');"
+        + "insert into threads values ('child1','/tmp/child.jsonl','Mismatch','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+    );
+    const transcript = join(home, "parent-model-mismatch.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"explicit model test\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Mencius\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.ok, false);
+    assert.equal(output.verdict, "native_spawn_model_mismatch");
+    const check = output.checks.find((item) => item.name === "tool_model_matches_native");
+    assert.equal(check.status, "fail");
+    assert.match(check.evidence, /tool_model=gpt-5\.3-codex-spark/);
+    assert.match(check.evidence, /native_model=gpt-5\.5/);
   });
 });
 
