@@ -1894,10 +1894,10 @@ function zeroBudgetRecoveryGuidance(summary) {
   return [
     "ZERO_BUDGET_RECOVERY_REQUIRED=true.",
     "Do not stop at saying the subagent pool is full.",
-    "Before any new spawn, choose one recovery action: reuse a compatible current-parent lane with send_input, close exactly one listed current-parent lane that is no longer needed, wait for an active lane if its result is needed, or continue locally.",
+    "Before any new spawn, choose one recovery action: reuse a compatible current-parent lane with send_input, close listed current-parent lane(s) that are no longer needed, wait for an active lane if its result is needed, or continue locally.",
     candidateText,
     hasListedLane
-      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and then spawn at most one lane if budget is positive."
+      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and then obey the refreshed remaining_spawn_budget; multiple independent lanes are allowed when budget permits."
       : "If live state says fewer lanes exist than the hook snapshot, run a fresh hook/live check and use the newer scoped budget."
   ].join(" ");
 }
@@ -1905,17 +1905,16 @@ function zeroBudgetRecoveryGuidance(summary) {
 function buildTurnBudgetGuidance(summary, cap) {
   if (!summary) return "";
   const remaining = remainingSpawnBudget(summary, cap);
-  const responseSpawnToken = remaining > 0 ? 1 : 0;
   const hardDirective = remaining === 0
-    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget snapshot). remaining_spawn_budget=0: do not call spawn_agent from this capacity snapshot. First close a known no-longer-needed current-parent lane or continue locally. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state."
-    : `SPAWN_AGENT_LOCAL_COUNTER_START=${responseSpawnToken}. SINGLE_SPAWN_TOKEN_FOR_THIS_RESPONSE=1. Launch at most one spawn_agent before re-checking capacity; remaining_spawn_budget is diagnostic capacity, not a batch size.`;
+    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget snapshot). remaining_spawn_budget=0: do not call spawn_agent from this capacity snapshot. First close known no-longer-needed current-parent lane(s) or continue locally. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state."
+    : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. You may launch up to this many spawn_agent calls from this capacity snapshot; each spawn_agent call immediately decrements this local counter.`;
   return [
     hardDirective,
     `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`,
     remaining === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
     terminalCloseTargetGuidance(summary),
-    "For this assistant response, maintain this as a hard local counter: at most one spawn_agent call is allowed from this capacity snapshot, even when remaining_spawn_budget is greater than 1. wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
-    "When remaining_spawn_budget is 0, do not call spawn_agent. Continue locally or close a known no-longer-needed current-parent lane first; send_input and wait_agent do not increase the spawn budget. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
+    "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
+    "When remaining_spawn_budget is 0, do not call spawn_agent. Continue locally or close known no-longer-needed current-parent lane(s) first; send_input and wait_agent do not increase the spawn budget. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
   ].filter(Boolean).join(" ");
 }
 
@@ -1929,7 +1928,7 @@ function buildSubagentModelSelectionGuidance() {
     `Use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`,
     "Do not combine fork_context=true with model. If you need Spark/mini/frontier model routing, remove fork_context and pass a compact context packet in message/items. Use fork_context=true without model only when exact full-history context matters more than model routing; that path may inherit the parent model.",
     "If you cannot state the child output cap and stop condition, do not use Spark; slice locally first or choose mini.",
-    "Do not launch multiple lanes just because there are multiple perspectives; launch at most one child per confirmed free slot, then re-check capacity and whether existing lanes can be reused.",
+    "Do not launch more lanes than the confirmed free-slot count. Multiple child lanes are allowed when each has an independent task contract and the batch size is within remaining_spawn_budget.",
     "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Spark exact slices to anchor, and use mini/frontier for synthesis.",
     "This judgment step is mandatory; never omit model, because omitted model inherits the parent frontier model.",
     "This is a spawn-shape guard, not a recommendation to create a subagent.",
@@ -1941,9 +1940,9 @@ function buildCapacityGuidance(eventName, cap, summary = null) {
     buildTurnBudgetGuidance(summary, cap),
     buildSubagentModelSelectionGuidance(),
     `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
-    "Do not batch native spawn_agent calls. Launch at most one native subagent per confirmed free slot, then re-check capacity before another spawn.",
+    "Batch native spawn_agent calls only when requested_spawns <= remaining_spawn_budget and each lane has an independent task contract. If any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes budget.",
     "Completed children can still consume slots until close succeeds; close only a current-parent lane that the leader knows is no longer needed.",
-    "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close or authoritative native-edge refresh reports budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit.",
+    "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, or explicit reset refreshes budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit.",
     "Do not restate/retry long child prompts after a capacity failure.",
     "This protocol does not recommend delegation, reuse, or messaging a child lane; it only prevents wasteful native pool collisions.",
   ].filter(Boolean).join(" ");
@@ -2037,16 +2036,18 @@ function mergeSummary(
   const trackedUnresolved = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
   const trackedOccupied = clampSlotCount(trackedUnresolved, capValue);
   const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
-  const lastCapHitMs = Math.max(
+  const rawLastCapHitMs = Math.max(
     transcriptPool.capHitAtMs || 0,
     msFromIso(session.last_cap_hit_at),
   );
-  const lastCloseMs = Math.max(
+  const rawLastCloseMs = Math.max(
     transcriptPool.lastCloseAtMs || 0,
     msFromIso(session.last_close_at),
   );
+  const lastCapHitMs = rawLastCapHitMs > resetAtMs ? rawLastCapHitMs : 0;
+  const lastCloseMs = Math.max(rawLastCloseMs, resetAtMs);
   const capHitAfterLastClose = lastCapHitMs > 0 && lastCapHitMs > lastCloseMs;
-  const capHitBlocksSpawn = Boolean(capHitAfterLastClose && !nativeAuthoritative);
+  const capHitBlocksSpawn = Boolean(capHitAfterLastClose);
   let evidenceOccupied = transcriptSlotOccupied;
   let slotPressureSource = "transcript_fallback";
   if (nativeAuthoritative) {
@@ -2111,7 +2112,6 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const ops = operations ?? agentOperations(payload ?? {}, name);
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
-  if (requestedSpawns > 1) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
   if (hasExplorerModelRouteViolationInOperations(ops)) return true;
@@ -2149,7 +2149,6 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const preferredExplorerContractAdvisory = hasPreferredExplorerContractAdvisoryInOperations(ops);
   const fallbackExplorerContractAdvisory = hasFallbackExplorerContractAdvisoryInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
-  const multiSpawnBatch = requestedSpawns > 1;
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
     `requested_spawns=${requestedSpawns}`,
@@ -2170,10 +2169,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const context = [
     parts.join(", ") + ".",
     forkContextModelConflict
-      ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry at most one spawn while remaining_spawn_budget is still positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
-      : null,
-    multiSpawnBatch
-      ? "Native spawn batch is blocked. This hook exposes only one spawn token per response because native spawn may bypass or race PreToolUse on some Codex surfaces. Launch one child, wait for its spawn result and a fresh capacity check, then decide whether another lane is still needed."
+      ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry corrected independent spawn call(s) only while remaining_spawn_budget is still positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
       : null,
     missingSpawnModel
       ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
@@ -2195,18 +2191,16 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       : null,
     blockSpawn
       ? (forkContextModelConflict
-        ? "Correct the spawn shape and retry at most one spawn; do not treat this as a consumed native slot or as proof the pool is full."
+        ? "Correct the spawn shape and retry only the corrected independent spawn call(s) that still fit remaining_spawn_budget; do not treat this as a consumed native slot or as proof the pool is full."
         : missingSpawnModel
-        ? "Retry at most one spawn after making the model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and remaining_spawn_budget must still be positive."
+        ? "Retry only after making model-selection judgment explicit for each spawn; Analyze/read-only/bounded labels are not enough, and requested_spawns must still fit remaining_spawn_budget."
         : explorerModelRouteViolation
-        ? "Retry at most one explorer spawn after correcting the explicit model route, and only if remaining_spawn_budget is still positive."
+        ? "Retry explorer spawn call(s) only after correcting each explicit model route, and only if requested_spawns still fit remaining_spawn_budget."
         : isChildSession
         ? "Nested spawn denied; no child-side delegation guidance is emitted."
-        : multiSpawnBatch
-        ? "Retry exactly one spawn after choosing the highest-value lane; do not replay the full batch."
         : (summary.cap_hit_blocks_spawn
-          ? "This thread already saw a native pool-exhaustion failure after the last confirmed close; do not retry spawn_agent until a later close succeeds and a newer hook/PreToolUse capacity check reports budget."
-          : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close exactly one listed no-longer-needed current-parent lane, wait for a needed active lane, or continue locally; then retry only one spawn after a fresh positive capacity check."))
+          ? "This thread already saw a native pool-exhaustion failure after the last confirmed close/repair/reset; do not retry spawn_agent until a later close/repair/reset succeeds and a newer hook/PreToolUse capacity check reports budget."
+          : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, wait for a needed active lane, or continue locally; then retry only within a fresh positive capacity budget."))
       : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
     (summary.native_edge_overflow ?? 0) > 0
       ? `Native DB open-edge debt exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are repair debt rather than additional live agents. db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}.`
@@ -2246,7 +2240,7 @@ function buildLockUnavailableAdvisory(eventName, cap, isChildSession, operations
     hasSpawn
       ? (isChildSession
         ? "Blocking nested spawn_agent; child sessions cannot create subagents."
-        : `Blocking spawn_agent conservatively. The native cap is ${cap}; retry one spawn only after the lock clears or continue locally.`)
+        : `Blocking spawn_agent conservatively. The native cap is ${cap}; retry only after the lock clears and requested_spawns fit the refreshed budget, or continue locally.`)
       : "Serialize agent-pool operations until the lock clears.",
     isChildSession ? "This is a child session; nested native spawn remains disallowed." : null,
   ].filter(Boolean).join(" ");

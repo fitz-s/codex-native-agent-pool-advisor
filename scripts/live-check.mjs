@@ -270,6 +270,7 @@ async function main() {
   const edges = await readEdges(resolve(args.stateDb || defaultStateDb()), parent);
   const spawnCalls = transcript.calls.filter((call) => call.name === "spawn_agent");
   const spawnBatches = transcript.spawnBatches ?? [];
+  const failedSpawnCalls = spawnCalls.filter((call) => call.output?.failed);
   const missingModelSpawns = spawnCalls.filter((call) => !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
@@ -306,11 +307,11 @@ async function main() {
         : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
     ),
     buildCheck(
-      "no_spawn_batch_calls",
-      spawnBatches.length === 0,
-      spawnBatches.length === 0
-        ? "no multiple spawn_agent calls emitted before a tool result"
-        : spawnBatches.map((batch) => `lines ${batch.join(",")}`).join("; "),
+      "no_spawn_failures",
+      failedSpawnCalls.length === 0,
+      failedSpawnCalls.length === 0
+        ? "no spawn_agent calls returned runtime/tool failure"
+        : failedSpawnCalls.map((call) => `line ${call.line} -> output line ${call.output?.line ?? "?"}`).join(", "),
     ),
     buildCheck(
       "guidance_before_first_spawn",

@@ -33,19 +33,19 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
 - `occupied` is a saturated current-parent runtime slot estimate and is never reported above the cap. Extra current-parent `open` rows are surfaced separately as `db_open_edge_debt` and `open_edge_overflow`; they are persistent-state repair debt, not additional live subagents.
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
-- A historical cap-hit is diagnostic, not automatically authoritative. If the current parent/session native edge read is authoritative and reports fewer than six occupied slots, the hook reports `cap_hit_after_last_close=yes` with `cap_hit_blocks_spawn=no` and uses the fresh native count for admission.
-- Positive `remaining_spawn_budget` is physical capacity, not a batch size. Prompt-time guidance grants at most one spawn token per assistant response, then requires a fresh capacity check before another child is launched.
+- A historical cap-hit before the latest successful close is diagnostic. A runtime cap-hit after the latest successful close is authoritative pressure: the hook reports `cap_hit_blocks_spawn=yes` and blocks further spawns until a close/repair or explicit reset refreshes capacity, even if SQLite currently shows fewer than six open rows.
+- Positive `remaining_spawn_budget` is physical capacity. Multiple subagents may be launched together when `requested_spawns <= remaining_spawn_budget` and each lane has an independent task contract.
 - `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
 - A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
-- A zero-budget prompt also emits a recovery protocol. The agent should not stop at "the pool is full"; it must choose between reusing a compatible current-parent lane, closing exactly one no-longer-needed listed lane, waiting for a needed active lane, or continuing locally.
+- A zero-budget prompt also emits a recovery protocol. The agent should not stop at "the pool is full"; it must choose between reusing a compatible current-parent lane, closing listed no-longer-needed lane(s), waiting for a needed active lane, or continuing locally.
 - The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Runtime `not found` / `unknown agent` close evidence is also treated as a stale-unreachable lane and repaired to `closed`; other close failures do not free capacity.
 - Runtime `not found` close evidence releases a stale-unreachable lane when the current parent owns the matching native edge row. If a PostToolUse payload is mis-scoped but the target child has exactly one non-closed native edge anywhere in the DB, the hook repairs that unique parent/child row; ambiguous or unknown targets do not free capacity.
 - Child transcript terminal detection checks beyond the tail window when needed, so a long transcript with an earlier `task_complete` does not get mislabeled as an active open lane.
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
 - Child sessions do not receive proactive prompt-time delegation guidance. A child that needs more delegation should report that recommendation upward; the parent leader owns slot closure and relaunch.
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
-- Full-history fork is the exception to model routing. If the runtime rejects `fork_context=true` together with `model`, use either `fork_context=true` without `model` and accept inherited parent model, or remove `fork_context` and pass a compact context packet with an explicit Spark/mini/frontier model. A fork/model shape failure is not native-pool exhaustion and should be retried once with the corrected shape if budget remains positive.
+- Full-history fork is the exception to model routing. If the runtime rejects `fork_context=true` together with `model`, use either `fork_context=true` without `model` and accept inherited parent model, or remove `fork_context` and pass a compact context packet with an explicit Spark/mini/frontier model. A fork/model shape failure is not native-pool exhaustion and should be retried only with corrected shape and positive budget.
 - The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection with an output cap and stop condition. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.
 - Explorer model allow-list defaults to `gpt-5.3-codex-spark,gpt-5.4-mini`, so lookup lanes cannot silently spend `gpt-5.5`.
 - The hook does not block Spark because a prompt looks "complex"; it emits a pre-spawn decision contract and lets the parent agent choose. `Analyze`, `review`, `read-only`, and `bounded` are not model choices by themselves.
@@ -183,7 +183,7 @@ npm run check
 npm test
 ```
 
-The test suite covers hook-script behavior: wrapper-spawn blocking, single-spawn-token guidance, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
+The test suite covers hook-script behavior: wrapper-spawn blocking, multi-spawn budget accounting, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
 
 For real end-to-end evidence from Codex Desktop or CLI, inspect the actual parent transcript after a spawn attempt:
 
@@ -191,7 +191,7 @@ For real end-to-end evidence from Codex Desktop or CLI, inspect the actual paren
 node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl
 ```
 
-`ok=false` means the real transcript contains a native spawn path that was not protected before the child was created, or it emitted multiple same-response `spawn_agent` calls before any tool result. That is a runtime-boundary failure, not a passing hook test.
+`ok=false` means the real transcript contains a native spawn path that was not protected before the child was created, or a spawn call returned a runtime/tool failure such as pool exhaustion or invalid fork/model shape. That is a runtime-boundary failure, not a passing hook test.
 
 Use explicit expectations when validating a real run:
 

@@ -262,9 +262,9 @@ test("unrelated parent native open edges do not emit zero budget on current prom
     });
     const context = output.hookSpecificOutput.additionalContext;
 
-    assert.match(context, /^SPAWN_AGENT_LOCAL_COUNTER_START=1/);
+    assert.match(context, /^SPAWN_AGENT_LOCAL_COUNTER_START=6/);
     assert.match(context, /remaining_spawn_budget=6/);
-    assert.match(context, /remaining_spawn_budget is diagnostic capacity, not a batch size/);
+    assert.doesNotMatch(context, /remaining_spawn_budget is diagnostic capacity, not a batch size/);
     assert.match(context, /native_slots=slot_open=0/);
     assert.doesNotMatch(context, /native_global/);
     assert.doesNotMatch(context, /Global native/);
@@ -556,7 +556,7 @@ test("blocks wrapped multi-spawn when requested spawn count exceeds remaining ca
   });
 });
 
-test("blocks wrapped multi-spawn even when capacity has room", async () => {
+test("allows wrapped multi-spawn when requested count fits remaining capacity", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
 
@@ -588,10 +588,11 @@ test("blocks wrapped multi-spawn even when capacity has room", async () => {
       },
     });
 
-    assert.equal(output.decision, "block");
-    assert.match(output.reason, /requested_spawns=2/);
-    assert.match(output.reason, /Native spawn batch is blocked/);
-    assert.match(output.reason, /Retry exactly one spawn/);
+    assert.notEqual(output?.decision, "block");
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
+    assert.equal(reservations.length, 1);
+    assert.equal(reservations[0].count, 2);
   });
 });
 
@@ -1290,7 +1291,7 @@ test("close_agent not found does not repair ambiguous native child edge", async 
   });
 });
 
-test("authoritative native open edges below cap override stale cap-hit state", async () => {
+test("runtime cap hit after latest close blocks despite authoritative native count below cap", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -1317,11 +1318,12 @@ test("authoritative native open edges below cap override stale cap-hit state", a
       prompt: "open one more explorer",
     });
     const context = promptOutput.hookSpecificOutput.additionalContext;
-    assert.match(context, /occupied=3\/6/);
-    assert.match(context, /remaining_spawn_budget=3/);
+    assert.match(context, /SPAWN_AGENT_DISABLED_THIS_TURN=true/);
+    assert.match(context, /occupied=6\/6/);
+    assert.match(context, /remaining_spawn_budget=0/);
+    assert.match(context, /native_slots=slot_open=3/);
     assert.match(context, /cap_hit_after_last_close=yes/);
-    assert.match(context, /cap_hit_blocks_spawn=no/);
-    assert.doesNotMatch(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
+    assert.match(context, /cap_hit_blocks_spawn=yes/);
 
     const spawnOutput = await runHook(home, {
       hook_event_name: "PreToolUse",
@@ -1334,7 +1336,9 @@ test("authoritative native open edges below cap override stale cap-hit state", a
         message: "map another file",
       },
     });
-    assert.notEqual(spawnOutput?.decision, "block");
+    assert.equal(spawnOutput.decision, "block");
+    assert.match(spawnOutput.reason, /cap_hit_blocks_spawn=yes/);
+    assert.match(spawnOutput.reason, /pool-exhaustion failure after the last confirmed close\/repair\/reset/);
   });
 });
 
@@ -1554,7 +1558,7 @@ test("zero budget guidance rejects send_input and requires capacity refresh afte
     assert.match(context, /^SPAWN_AGENT_DISABLED_THIS_TURN=true/);
     assert.match(context, /ZERO_BUDGET_RECOVERY_REQUIRED=true/);
     assert.match(context, /reuse a compatible current-parent lane with send_input/);
-    assert.match(context, /close exactly one listed current-parent lane/);
+    assert.match(context, /close listed current-parent lane\(s\)/);
     assert.match(context, /send_input and wait_agent do not increase the spawn budget/);
     assert.match(context, /If close_agent succeeds, re-check capacity before any spawn/);
     assert.match(context, /older zero-budget snapshot is no longer authoritative/);
@@ -1582,7 +1586,7 @@ test("prompt-time guidance requires explicit model-selection judgment when spawn
     assert.match(context, /model=\"gpt-5\.5\"/);
     assert.match(context, /strict output cap/);
     assert.match(context, /If you cannot state the child output cap and stop condition, do not use Spark/);
-    assert.match(context, /Do not launch multiple lanes just because there are multiple perspectives/);
+    assert.match(context, /Multiple child lanes are allowed when each has an independent task contract/);
     assert.match(context, /large-context repos, first make a local module\/file map/);
     assert.match(context, /This judgment step is mandatory/);
     assert.match(context, /omitted model inherits the parent frontier model/);
@@ -1733,7 +1737,7 @@ test("live-check detects real missing-model native spawn bypass evidence", async
   });
 });
 
-test("live-check detects same-response native spawn batches", async () => {
+test("live-check records same-response native spawn batches and fails runtime spawn failures", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const transcript = join(home, "parent-batch.jsonl");
@@ -1758,7 +1762,9 @@ test("live-check detects same-response native spawn batches", async () => {
     const output = JSON.parse(error.stdout);
     assert.equal(output.ok, false);
     assert.deepEqual(output.spawn_batches, [[2, 3]]);
-    assert.equal(output.checks.find((check) => check.name === "no_spawn_batch_calls").status, "fail");
+    assert.equal(output.checks.find((check) => check.name === "no_spawn_failures").status, "fail");
+    assert.equal(output.spawn_calls[0].output_failed, true);
+    assert.equal(output.spawn_calls[1].output_failed, true);
   });
 });
 
