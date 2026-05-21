@@ -314,6 +314,51 @@ test("blocks non-explorer spawns that omit explicit model selection", async () =
   });
 });
 
+test("blocks fork_context spawn when it also specifies model", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        fork_context: true,
+        model: "gpt-5.4-mini",
+        reasoning_effort: "medium",
+        message: "Trace with full context.",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /fork_context=true cannot be combined with an explicit model/);
+    assert.match(output.reason, /tool-shape failure, not native-pool exhaustion/);
+    assert.match(output.reason, /remove fork_context/);
+    assert.match(output.reason, /do not treat this as a consumed native slot/);
+  });
+});
+
+test("allows fork_context without model but warns about inherited model exception", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        fork_context: true,
+        reasoning_effort: "medium",
+        message: "Trace with exact full history.",
+      },
+    });
+
+    assert.notEqual(output?.decision, "block");
+    assert.match(output.hookSpecificOutput.additionalContext, /Fork-context model inheritance exception/);
+    assert.match(output.hookSpecificOutput.additionalContext, /remove fork_context and pass compact context/);
+  });
+});
+
 test("allows explicit frontier model for critic roles", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

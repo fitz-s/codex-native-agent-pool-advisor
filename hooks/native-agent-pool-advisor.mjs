@@ -1282,6 +1282,12 @@ function operationModel(operation) {
   return safeString(operation?.input?.model).trim();
 }
 
+function operationForkContext(operation) {
+  const value = operation?.input?.fork_context ?? operation?.input?.forkContext;
+  if (typeof value === "boolean") return value;
+  return /^(?:1|true|yes)$/i.test(safeString(value).trim());
+}
+
 function operationReasoningEffort(operation) {
   return safeString(operation?.input?.reasoning_effort ?? operation?.input?.reasoningEffort).trim();
 }
@@ -1318,13 +1324,29 @@ function hasExplorerModelRouteViolationInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
     if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
+    if (operationForkContext(operation) && !operationModel(operation)) return false;
     return !explorerModels().includes(operationModel(operation));
+  });
+}
+
+function hasForkContextModelConflictInOperations(operations) {
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    return operationForkContext(operation) && Boolean(operationModel(operation));
+  });
+}
+
+function hasForkContextModelInheritanceInOperations(operations) {
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    return operationForkContext(operation) && !operationModel(operation);
   });
 }
 
 function hasMissingSpawnModelInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
+    if (operationForkContext(operation)) return false;
     return !operationModel(operation);
   });
 }
@@ -1834,6 +1856,7 @@ function buildSubagentModelSelectionGuidance() {
     `Use model="${explorerModel()}" only for read-only scout output: grep/file maps, symbol/log filters, candidate file:line anchors, or hypotheses with a strict output cap and no durable verdict.`,
     `Use model="${explorerFallbackModel()}" for multi-hop tracing, compact synthesis, bounded verification, config/test interpretation, or light low-risk execution where the child owns a durable conclusion.`,
     `Use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`,
+    "Do not combine fork_context=true with model. If you need Spark/mini/frontier model routing, remove fork_context and pass a compact context packet in message/items. Use fork_context=true without model only when exact full-history context matters more than model routing; that path may inherit the parent model.",
     "If you cannot state the child output cap and stop condition, do not use Spark; slice locally first or choose mini.",
     "Do not launch multiple lanes just because there are multiple perspectives; launch at most one child per confirmed free slot, then re-check capacity and whether existing lanes can be reused.",
     "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Spark exact slices to anchor, and use mini/frontier for synthesis.",
@@ -2017,6 +2040,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const ops = operations ?? agentOperations(payload ?? {}, name);
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
+  if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
   if (hasExplorerModelRouteViolationInOperations(ops)) return true;
   if (isChildSession) return true;
@@ -2038,6 +2062,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   if (ops.length === 0) return false;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
+  if (hasForkContextModelInheritanceInOperations(ops)) return true;
   if (hasExplorerContractAdvisoryInOperations(ops)) return true;
   const threshold = Math.max(1, cap - warnRemaining());
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
@@ -2046,6 +2071,8 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
 function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payload = null, operations = null) {
   const ops = operations ?? agentOperations(payload ?? {}, "");
   const missingSpawnModel = hasMissingSpawnModelInOperations(ops);
+  const forkContextModelConflict = hasForkContextModelConflictInOperations(ops);
+  const forkContextModelInheritance = hasForkContextModelInheritanceInOperations(ops);
   const explorerModelRouteViolation = hasExplorerModelRouteViolationInOperations(ops);
   const preferredExplorerContractAdvisory = hasPreferredExplorerContractAdvisoryInOperations(ops);
   const fallbackExplorerContractAdvisory = hasFallbackExplorerContractAdvisoryInOperations(ops);
@@ -2069,8 +2096,14 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 
   const context = [
     parts.join(", ") + ".",
+    forkContextModelConflict
+      ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry at most one spawn while remaining_spawn_budget is still positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
+      : null,
     missingSpawnModel
       ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+      : null,
+    forkContextModelInheritance
+      ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for explorer/scout/mini routing, remove fork_context and pass compact context instead."
       : null,
     explorerModelRouteViolation
       ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for capped scout/probe anchors and ${explorerFallbackModel()} for reasoning explorer, synthesis, verification, or light executor work. Do not inherit a frontier model for read-only lookup.`
@@ -2085,7 +2118,9 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       ? "Nested native spawn is blocked: child sessions cannot create subagents; the parent leader owns delegation."
       : null,
 	    blockSpawn
-	      ? (missingSpawnModel
+	      ? (forkContextModelConflict
+	          ? "Correct the spawn shape and retry at most one spawn; do not treat this as a consumed native slot or as proof the pool is full."
+	          : missingSpawnModel
 	          ? "Retry at most one spawn after making the model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and remaining_spawn_budget must still be positive."
 	          : explorerModelRouteViolation
 	          ? "Retry at most one explorer spawn after correcting the explicit model route, and only if remaining_spawn_budget is still positive."
