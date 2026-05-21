@@ -262,7 +262,9 @@ test("unrelated parent native open edges do not emit zero budget on current prom
     });
     const context = output.hookSpecificOutput.additionalContext;
 
-    assert.match(context, /^SPAWN_AGENT_LOCAL_COUNTER_START=6/);
+    assert.match(context, /^SPAWN_AGENT_LOCAL_COUNTER_START=1/);
+    assert.match(context, /remaining_spawn_budget=6/);
+    assert.match(context, /remaining_spawn_budget is diagnostic capacity, not a batch size/);
     assert.match(context, /native_slots=slot_open=0/);
     assert.doesNotMatch(context, /native_global/);
     assert.doesNotMatch(context, /Global native/);
@@ -551,6 +553,45 @@ test("blocks wrapped multi-spawn when requested spawn count exceeds remaining ca
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /requested_spawns=2/);
+  });
+});
+
+test("blocks wrapped multi-spawn even when capacity has room", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "multi_tool_use.parallel",
+      session_id: "parent1",
+      tool_input: {
+        tool_uses: [
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.3-codex-spark",
+              reasoning_effort: "low",
+              message: "map files",
+            },
+          },
+          {
+            recipient_name: "functions.spawn_agent",
+            parameters: {
+              agent_type: "explorer",
+              model: "gpt-5.4-mini",
+              reasoning_effort: "medium",
+              message: "trace code path",
+            },
+          },
+        ],
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /requested_spawns=2/);
+    assert.match(output.reason, /Native spawn batch is blocked/);
+    assert.match(output.reason, /Retry exactly one spawn/);
   });
 });
 
@@ -1689,6 +1730,35 @@ test("live-check detects real missing-model native spawn bypass evidence", async
     assert.equal(output.spawn_calls[0].has_model, false);
     assert.equal(output.spawn_calls[0].created_agent_id, "child1");
     assert.equal(output.spawn_calls[0].native_edge.model, "gpt-5.5");
+  });
+});
+
+test("live-check detects same-response native spawn batches", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const transcript = join(home, "parent-batch.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call2","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"two\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"collab spawn failed: agent thread limit reached"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call2","output":"collab spawn failed: agent thread limit reached"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.ok, false);
+    assert.deepEqual(output.spawn_batches, [[2, 3]]);
+    assert.equal(output.checks.find((check) => check.name === "no_spawn_batch_calls").status, "fail");
   });
 });
 

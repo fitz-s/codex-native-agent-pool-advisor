@@ -34,6 +34,7 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - `occupied` is a saturated current-parent runtime slot estimate and is never reported above the cap. Extra current-parent `open` rows are surfaced separately as `db_open_edge_debt` and `open_edge_overflow`; they are persistent-state repair debt, not additional live subagents.
 - Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
 - A historical cap-hit is diagnostic, not automatically authoritative. If the current parent/session native edge read is authoritative and reports fewer than six occupied slots, the hook reports `cap_hit_after_last_close=yes` with `cap_hit_blocks_spawn=no` and uses the fresh native count for admission.
+- Positive `remaining_spawn_budget` is physical capacity, not a batch size. Prompt-time guidance grants at most one spawn token per assistant response, then requires a fresh capacity check before another child is launched.
 - `wait_agent`, `task_complete`, child completion notifications, and `send_input` never free a native slot.
 - A completed child can still occupy the current parent pool until `close_agent` succeeds. Completed `open` rows are current-parent close/reset candidates, not proof of more than six live slots.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
@@ -182,7 +183,7 @@ npm run check
 npm test
 ```
 
-The test suite covers hook-script behavior: wrapper-spawn blocking, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
+The test suite covers hook-script behavior: wrapper-spawn blocking, single-spawn-token guidance, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
 
 For real end-to-end evidence from Codex Desktop or CLI, inspect the actual parent transcript after a spawn attempt:
 
@@ -190,7 +191,7 @@ For real end-to-end evidence from Codex Desktop or CLI, inspect the actual paren
 node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl
 ```
 
-`ok=false` means the real transcript contains a native spawn path that was not protected before the child was created. That is a runtime-boundary failure, not a passing hook test.
+`ok=false` means the real transcript contains a native spawn path that was not protected before the child was created, or it emitted multiple same-response `spawn_agent` calls before any tool result. That is a runtime-boundary failure, not a passing hook test.
 
 Use explicit expectations when validating a real run:
 

@@ -28,6 +28,7 @@
 - General evidence collection does not repair native edges. Successful `PostToolUse(close_agent)` for the current parent/session marks a native edge closed and decrements slot pressure; runtime `not found` / `unknown agent` close evidence is also repaired because the lane is no longer reachable by Codex. If the close hook payload is mis-scoped, a target child id repairs only when it maps to exactly one non-closed native edge; ambiguous child ids remain open.
 - Wrapped `multi_tool_use.parallel` evidence is normalized before accounting, so nested `spawn_agent`, `wait_agent`, and `close_agent` calls update the same budget model as direct tool calls.
 - Multiple `spawn_agent` calls inside one wrapper consume multiple requested slots before the hook decides whether to block.
+- Prompt-time spawn allowance is intentionally stricter than physical remaining capacity: each assistant response gets at most one spawn token. `remaining_spawn_budget=3` means three physical slots may be free after re-checks, not that the agent may launch three children in one response.
 - Slot pressure is saturated to the native cap. If SQLite reports more `open` edges than the cap, those rows are reported as `db_open_edge_debt` / `open_edge_overflow`, not as more live agents or `occupied > cap`.
 - Historical cap-hit evidence is split from admission blocking. `cap_hit_after_last_close=yes` remains visible as diagnostic history, but it blocks a new spawn only when `cap_hit_blocks_spawn=yes`; an authoritative current-parent native edge read below the cap must restore positive budget.
 - `SessionStart` is a first-class guidance surface for parent sessions. It emits current budget pressure after compaction/resume even when there is no fresh `UserPromptSubmit` event before the next tool call.
@@ -69,6 +70,7 @@ The live checker supports expectation-based E2E gates:
 - `--expect-current-open <n>` verifies the current parent/session open-edge count after the scanned transcript window.
 - `--expect-all-closed` verifies every successful spawn in the scanned window has both a successful close call and a closed native edge.
 - `--require-guidance` treats missing prompt-time advisor markers as a failure; `--allow-missing-guidance` keeps model/capacity verification independent from Codex transcript marker availability.
+- Live-check always fails a same-response spawn batch: multiple `spawn_agent` calls emitted before any tool result are a launch-sequencing violation even if every call has an explicit model.
 
 The capacity E2E should stop at six real child lanes. At `open=6`, the live `UserPromptSubmit` hook must report `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, and `remaining_spawn_budget=0`. Do not launch a seventh child to prove the cap. If a later close succeeds, verify that a fresh hook/live check reports the reduced open count before spawning.
 

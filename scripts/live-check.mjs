@@ -18,6 +18,7 @@ const FAILURE_PATTERNS = [
   /unable to spawn/i,
   /cannot spawn/i,
   /failed to spawn/i,
+  /Full-history forked agents inherit/i,
   /agent.*limit/i,
   /pool.*full/i,
   /子代理.*满/,
@@ -145,9 +146,18 @@ function canCarryRuntimeGuidance(record) {
 function readTranscript(text, sinceLine) {
   const markers = [];
   const calls = [];
+  const spawnBatches = [];
   const outputsByCallId = new Map();
   const lines = text.split(/\r?\n/);
   let sessionId = "";
+  let pendingSpawnBatch = [];
+
+  const flushSpawnBatch = () => {
+    if (pendingSpawnBatch.length > 1) {
+      spawnBatches.push([...pendingSpawnBatch]);
+    }
+    pendingSpawnBatch = [];
+  };
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1;
@@ -181,8 +191,14 @@ function readTranscript(text, sinceLine) {
           message_preview: preview(args.message),
           has_model: Boolean(args.model),
         });
+        if (name === "spawn_agent") {
+          pendingSpawnBatch.push(lineNumber);
+        } else {
+          flushSpawnBatch();
+        }
       }
     } else if (record.type === "response_item" && payload.type === "function_call_output") {
+      flushSpawnBatch();
       const callId = typeof payload.call_id === "string" ? payload.call_id : "";
       if (callId) {
         outputsByCallId.set(callId, {
@@ -194,10 +210,12 @@ function readTranscript(text, sinceLine) {
       }
     }
   }
+  flushSpawnBatch();
 
   return {
     sessionId,
     markers,
+    spawnBatches,
     calls: calls.map((call) => ({ ...call, output: outputsByCallId.get(call.call_id) ?? null })),
   };
 }
@@ -251,6 +269,7 @@ async function main() {
   const parent = args.parent || transcript.sessionId;
   const edges = await readEdges(resolve(args.stateDb || defaultStateDb()), parent);
   const spawnCalls = transcript.calls.filter((call) => call.name === "spawn_agent");
+  const spawnBatches = transcript.spawnBatches ?? [];
   const missingModelSpawns = spawnCalls.filter((call) => !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
@@ -285,6 +304,13 @@ async function main() {
       missingModelCreated.length === 0
         ? "no missing-model spawn created a child"
         : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
+    ),
+    buildCheck(
+      "no_spawn_batch_calls",
+      spawnBatches.length === 0,
+      spawnBatches.length === 0
+        ? "no multiple spawn_agent calls emitted before a tool result"
+        : spawnBatches.map((batch) => `lines ${batch.join(",")}`).join("; "),
     ),
     buildCheck(
       "guidance_before_first_spawn",
@@ -339,6 +365,7 @@ async function main() {
     parent_thread_id: parent,
     scanned_since_line: Number.isFinite(args.sinceLine) ? args.sinceLine : 1,
     guidance_markers: transcript.markers,
+    spawn_batches: spawnBatches,
     spawn_calls: spawnCalls.map((call) => ({
       line: call.line,
       call_id: call.call_id,
