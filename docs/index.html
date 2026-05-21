@@ -358,14 +358,14 @@
 
 <span class="good">advisor:</span> occupied=5/6, remaining_spawn_budget=1
 <span class="good">advisor:</span> requested_spawns=2 would exceed cap
-<span class="good">advisor:</span> reuse an existing lane or close one first</pre>
+<span class="good">advisor:</span> launch one, or close a current-parent lane first</pre>
           </div>
         </section>
 
         <section class="band">
           <div class="section-heading">
             <h2>What it prevents</h2>
-            <p>The hook does not decide whether to delegate. It keeps Codex from wasting the leader turn on native pool reality the model cannot reliably see.</p>
+            <p>The hook does not decide whether to delegate. It surfaces native pool reality early, and hard-blocks only tool paths Codex actually routes through PreToolUse.</p>
           </div>
           <div class="grid">
             <article class="card">
@@ -378,7 +378,7 @@
             </article>
             <article class="card">
               <h3>Blind retry loops</h3>
-              <p>Blocks doomed over-cap spawns so the leader does not close lanes, restate prompts, and drift from the task.</p>
+              <p>Stops doomed over-cap spawns on supported hook surfaces and reports bypasses from real transcripts when the runtime does not expose a blockable spawn event.</p>
             </article>
             <article class="card">
               <h3>Batch overbooking</h3>
@@ -390,11 +390,11 @@
             </article>
             <article class="card">
               <h3>Recursive delegation</h3>
-              <p>Blocks child agents from spawning their own reviewers, verifiers, researchers, or explorers.</p>
+              <p>Keeps recursive delegation as a parent-owned rule; child lanes should report escalation needs upward instead of launching more lanes.</p>
             </article>
             <article class="card">
               <h3>Model drift</h3>
-              <p>Requires read-only explorer work to set an explicit configured model instead of inheriting a frontier model by accident.</p>
+              <p>Requires read-only explorer work to set an explicit configured model when the spawn is visible to the hook, and makes missing-model bypasses detectable after the fact.</p>
             </article>
             <article class="card">
               <h3>Unsafe reset drift</h3>
@@ -407,15 +407,37 @@
           <div class="split">
             <div class="section-heading">
               <h2>Install</h2>
-              <p>Run tests first, install into the active Codex home, then verify the live Desktop or CLI hook registration with doctor.</p>
+              <p>Run tests first, install into the active Codex home, then verify registration with doctor and real runtime behavior with live-check.</p>
             </div>
             <div class="code-block">
               <pre>git clone https://github.com/fitz-s/codex-native-agent-pool-advisor.git
 cd codex-native-agent-pool-advisor
 npm test
 node scripts/install.mjs
-node scripts/doctor.mjs</pre>
+node scripts/doctor.mjs
+node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl</pre>
             </div>
+          </div>
+        </section>
+
+        <section>
+          <div class="section-heading">
+            <h2>Runtime boundary</h2>
+            <p>Doctor proves the hook is installed. It does not prove native <code>spawn_agent</code> is a blockable PreToolUse target in your current Codex build.</p>
+          </div>
+          <div class="grid">
+            <article class="card">
+              <h3>Prompt guidance</h3>
+              <p><code>SessionStart</code> and <code>UserPromptSubmit</code> can inject the current budget and model-selection rule when Codex emits those events.</p>
+            </article>
+            <article class="card">
+              <h3>Hard block surface</h3>
+              <p><code>PreToolUse</code> blocking applies only to supported tool paths. Native subagent spawn may bypass that surface.</p>
+            </article>
+            <article class="card">
+              <h3>Live proof</h3>
+              <p><code>live-check</code> reads the actual transcript and SQLite edge state to verify model routes, open-slot counts, close release, and bypass evidence.</p>
+            </article>
           </div>
         </section>
 

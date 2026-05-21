@@ -16,8 +16,6 @@ const TRANSCRIPT_TAIL_BYTES = 12 * 1024 * 1024;
 const CHILD_SESSION_SCAN_MS = 36 * 60 * 60 * 1000;
 const SESSION_CAPACITY_GUIDANCE_TTL_MS = 24 * 60 * 60 * 1000;
 const PROMPT_CAPACITY_GUIDANCE_TTL_MS = 2 * 60 * 60 * 1000;
-const PROMPT_DELEGATION_GUIDANCE_TTL_MS = 90 * 60 * 1000;
-const PROMPT_CHILD_NO_SPAWN_GUIDANCE_TTL_MS = 90 * 60 * 1000;
 const SPAWN_RESERVATION_TTL_MS = 90 * 1000;
 const STATE_LOCK_WAIT_MS = 2500;
 const STATE_LOCK_STALE_MS = 10000;
@@ -568,13 +566,20 @@ async function sessionIdentity(payload) {
   const threadId = transcriptThreadId || directThreadId;
   const parentThreadId = parentThreadIdFromChildMeta(transcriptMeta) || directParentThreadId(payload);
   const poolThreadId = parentThreadId || threadId;
+  const unscoped = !poolThreadId;
   return {
     threadId,
     parentThreadId,
     poolThreadId,
     transcript,
-    key: poolThreadId ? `thread:${poolThreadId}` : stableSessionKey(payload),
+    key: poolThreadId ? `thread:${poolThreadId}` : `unscoped:${hashText(JSON.stringify({
+      event: hookEventName(payload),
+      tool: toolName(payload),
+      transcript,
+      prompt: promptText(payload),
+    }))}`,
     isChildSession: Boolean(parentThreadId) || directChildSessionFlag(payload),
+    unscoped,
   };
 }
 
@@ -648,6 +653,7 @@ function emptyTranscriptPool() {
     active: new Set(),
     spawned: new Set(),
     closed: new Set(),
+    missingClosed: new Set(),
     slotOccupied: 0,
     slotEstimateEvents: 0,
     slotEstimateReliable: false,
@@ -746,7 +752,21 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
       const closeIds = callId ? pendingCloseCalls.get(callId) : null;
       if (closeIds) {
         pendingCloseCalls.delete(callId);
-        if (textLooksCloseFailed(safeString(payload.output ?? payload.result ?? ""))) {
+        const outputText = safeString(payload.output ?? payload.result ?? "");
+        if (textLooksCloseTargetMissing(outputText)) {
+          for (const id of closeIds) {
+            pool.missingClosed.add(id);
+          }
+          const activeCloseIds = closeIds.filter((id) => pool.active.has(id));
+          for (const id of activeCloseIds) {
+            pool.closed.add(id);
+            pool.active.delete(id);
+            pool.lastCloseAtMs = Math.max(pool.lastCloseAtMs, eventTimestampMs(record));
+          }
+          if (activeCloseIds.length > 0) noteSlotClose(activeCloseIds.length);
+          continue;
+        }
+        if (textLooksCloseFailed(outputText)) {
           pool.failedCloses += closeIds.length;
           continue;
         }
@@ -891,15 +911,9 @@ async function transcriptHasTaskComplete(path) {
       handle = await open(path, "r");
       const buffer = Buffer.alloc(stats.size - start);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-      for (const line of buffer.subarray(0, bytesRead).toString("utf-8").split(/\r?\n/)) {
-        if (!line.includes('"task_complete"')) continue;
-        const record = parseJsonLine(line);
-        const payload = safeObject(record?.payload);
-        if (record?.type === "event_msg" && payload?.type === "task_complete") {
-          return true;
-        }
-      }
-      return false;
+      if (textHasTaskCompleteEvent(buffer.subarray(0, bytesRead).toString("utf-8"))) return true;
+      if (start === 0) return false;
+      return await scanTranscriptForTaskComplete(path, stats.size);
     } finally {
       try {
         await handle?.close();
@@ -912,23 +926,84 @@ async function transcriptHasTaskComplete(path) {
   }
 }
 
-async function repairClosedNativeEdges(parentThreadId, closedIds) {
-  const ids = [...(closedIds ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
-  if (!parentThreadId || ids.length === 0) return 0;
-  const dbPath = stateDbPath();
-  if (!existsSync(dbPath)) return 0;
+function textHasTaskCompleteEvent(text) {
+  for (const line of safeString(text).split(/\r?\n/)) {
+    if (!line.includes('"task_complete"')) continue;
+    const record = parseJsonLine(line);
+    const payload = safeObject(record?.payload);
+    if (record?.type === "event_msg" && payload?.type === "task_complete") {
+      return true;
+    }
+  }
+  return false;
+}
 
+async function scanTranscriptForTaskComplete(path, size) {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    const chunkSize = 1024 * 1024;
+    const buffer = Buffer.alloc(chunkSize);
+    let offset = 0;
+    let carry = "";
+    while (offset < size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(chunkSize, size - offset), offset);
+      if (bytesRead <= 0) break;
+      offset += bytesRead;
+      const text = carry + buffer.subarray(0, bytesRead).toString("utf-8");
+      const lines = text.split(/\r?\n/);
+      carry = lines.pop() ?? "";
+      if (textHasTaskCompleteEvent(lines.join("\n"))) return true;
+    }
+    return textHasTaskCompleteEvent(carry);
+  } catch {
+    return false;
+  } finally {
+    try {
+      await handle?.close();
+    } catch {
+      // best effort
+    }
+  }
+}
+
+async function repairClosedNativeEdgeIds(parentThreadId, closedIds) {
+  const ids = [...(closedIds ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
+  const parentId = safeString(parentThreadId).trim();
+  if (ids.length === 0 || !parentId) return new Set();
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return new Set();
+
+  const selectSql = [
+    "select child_thread_id",
+    "from thread_spawn_edges",
+    "where status!='closed'",
+    `and parent_thread_id=${sqlString(parentId)}`,
+    `and child_thread_id in (${ids.map(sqlString).join(",")});`,
+  ].join(" ");
   const sql = [
     "pragma busy_timeout=250;",
     "update thread_spawn_edges",
     "set status='closed'",
-    `where parent_thread_id=${sqlString(parentThreadId)}`,
-    "and status!='closed'",
+    "where status!='closed'",
+    `and parent_thread_id=${sqlString(parentId)}`,
     `and child_thread_id in (${ids.map(sqlString).join(",")});`,
     "select changes() as changed;",
   ].join(" ");
 
   try {
+    const { stdout: selectStdout } = await execFileAsync("sqlite3", ["-json", dbPath, selectSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const repairableRows = parseSqliteJsonOutput(selectStdout);
+    const repairableIds = new Set(
+      (Array.isArray(repairableRows) ? repairableRows : [])
+        .map((row) => safeString(row?.child_thread_id).trim())
+        .filter(Boolean),
+    );
+    if (repairableIds.size === 0) return repairableIds;
+
     const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
       timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
       maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
@@ -938,15 +1013,113 @@ async function repairClosedNativeEdges(parentThreadId, closedIds) {
     if (changed > 0) {
       await appendAdvisorLog({
         event: "native_edge_close_repair",
-        parent_thread_id: parentThreadId,
+        parent_thread_id: parentId,
         requested: ids.length,
         changed,
       });
     }
-    return Number.isFinite(changed) ? changed : 0;
+    return changed > 0 ? repairableIds : new Set();
   } catch {
-    return 0;
+    return new Set();
   }
+}
+
+async function repairUniqueMissingNativeEdgeIds(closedIds) {
+  const ids = [...(closedIds ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
+  if (ids.length === 0) return new Map();
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return new Map();
+
+  const selectSql = [
+    "select parent_thread_id,child_thread_id",
+    "from thread_spawn_edges",
+    "where status!='closed'",
+    `and child_thread_id in (${ids.map(sqlString).join(",")})`,
+    "order by child_thread_id,parent_thread_id;",
+  ].join(" ");
+
+  try {
+    const { stdout: selectStdout } = await execFileAsync("sqlite3", ["-json", dbPath, selectSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(selectStdout);
+    const parentsByChild = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const childId = safeString(row?.child_thread_id).trim();
+      const parentId = safeString(row?.parent_thread_id).trim();
+      if (!childId || !parentId) continue;
+      if (!parentsByChild.has(childId)) parentsByChild.set(childId, new Set());
+      parentsByChild.get(childId).add(parentId);
+    }
+
+    const uniquePairs = [];
+    for (const [childId, parentIds] of parentsByChild.entries()) {
+      if (parentIds.size !== 1) continue;
+      uniquePairs.push([childId, [...parentIds][0]]);
+    }
+    if (uniquePairs.length === 0) return new Map();
+
+    const conditions = uniquePairs
+      .map(([childId, parentId]) => `(parent_thread_id=${sqlString(parentId)} and child_thread_id=${sqlString(childId)})`)
+      .join(" or ");
+    const sql = [
+      "pragma busy_timeout=250;",
+      "update thread_spawn_edges",
+      "set status='closed'",
+      "where status!='closed'",
+      `and (${conditions});`,
+      "select changes() as changed;",
+    ].join(" ");
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = Number(parseSqliteJsonOutput(stdout)?.[0]?.changed ?? 0);
+    if (changed <= 0) return new Map();
+
+    const repaired = new Map(uniquePairs);
+    await appendAdvisorLog({
+      event: "native_edge_close_not_found_unique_child_repair",
+      requested: ids.length,
+      changed,
+      repaired: [...repaired.entries()].map(([child_thread_id, parent_thread_id]) => ({
+        child_thread_id,
+        parent_thread_id,
+      })),
+    });
+    return repaired;
+  } catch {
+    return new Map();
+  }
+}
+
+async function repairClosedNativeEdges(parentThreadId, closedIds) {
+  return (await repairClosedNativeEdgeIds(parentThreadId, closedIds)).size;
+}
+
+async function applyMissingCloseEvidence(parentThreadId, transcriptPool, nativeThreadEdges) {
+  const ids = [...(transcriptPool?.missingClosed ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
+  const parentId = safeString(parentThreadId).trim();
+  if (!parentId || ids.length === 0) return 0;
+
+  const repairedIds = await repairClosedNativeEdgeIds(parentId, ids);
+  const nativeAuthoritative = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
+  const effectiveIds = nativeAuthoritative ? repairedIds : new Set(ids);
+  for (const id of effectiveIds) {
+    nativeThreadEdges?.active?.delete(id);
+    nativeThreadEdges?.terminal?.delete(id);
+    nativeThreadEdges?.closed?.add(id);
+  }
+  if (repairedIds.size > 0) {
+    await appendAdvisorLog({
+      event: "native_edge_close_not_found_repair",
+      parent_thread_id: parentId,
+      requested: ids.length,
+      changed: repairedIds.size,
+    });
+  }
+  return repairedIds.size;
 }
 
 async function maintainNativePoolStorage(state, nowMs, nowIso) {
@@ -983,6 +1156,7 @@ async function discoverNativeThreadEdges(parentThreadId) {
     if (!Array.isArray(rows)) return edges;
 
     edges.checked = true;
+    const terminalRepairCandidates = [];
     for (const row of rows) {
       const childId = safeString(row?.child_thread_id).trim();
       if (!childId) continue;
@@ -1002,9 +1176,20 @@ async function discoverNativeThreadEdges(parentThreadId) {
         edges.closed.add(childId);
       } else {
         if (await transcriptHasTaskComplete(safeString(row?.rollout_path).trim())) {
-          edges.terminal.add(childId);
+          terminalRepairCandidates.push(childId);
         } else {
           edges.active.add(childId);
+        }
+      }
+    }
+    if (terminalRepairCandidates.length > 0) {
+      const repairedIds = await repairClosedNativeEdgeIds(parentThreadId, terminalRepairCandidates);
+      edges.repaired = repairedIds.size;
+      for (const childId of terminalRepairCandidates) {
+        if (repairedIds.has(childId)) {
+          edges.closed.add(childId);
+        } else {
+          edges.terminal.add(childId);
         }
       }
     }
@@ -1076,6 +1261,7 @@ async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT
     discoverRecentChildSessionIds(poolThreadId, nowMs, resetAtMs),
     discoverNativeThreadEdges(poolThreadId),
   ]);
+  await applyMissingCloseEvidence(poolThreadId, transcriptPool, nativeThreadEdges);
   return { transcriptPool, childSessionIds, nativeThreadEdges, poolThreadId };
 }
 
@@ -1181,6 +1367,12 @@ function operationModel(operation) {
   return safeString(operation?.input?.model).trim();
 }
 
+function operationForkContext(operation) {
+  const value = operation?.input?.fork_context ?? operation?.input?.forkContext;
+  if (typeof value === "boolean") return value;
+  return /^(?:1|true|yes)$/i.test(safeString(value).trim());
+}
+
 function operationReasoningEffort(operation) {
   return safeString(operation?.input?.reasoning_effort ?? operation?.input?.reasoningEffort).trim();
 }
@@ -1217,7 +1409,30 @@ function hasExplorerModelRouteViolationInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
     if (!["explore", "explorer"].includes(operationAgentType(operation))) return false;
+    if (operationForkContext(operation) && !operationModel(operation)) return false;
     return !explorerModels().includes(operationModel(operation));
+  });
+}
+
+function hasForkContextModelConflictInOperations(operations) {
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    return operationForkContext(operation) && Boolean(operationModel(operation));
+  });
+}
+
+function hasForkContextModelInheritanceInOperations(operations) {
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    return operationForkContext(operation) && !operationModel(operation);
+  });
+}
+
+function hasMissingSpawnModelInOperations(operations) {
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    if (operationForkContext(operation)) return false;
+    return !operationModel(operation);
   });
 }
 
@@ -1366,6 +1581,12 @@ function textLooksCloseFailed(text) {
   );
 }
 
+function textLooksCloseTargetMissing(text) {
+  return /(?:unknown agent|agent (?:with id [A-Za-z0-9_.:-]+ )?not found|no such agent|invalid agent(?: id)?|agent [A-Za-z0-9_.:-]+ not found|(?:agent|代理|智能体)[^.!?\n]{0,80}(?:不存在|未找到))/i.test(
+    safeString(text),
+  );
+}
+
 function textLooksSpawnCapacityFailure(text) {
   return /(?:collab spawn failed|agent thread limit reached|thread limit reached|pool[- ]?exhaustion|pool[^.!?\n]{0,80}(?:full|exhausted)|无法生成|不能启动|名额[^.!?\n]{0,80}满|数量[^.!?\n]{0,80}上限|线程上限|子代理[^.!?\n]{0,80}(?:上限|已满)|智能体[^.!?\n]{0,80}(?:上限|已满)|native[^.!?\n]{0,80}(?:agent|subagent)[^.!?\n]{0,80}(?:limit|cap)[^.!?\n]{0,80}(?:reached|full|exhausted)|(?:limit|cap)[^.!?\n]{0,80}(?:reached|full|exhausted)[^.!?\n]{0,80}native[^.!?\n]{0,80}(?:agent|subagent))/i.test(
     safeString(text),
@@ -1374,6 +1595,10 @@ function textLooksSpawnCapacityFailure(text) {
 
 function closeLooksFailed(payload) {
   return textLooksCloseFailed(responseText(payload));
+}
+
+function closeLooksTargetMissing(payload) {
+  return textLooksCloseTargetMissing(responseText(payload));
 }
 
 function toolCallId(payload) {
@@ -1532,9 +1757,9 @@ function looksLikeDelegationPrompt(prompt) {
   return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bagents?\b|\bpool\b|\bcap\b|\blimit\b|\bcritics?\b|\breviewers?\b|\breviews?\b|\bverifiers?\b|\bverif(?:y|ier|ication)\b|\bresearchers?\b|\baudit(?:or|ing)?\b|\bdelegate\b|\bparallel\b|\bfan[ -]?out\b|子代理|智能体|代理|上限|满池|名额|槽位|并行|派发|审查代理|验证代理|评审代理|复审代理|验收代理|审查|复核|评审|审计|验证|深度推理|第一性原理)/i.test(normalized);
 }
 
-function looksLikeRepoContextPrompt(prompt) {
+function looksLikeSpawnIntentPrompt(prompt) {
   const normalized = safeString(prompt).toLowerCase();
-  return /(?:\brg\b|\bgrep\b|\bglob\b|\bfind\b|\bscan\b|\bsearch\b|\blookup\b|\binspect\b|\btrace\b|\bdebug\b|\breview\b|\baudit\b|\brefactor\b|\bcodebase\b|\brepo(?:sitory)?\b|\bworkspace\b|\bsymbol\b|\breferences?\b|\bcallers?\b|\btests?\b|\bpytest\b|\bhooks?\b|\.claude|\.codex|agents\.md|spark|mini|子代理|智能体|代码库|代码|仓库|工作区|全局|搜索|检索|查找|定位|扫描|查看|阅读|排查|调试|审查|复核|重构|测试|上下文|污染|文件|符号|引用)/i.test(normalized);
+  return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bagents?\b|\bexplorers?\b|\breviewers?\b|\bverifiers?\b|\bresearchers?\b|\bcritics?\b|\bparallel\b|\bfan[ -]?out\b|子代理|智能体|代理|explorer|并行|派发|审查代理|验证代理|评审代理|复审代理|调查代理|研究代理)/i.test(normalized);
 }
 
 function hasRecentCapacityPressure(session, nowMs) {
@@ -1553,7 +1778,7 @@ function hasPromptCapacityPressure(summary) {
     summary
       && (
         summary.occupied > 0
-        || summary.cap_hit_after_last_close
+        || summary.cap_hit_blocks_spawn
         || summary.failed_closes > 0
         || summary.pending_spawn_reservations > 0
       ),
@@ -1561,13 +1786,13 @@ function hasPromptCapacityPressure(summary) {
 }
 
 function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSession, promptSummary = null, cap = DEFAULT_AGENT_CAP) {
+  if (isChildSession) return false;
   if (eventName === "SessionStart") {
-    if (isChildSession) return false;
     const criticalPressure = Boolean(
       promptSummary
         && (
           remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
-          || promptSummary.cap_hit_after_last_close
+          || promptSummary.cap_hit_blocks_spawn
           || promptSummary.failed_closes > 0
           || promptSummary.pending_spawn_reservations > 0
           || (promptSummary.native_edge_overflow ?? 0) > 0
@@ -1589,38 +1814,17 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
     promptSummary
       && (
         remainingSpawnBudget(promptSummary, cap) <= warnRemaining()
-        || promptSummary.cap_hit_after_last_close
+        || promptSummary.cap_hit_blocks_spawn
+        || (promptSummary.native_edge_overflow ?? 0) > 0
       ),
   );
   if (criticalPressure) return true;
+  if (looksLikeSpawnIntentPrompt(prompt)) return true;
 
   const signature = hashText(prompt.trim().toLowerCase());
   const last = msFromIso(session.last_capacity_prompt_guidance_at);
   if (last && nowMs - last < PROMPT_CAPACITY_GUIDANCE_TTL_MS) return false;
   if (session.last_capacity_prompt_signature === signature && last) return false;
-  return true;
-}
-
-function shouldEmitDelegationGuidance(eventName, prompt, session, nowMs, isChildSession) {
-  if (eventName !== "UserPromptSubmit") return false;
-  if (isChildSession) return false;
-  if (!looksLikeRepoContextPrompt(prompt)) return false;
-
-  const signature = hashText(prompt.trim().toLowerCase());
-  const last = msFromIso(session.last_delegation_prompt_guidance_at);
-  if (last && nowMs - last < PROMPT_DELEGATION_GUIDANCE_TTL_MS) return false;
-  if (session.last_delegation_prompt_signature === signature && last) return false;
-  return true;
-}
-
-function shouldEmitChildNoSpawnGuidance(eventName, prompt, session, nowMs, isChildSession) {
-  if (eventName !== "UserPromptSubmit") return false;
-  if (!isChildSession) return false;
-
-  const signature = hashText(prompt.trim().toLowerCase());
-  const last = msFromIso(session.last_child_no_spawn_guidance_at);
-  if (last && nowMs - last < PROMPT_CHILD_NO_SPAWN_GUIDANCE_TTL_MS) return false;
-  if (session.last_child_no_spawn_signature === signature && last) return false;
   return true;
 }
 
@@ -1635,19 +1839,9 @@ function markCapacityGuidanceEmitted(eventName, prompt, session, nowIso) {
   }
 }
 
-function markDelegationGuidanceEmitted(prompt, session, nowIso) {
-  session.last_delegation_prompt_guidance_at = nowIso;
-  session.last_delegation_prompt_signature = hashText(prompt.trim().toLowerCase());
-}
-
-function markChildNoSpawnGuidanceEmitted(prompt, session, nowIso) {
-  session.last_child_no_spawn_guidance_at = nowIso;
-  session.last_child_no_spawn_signature = hashText(prompt.trim().toLowerCase());
-}
-
 function remainingSpawnBudget(summary, cap) {
   if (!summary) return cap;
-  if (summary.cap_hit_after_last_close) return 0;
+  if (summary.cap_hit_blocks_spawn) return 0;
   return Math.max(0, cap - (summary.occupied ?? 0));
 }
 
@@ -1655,7 +1849,7 @@ function nativeEdgeSummary(summary) {
   if (summary?.native_edge_failed) return "unavailable";
   if (summary?.native_edge_checked) {
     const authority = summary.native_edge_authoritative ? "authoritative" : "fallback";
-    return `open=${summary.native_edge_active}, terminal_open=${summary.native_edge_terminal ?? 0}, unresolved_open_edges=${summary.native_edge_unresolved ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
+    return `slot_open=${summary.native_edge_active ?? 0}, slot_terminal=${summary.native_edge_terminal ?? 0}, slot_estimate=${summary.native_edge_slot_occupied ?? summary.occupied}/${summary.native_edge_cap ?? "?"}, ledger_lag=${summary.native_edge_ledger_lag ?? 0}, db_open_edge_debt=${summary.native_edge_debt ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
   }
   return "not_checked";
 }
@@ -1692,57 +1886,81 @@ function terminalCloseTargetGuidance(summary) {
   const lanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
   if (activeLanes.length === 0 && lanes.length === 0) return "";
   const activeText = activeLanes.length > 0
-    ? `Open native lanes without task_complete evidence: ${activeLanes.map(formatTerminalLaneSummary).join(" | ")}.`
+    ? `Current-parent open native lanes without task_complete evidence: ${activeLanes.map(formatTerminalLaneSummary).join(" | ")}.`
     : "";
   const terminalText = lanes.length > 0
-    ? `Completed-not-closed native edge candidates: ${lanes.map(formatTerminalLaneSummary).join(" | ")}.`
+    ? `Current-parent completed-not-closed native edge candidates: ${lanes.map(formatTerminalLaneSummary).join(" | ")}.`
     : "";
-  return `${activeText} ${terminalText} Runtime occupied slots are capped by the native pool; these rows are close/reuse/reset candidates, not proof of more than the cap. If a listed lane is still reachable and useful, reuse it with send_input; if it is reachable but no longer useful, close_agent it. Only a successful close_agent result decrements the slot estimate. If close_agent fails, treat that row as stale/unreachable and use explicit reset/repair tooling rather than counting it as freed capacity.`.trim();
+  const overflowText = (summary?.native_edge_overflow ?? 0) > 0
+    ? `Native DB open-edge debt exceeds the ${summary.native_edge_cap ?? "configured"}-slot runtime cap: db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}. Overflow rows are repair debt, not additional live agents.`
+    : "";
+  return `${activeText} ${terminalText} ${overflowText} Runtime occupied slots are capped by the native pool. These rows affect only this parent/session; rows from other parent sessions are diagnostic reset debt, not admission evidence here. Only a successful close_agent result or runtime not-found close evidence decrements the slot estimate for a current-parent lane. Other close_agent failures do not free capacity.`.trim();
+}
+
+function zeroBudgetRecoveryGuidance(summary) {
+  const activeLanes = Array.isArray(summary?.native_active_lanes) ? summary.native_active_lanes : [];
+  const terminalLanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
+  const hasListedLane = activeLanes.length > 0 || terminalLanes.length > 0;
+  const candidateText = terminalLanes.length > 0
+    ? "Prefer completed-not-closed candidates first."
+    : activeLanes.length > 0
+    ? "Only close an active lane when the leader knows it is no longer needed; otherwise reuse it, wait for it, or continue locally."
+    : "No current-parent close target is listed; treat this as a state mismatch and verify hook/native DB state instead of retrying spawn.";
+  return [
+    "ZERO_BUDGET_RECOVERY_REQUIRED=true.",
+    "Do not stop at saying the subagent pool is full.",
+    "Before any new spawn, choose one recovery action: reuse a compatible current-parent lane with send_input, close listed current-parent lane(s) that are no longer needed, wait for an active lane if its result is needed, or continue locally.",
+    candidateText,
+    hasListedLane
+      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and then obey the refreshed remaining_spawn_budget; multiple independent lanes are allowed when budget permits."
+      : "If live state says fewer lanes exist than the hook snapshot, run a fresh hook/live check and use the newer scoped budget."
+  ].join(" ");
 }
 
 function buildTurnBudgetGuidance(summary, cap) {
   if (!summary) return "";
   const remaining = remainingSpawnBudget(summary, cap);
+  const hardDirective = remaining === 0
+    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget snapshot). remaining_spawn_budget=0: do not call spawn_agent from this capacity snapshot. First close known no-longer-needed current-parent lane(s) or continue locally. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state."
+    : `SPAWN_AGENT_LOCAL_COUNTER_START=${remaining}. You may launch up to this many spawn_agent calls from this capacity snapshot; each spawn_agent call immediately decrements this local counter.`;
   return [
-    `Current native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_current=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}.`,
+    hardDirective,
+    `Current parent/session native subagent budget: occupied=${summary.occupied}/${cap}, remaining_spawn_budget=${remaining}, slot_pressure_source=${summary.slot_pressure_source}, ledger_slot=${summary.tracked_occupied}, ledger_unresolved=${summary.tracked_unresolved}, transcript_slot=${summary.transcript_occupied}, transcript_unresolved=${summary.transcript_unresolved}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, reserved_spawns=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`,
+    remaining === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
     terminalCloseTargetGuidance(summary),
-    "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result.",
-    "When remaining_spawn_budget is 0, do not call spawn_agent. Reuse a compatible completed lane with send_input, wait for active agents, continue locally, or close a no-longer-needed lane first.",
+    "For this assistant response, maintain this as a hard local counter: every spawn_agent call consumes 1 immediately; wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
+    "When remaining_spawn_budget is 0, do not call spawn_agent. Continue locally or close known no-longer-needed current-parent lane(s) first; send_input and wait_agent do not increase the spawn budget. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
   ].filter(Boolean).join(" ");
+}
+
+function buildSubagentModelSelectionGuidance() {
+  return [
+    "SUBAGENT_MODEL_SELECTION_REQUIRED=true. SUBAGENT_MODEL_DECISION_REQUIRED=true.",
+    "Before any spawn_agent call, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}.",
+    `Every spawn_agent call in this assistant response must include an explicit model. If there is no stronger reason, default to model="${explorerFallbackModel()}".`,
+    `Use model="${explorerModel()}" only for read-only scout output: grep/file maps, symbol/log filters, candidate file:line anchors, or hypotheses with a strict output cap and no durable verdict.`,
+    `Use model="${explorerFallbackModel()}" for multi-hop tracing, compact synthesis, bounded verification, config/test interpretation, or light low-risk execution where the child owns a durable conclusion.`,
+    `Use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`,
+    "Do not combine fork_context=true with model. If you need Spark/mini/frontier model routing, remove fork_context and pass a compact context packet in message/items. Use fork_context=true without model only when exact full-history context matters more than model routing; that path may inherit the parent model.",
+    "If you cannot state the child output cap and stop condition, do not use Spark; slice locally first or choose mini.",
+    "Do not launch more lanes than the confirmed free-slot count. Multiple child lanes are allowed when each has an independent task contract and the batch size is within remaining_spawn_budget.",
+    "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Spark exact slices to anchor, and use mini/frontier for synthesis.",
+    "This judgment step is mandatory; never omit model, because omitted model inherits the parent frontier model.",
+    "This is a spawn-shape guard, not a recommendation to create a subagent.",
+  ].join(" ");
 }
 
 function buildCapacityGuidance(eventName, cap, summary = null) {
   return [
     buildTurnBudgetGuidance(summary, cap),
-    `Native subagent capacity protocol (launch sequencing only): this parent session has a native child-agent cap of ${cap}; some Codex/App spawn surfaces do not run PreToolUse before spawn_agent, so treat this as a hard self-enforced launch budget.`,
-    "Do not batch native spawn_agent calls: if reviewer+verifier/critic/researcher lanes are useful, first reuse a compatible completed lane with send_input; otherwise launch at most one native subagent, wait for the spawn result or confirmed free-slot evidence, then decide whether one more is still worth it.",
-    "Completed children preserve valuable task context and still consume slots until close succeeds; keep useful lanes open for related follow-up, and close only stale/irrelevant/wrong-role lanes when capacity is needed.",
-    "If this thread already saw a pool-exhaustion failure and no later close is confirmed, do not call spawn_agent again in the same turn even when the local ledger estimates fewer than the cap.",
+    buildSubagentModelSelectionGuidance(),
+    `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
+    "Batch native spawn_agent calls only when requested_spawns <= remaining_spawn_budget and each lane has an independent task contract. If any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes budget.",
+    "Open children without task_complete evidence can consume slots until close succeeds; stale open edges with task_complete evidence are repaired to closed and excluded from current occupancy.",
+    "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, or explicit reset refreshes budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit.",
     "Do not restate/retry long child prompts after a capacity failure.",
-    "This protocol does not decide whether to delegate, reuse, or close a lane; it only prevents wasteful native pool collisions.",
+    "This protocol does not recommend delegation, reuse, or messaging a child lane; it only prevents wasteful native pool collisions.",
   ].filter(Boolean).join(" ");
-}
-
-function buildDelegationGuidance(cap) {
-  return [
-    `Codex context hygiene delegation protocol: treat native subagents as the default context-isolation layer for broad repo lookup, file/symbol mapping, grep-like scans, lightweight review probes, and bounded verification; the leader should preserve main-thread context for judgment, integration, and final decisions.`,
-    `Explorer model routing: choose by output contract, risk, and state depth, not by a few complexity words. ${explorerModel()} is the near-instant scout lane: use it for bounded read-only probes, grep/file maps, symbol lookup, log filtering, candidate file:line anchors, hypothesis sampling, and fast evidence collection inside larger reasoning workflows.`,
-    `${explorerFallbackModel()} is the reasoning explorer / light executor lane: use it for multi-hop code-path traces, compact evidence synthesis, small low-risk edits, config+test interpretation, and bounded verification that needs a durable conclusion but not frontier judgment.`,
-    `Before doing multiple broad rg/sed/cat reads in the leader context, reuse a compatible existing explorer lane with send_input; if no useful lane exists, launch one bounded explorer subagent when that lookup can be isolated. Native explorer spawns must set agent_type=explorer and one of these allowed models: ${explorerModelListText()}. Do not inherit a frontier model for read-only lookup.`,
-    `Spark is not banned from complex workflows; it should be used there as a scout/anchor collector with a tight stop condition and output cap. If a Spark child starts needing compaction or broad synthesis, it should stop and return anchors plus an escalation recommendation to the leader.`,
-    "Explorer prompts must be self-contained: exact cwd, scope, read/write permission, requested evidence shape, output budget, and stop condition. Ask for file:line evidence and a short synthesis, not raw dumps.",
-    "For implementation, destructive actions, architectural decisions, or final approval, the leader remains responsible; subagents gather evidence and run bounded checks only.",
-    `Respect the native child-agent cap (${cap}) by reusing relevant lanes first and launching at most one new native subagent at a time unless confirmed free slots and true independence justify another.`,
-  ].join(" ");
-}
-
-function buildChildNoSpawnGuidance(cap) {
-  return [
-    `Native child-agent boundary: this session is already a child subagent inside a parent thread with cap ${cap}.`,
-    "Do not call spawn_agent from a child session. Do not recursively create critic/reviewer/verifier/researcher/explorer agents, even for broad grep-style lookup.",
-    "Complete the assigned slice locally with read-only shell/tools, keep output concise with file:line evidence, and report any recommended follow-up delegation upward to the leader.",
-    "If more parallel review is needed, the parent leader owns closing old agents and launching exactly one new native child per confirmed free slot.",
-  ].join(" ");
 }
 
 function buildPromptGuidanceOutput(eventName, contexts) {
@@ -1760,11 +1978,13 @@ function summarize(session) {
   });
   const running = agents.filter((agent) => agent.status === "running").length;
   const terminal = agents.filter((agent) => agent.status === "terminal_not_closed").length;
+  const trackedAgentIds = agents.map((agent) => safeString(agent.id).trim()).filter(Boolean);
   const pendingSpawnReservations = spawnReservationCount(session);
   const trackedOccupied = running + terminal;
   return {
     running,
     terminal,
+    tracked_agent_ids: trackedAgentIds,
     pending_spawn_reservations: pendingSpawnReservations,
     tracked_occupied: trackedOccupied,
     occupied: trackedOccupied + pendingSpawnReservations,
@@ -1787,15 +2007,22 @@ function msFromIso(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs = 0, cap = DEFAULT_AGENT_CAP) {
+function mergeSummary(
+  sessionSummary,
+  transcriptPool,
+  childSessionIds,
+  nativeThreadEdges,
+  session,
+  resetAtMs = 0,
+  cap = DEFAULT_AGENT_CAP,
+) {
   const capValue = slotCap(cap);
   const nativeClosed = new Set(nativeThreadEdges?.closed ?? []);
   const nativeActive = new Set(nativeThreadEdges?.active ?? []);
   const nativeTerminal = new Set(nativeThreadEdges?.terminal ?? []);
   const nativeLanes = nativeThreadEdges?.lanes instanceof Map ? nativeThreadEdges.lanes : new Map();
   const nativeChecked = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
-  const nativeEdgeTotal = nativeClosed.size + nativeActive.size + nativeTerminal.size;
-  const nativeAuthoritative = nativeChecked && (nativeEdgeTotal > 0 || resetAtMs > 0);
+  const nativeAuthoritative = nativeChecked;
   const transcriptActive = new Set(transcriptPool.active ?? []);
   if (!nativeAuthoritative) {
     for (const id of childSessionIds ?? []) {
@@ -1816,34 +2043,50 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
   );
   const transcriptSlotReliable = transcriptEstimateCanOverrideFallback;
   const nativeUnresolved = nativeActive.size + nativeTerminal.size;
-  const nativeSlotOccupied = clampSlotCount(nativeUnresolved, capValue);
+  const nativeSlotActive = clampSlotCount(nativeActive.size, capValue);
+  const nativeSlotTerminal = clampSlotCount(
+    Math.min(nativeTerminal.size, Math.max(0, capValue - nativeSlotActive)),
+    capValue,
+  );
+  const nativeSlotOccupied = clampSlotCount(nativeSlotActive + nativeSlotTerminal, capValue);
+  const nativeEdgeOverflow = Math.max(0, nativeUnresolved - capValue);
   const trackedUnresolved = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
   const trackedOccupied = clampSlotCount(trackedUnresolved, capValue);
+  const trackedAgentIds = new Set(sessionSummary.tracked_agent_ids ?? []);
+  const nativeLedgerLagIds = nativeAuthoritative
+    ? [...trackedAgentIds].filter((id) => !nativeActive.has(id) && !nativeTerminal.has(id) && !nativeClosed.has(id))
+    : [];
+  const nativeLedgerLag = nativeLedgerLagIds.length;
   const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
-  const lastCapHitMs = Math.max(
+  const rawLastCapHitMs = Math.max(
     transcriptPool.capHitAtMs || 0,
     msFromIso(session.last_cap_hit_at),
   );
-  const lastCloseMs = Math.max(
+  const rawLastCloseMs = Math.max(
     transcriptPool.lastCloseAtMs || 0,
     msFromIso(session.last_close_at),
   );
+  const lastCapHitMs = rawLastCapHitMs > resetAtMs ? rawLastCapHitMs : 0;
+  const lastCloseMs = Math.max(rawLastCloseMs, resetAtMs);
   const capHitAfterLastClose = lastCapHitMs > 0 && lastCapHitMs > lastCloseMs;
+  const capHitBlocksSpawn = Boolean(capHitAfterLastClose && !nativeAuthoritative);
   let evidenceOccupied = transcriptSlotOccupied;
   let slotPressureSource = "transcript_fallback";
-  if (nativeAuthoritative && nativeUnresolved <= capValue) {
-    evidenceOccupied = nativeSlotOccupied;
-    slotPressureSource = "native_open_edges";
+  if (nativeAuthoritative) {
+    evidenceOccupied = clampSlotCount(nativeUnresolved + nativeLedgerLag, capValue);
+    slotPressureSource = nativeUnresolved > capValue
+      ? "native_open_edges_saturated"
+      : nativeLedgerLag > 0
+      ? "native_open_edges_plus_ledger"
+      : "native_open_edges";
   } else if (transcriptSlotReliable) {
     evidenceOccupied = transcriptSlotOccupied;
     slotPressureSource = "transcript_events";
-  } else if (nativeAuthoritative) {
-    evidenceOccupied = nativeSlotOccupied;
-    slotPressureSource = "native_open_edges_saturated";
   }
-  const effectiveOccupied = capHitAfterLastClose
+  const trackedAdmission = nativeAuthoritative ? 0 : trackedOccupied;
+  const effectiveOccupied = capHitBlocksSpawn
     ? capValue
-    : clampSlotCount(Math.max(trackedOccupied, evidenceOccupied) + pendingSpawnReservations, capValue);
+    : clampSlotCount(Math.max(trackedAdmission, evidenceOccupied) + pendingSpawnReservations, capValue);
 
   return {
     ...sessionSummary,
@@ -1861,18 +2104,25 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     native_edge_checked: Boolean(nativeThreadEdges?.checked),
     native_edge_authoritative: nativeAuthoritative,
     native_edge_failed: Boolean(nativeThreadEdges?.failed),
-    native_edge_active: nativeActive.size,
+    native_edge_active: nativeSlotActive,
+    native_edge_active_debt: nativeActive.size,
     native_edge_closed: nativeClosed.size,
-    native_edge_terminal: nativeTerminal.size,
+    native_edge_terminal: nativeSlotTerminal,
+    native_edge_terminal_debt: nativeTerminal.size,
+    native_edge_slot_occupied: nativeSlotOccupied,
+    native_edge_debt: nativeUnresolved,
     native_edge_unresolved: nativeUnresolved,
-    native_edge_overflow: Math.max(0, nativeUnresolved - capValue),
+    native_edge_ledger_lag: nativeLedgerLag,
+    native_edge_ledger_lag_ids: nativeLedgerLagIds.slice(0, capValue),
+    native_edge_overflow: nativeEdgeOverflow,
+    native_edge_cap: capValue,
     slot_pressure_source: slotPressureSource,
-    native_terminal_ids: [...nativeTerminal].slice(0, DEFAULT_AGENT_CAP),
+    native_terminal_ids: [...nativeTerminal].slice(0, nativeSlotTerminal),
     native_terminal_lanes: [...nativeTerminal]
-      .slice(0, DEFAULT_AGENT_CAP)
+      .slice(0, nativeSlotTerminal)
       .map((id) => nativeLanes.get(id) ?? { id }),
     native_active_lanes: [...nativeActive]
-      .slice(0, DEFAULT_AGENT_CAP)
+      .slice(0, nativeSlotActive)
       .map((id) => nativeLanes.get(id) ?? { id }),
     native_edge_repaired: nativeThreadEdges?.repaired ?? 0,
     failed_spawns: transcriptPool.failedSpawns ?? 0,
@@ -1881,6 +2131,7 @@ function mergeSummary(sessionSummary, transcriptPool, childSessionIds, nativeThr
     last_close_at: isoFromMs(lastCloseMs),
     native_pool_reset_at: isoFromMs(resetAtMs),
     cap_hit_after_last_close: capHitAfterLastClose,
+    cap_hit_blocks_spawn: capHitBlocksSpawn,
   };
 }
 
@@ -1889,11 +2140,13 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const ops = operations ?? agentOperations(payload ?? {}, name);
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
-  if (hasExplorerModelRouteViolationInOperations(ops)) return true;
   if (isChildSession) return true;
+  if (hasForkContextModelConflictInOperations(ops)) return true;
+  if (hasMissingSpawnModelInOperations(ops)) return true;
+  if (hasExplorerModelRouteViolationInOperations(ops)) return true;
   if (summary.native_edge_failed) return true;
   if (summary.occupied + requestedSpawns > cap) return true;
-  if (summary.tracked_occupied + requestedSpawns > cap) return true;
+  if (!summary.native_edge_authoritative && summary.tracked_occupied + requestedSpawns > cap) return true;
   if (
     !summary.native_edge_authoritative
     && summary.transcript_scanned
@@ -1901,7 +2154,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   ) {
     return true;
   }
-  return Boolean(summary.cap_hit_after_last_close);
+  return Boolean(summary.cap_hit_blocks_spawn);
 }
 
 function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
@@ -1909,6 +2162,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   if (ops.length === 0) return false;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
+  if (hasForkContextModelInheritanceInOperations(ops)) return true;
   if (hasExplorerContractAdvisoryInOperations(ops)) return true;
   const threshold = Math.max(1, cap - warnRemaining());
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
@@ -1916,9 +2170,13 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
 
 function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payload = null, operations = null) {
   const ops = operations ?? agentOperations(payload ?? {}, "");
-  const explorerModelRouteViolation = hasExplorerModelRouteViolationInOperations(ops);
-  const preferredExplorerContractAdvisory = hasPreferredExplorerContractAdvisoryInOperations(ops);
-  const fallbackExplorerContractAdvisory = hasFallbackExplorerContractAdvisoryInOperations(ops);
+  const checkSpawnShape = !isChildSession;
+  const missingSpawnModel = checkSpawnShape && hasMissingSpawnModelInOperations(ops);
+  const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
+  const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
+  const explorerModelRouteViolation = checkSpawnShape && hasExplorerModelRouteViolationInOperations(ops);
+  const preferredExplorerContractAdvisory = checkSpawnShape && hasPreferredExplorerContractAdvisoryInOperations(ops);
+  const fallbackExplorerContractAdvisory = checkSpawnShape && hasFallbackExplorerContractAdvisoryInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
@@ -1928,18 +2186,28 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     `ledger_unresolved=${summary.tracked_unresolved}`,
     `transcript_slot=${summary.transcript_occupied}`,
     `transcript_unresolved=${summary.transcript_unresolved}`,
-    `native_current=${nativeEdgeSummary(summary)}`,
+    `native_slots=${nativeEdgeSummary(summary)}`,
     `reserved_spawns=${summary.pending_spawn_reservations}`,
     `running=${summary.running}`,
     `completed_not_closed=${summary.terminal}`,
     `failed_closes=${summary.failed_closes}`,
     `cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}`,
+    `cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}`,
   ];
 
   const context = [
     parts.join(", ") + ".",
+    forkContextModelConflict
+      ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry corrected independent spawn call(s) only while remaining_spawn_budget is still positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
+      : null,
+    missingSpawnModel
+      ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+      : null,
+    forkContextModelInheritance
+      ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for explorer/scout/mini routing, remove fork_context and pass compact context instead."
+      : null,
     explorerModelRouteViolation
-      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for fast scout/probe work and ${explorerFallbackModel()} for reasoning explorer or light executor work. Do not inherit a frontier model for read-only lookup.`
+      ? `Explorer native spawn is blocked until tool input explicitly sets an allowed explorer model (${explorerModelListText()}). Use ${explorerModel()} for capped scout/probe anchors and ${explorerFallbackModel()} for reasoning explorer, synthesis, verification, or light executor work. Do not inherit a frontier model for read-only lookup.`
       : null,
     preferredExplorerContractAdvisory
       ? `Explorer route advisory, not a block: ${explorerModel()} is useful even inside complex work when the output contract is scout/anchor collection. Keep the prompt bounded with exact scope, file:line evidence, output cap, and stop condition; if the child must synthesize a durable verdict, edit files, approve a claim, or repeatedly compact, route that follow-up to ${explorerFallbackModel()} or a frontier reviewer.`
@@ -1948,19 +2216,23 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       ? `Explorer route advisory, not a block: this looks like a narrow scan that ${explorerModel()} can usually handle faster. ${explorerFallbackModel()} remains valid when you want more synthesis, resilience, or light execution, but do not spend the reasoning lane on disposable grep unless the context lane is already useful.`
       : null,
     blockSpawn && isChildSession
-      ? "Nested native spawn is blocked: child sessions must not create subagents. Finish the assigned slice locally and report any needed follow-up delegation to the parent leader."
+      ? "Nested native spawn is blocked: child sessions cannot create subagents; the parent leader owns delegation."
       : null,
-	    blockSpawn
-	      ? (explorerModelRouteViolation
-	          ? "Retry at most one explorer spawn after correcting the explicit model route, and only if remaining_spawn_budget is still positive."
-	          : isChildSession
-	          ? "Do not restate or retry the nested spawn prompt. Continue the child task locally; the parent leader decides any follow-up delegation."
-	          : (summary.cap_hit_after_last_close
-	              ? "This thread already saw a native pool-exhaustion failure after the last confirmed close; do not retry spawn_agent until a later close succeeds."
-	              : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary. First reuse a compatible completed lane with send_input, wait for active agents, or close a no-longer-needed lane, then retry only one spawn per confirmed free slot."))
-	      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
+    blockSpawn
+      ? (forkContextModelConflict
+        ? "Correct the spawn shape and retry only the corrected independent spawn call(s) that still fit remaining_spawn_budget; do not treat this as a consumed native slot or as proof the pool is full."
+        : missingSpawnModel
+        ? "Retry only after making model-selection judgment explicit for each spawn; Analyze/read-only/bounded labels are not enough, and requested_spawns must still fit remaining_spawn_budget."
+        : explorerModelRouteViolation
+        ? "Retry explorer spawn call(s) only after correcting each explicit model route, and only if requested_spawns still fit remaining_spawn_budget."
+        : isChildSession
+        ? "Nested spawn denied; no child-side delegation guidance is emitted."
+        : (summary.cap_hit_blocks_spawn
+          ? "This thread already saw a native pool-exhaustion failure after the last confirmed close/repair/reset; do not retry spawn_agent until a later close/repair/reset succeeds and a newer hook/PreToolUse capacity check reports budget."
+          : "This spawn is likely to fail or race another pending spawn reservation; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, wait for a needed active lane, or continue locally; then retry only within a fresh positive capacity budget."))
+      : "Completed subagents are reusable context lanes and still consume native slots until closed; pending spawn reservations also count until the spawn succeeds, fails, or expires.",
     (summary.native_edge_overflow ?? 0) > 0
-      ? "Native open-edge evidence exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are diagnostic debt/candidates rather than additional live slots."
+      ? `Native DB open-edge debt exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are repair debt rather than additional live agents. db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}.`
       : null,
     summary.failed_closes > 0
       ? "At least one recent close was not confirmed; treat capacity as uncertain and serialize follow-up spawns."
@@ -1968,7 +2240,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     summary.native_edge_failed
       ? "Native thread_spawn_edges could not be read; spawn capacity is unknown, so serialize and retry only after the state read succeeds."
       : null,
-	    "This hook does not choose which agent to reuse/close or whether delegation is needed; it only surfaces native pool pressure and enforces the no-recursive-spawn boundary.",
+	    "This hook does not choose whether delegation is needed and does not emit proactive child-agent guidance; it only surfaces current-parent native pool pressure and enforces the no-recursive-spawn boundary.",
   ].filter(Boolean).join(" ");
 
   if (blockSpawn) {
@@ -1995,11 +2267,11 @@ function buildLockUnavailableAdvisory(eventName, cap, isChildSession, operations
   const context = [
     "Native agent pool guard: advisor state lock is unavailable, so current capacity cannot be reconciled.",
     hasSpawn
-      ? `Blocking spawn_agent conservatively. The native cap is ${cap}; retry one spawn only after the lock clears or continue locally.`
+      ? (isChildSession
+        ? "Blocking nested spawn_agent; child sessions cannot create subagents."
+        : `Blocking spawn_agent conservatively. The native cap is ${cap}; retry only after the lock clears and requested_spawns fit the refreshed budget, or continue locally.`)
       : "Serialize agent-pool operations until the lock clears.",
-    isChildSession
-      ? "This is a child session; nested native spawn remains disallowed."
-      : null,
+    isChildSession ? "This is a child session; nested native spawn remains disallowed." : null,
   ].filter(Boolean).join(" ");
   if (eventName === "PreToolUse" && hasSpawn) {
     return {
@@ -2062,6 +2334,18 @@ async function main() {
     const nowMs = now.getTime();
     const nowIso = now.toISOString();
     const identity = await sessionIdentity(payload);
+    if (eventName === "PreToolUse" && hasSpawnOperation(operations) && identity.unscoped) {
+      const context = `Native agent pool guard: blocking spawn_agent because this hook payload has no session_id, thread_id, transcript_path session_meta, or parent_thread_id. Capacity is scoped per parent/session; an unscoped payload must not fall back to a shared cwd bucket. Retry only after Codex provides a scoped parent/session identity.`;
+      process.stdout.write(`${JSON.stringify({
+        decision: "block",
+        reason: context,
+        hookSpecificOutput: {
+          hookEventName: eventName,
+          additionalContext: context,
+        },
+      })}\n`);
+      return;
+    }
 
     const lockResult = await withStateLock(async () => {
       const state = await readState();
@@ -2082,19 +2366,13 @@ async function main() {
           promptSummary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
         }
         const emitCapacity = shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, identity.isChildSession, promptSummary, cap);
-        const emitDelegation = shouldEmitDelegationGuidance(eventName, prompt, session, nowMs, identity.isChildSession);
-        const emitChildNoSpawn = shouldEmitChildNoSpawnGuidance(eventName, prompt, session, nowMs, identity.isChildSession);
         if (emitCapacity) markCapacityGuidanceEmitted(eventName, prompt, session, nowIso);
-        if (emitDelegation) markDelegationGuidanceEmitted(prompt, session, nowIso);
-        if (emitChildNoSpawn) markChildNoSpawnGuidanceEmitted(prompt, session, nowIso);
         session.updated_at = nowIso;
         state.updated_at = nowIso;
         await writeState(state);
-        if (emitCapacity || emitDelegation || emitChildNoSpawn) {
+        if (emitCapacity) {
           const contexts = [
             emitCapacity ? buildCapacityGuidance(eventName, cap, promptSummary) : "",
-            emitDelegation ? buildDelegationGuidance(cap) : "",
-            emitChildNoSpawn ? buildChildNoSpawnGuidance(cap) : "",
           ];
           process.stdout.write(`${JSON.stringify(buildPromptGuidanceOutput(eventName, contexts))}\n`);
         }
@@ -2137,6 +2415,39 @@ async function main() {
             continue;
           }
           if (operation.name !== "close_agent") continue;
+
+          const missingCloseIds = closeLooksTargetMissing(operationPayload)
+            ? collectCloseTargetIds(operationPayload)
+            : [];
+          if (missingCloseIds.length > 0) {
+            const repairedIds = await repairClosedNativeEdgeIds(identity.poolThreadId, missingCloseIds);
+            const unrepairedMissingIds = missingCloseIds.filter((id) => !repairedIds.has(id));
+            const uniqueRepairedParents = await repairUniqueMissingNativeEdgeIds(unrepairedMissingIds);
+            const nativeAuthoritative = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
+            const currentParentUniqueIds = new Set(
+              [...uniqueRepairedParents.entries()]
+                .filter(([, parentId]) => parentId === identity.poolThreadId)
+                .map(([id]) => id),
+            );
+            const currentParentRepairedIds = new Set([...repairedIds, ...currentParentUniqueIds]);
+            const verifiedFallbackMissingIds = missingCloseIds.filter((id) => {
+              return Boolean(session.agents?.[id]) || transcriptPool.active.has(id) || transcriptPool.spawned.has(id);
+            });
+            const effectiveIds = nativeAuthoritative
+              ? currentParentRepairedIds
+              : new Set([...currentParentRepairedIds, ...verifiedFallbackMissingIds]);
+            for (const id of effectiveIds) {
+              delete session.agents[id];
+              nativeThreadEdges.active?.delete(id);
+              nativeThreadEdges.terminal?.delete(id);
+              nativeThreadEdges.closed?.add(id);
+              transcriptPool.active.delete(id);
+              transcriptPool.closed.add(id);
+              transcriptPool.missingClosed.add(id);
+            }
+            if (effectiveIds.size > 0) session.last_close_at = nowIso;
+            continue;
+          }
 
           const closedIds = markClosed(session, operationPayload);
           if (closedIds.length > 0) {

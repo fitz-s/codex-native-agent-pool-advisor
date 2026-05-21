@@ -45,17 +45,49 @@ function commandMatches(hook, command) {
   return hook && hook.type === "command" && hook.command === command;
 }
 
+function hookEntryMatcher(eventName) {
+  return eventName === "SessionStart" ? "startup|resume|clear" : "";
+}
+
+function entryMatcher(entry) {
+  return typeof entry?.matcher === "string" ? entry.matcher : "";
+}
+
 function ensureHook(config, eventName, command) {
   config.hooks ??= {};
   const entries = Array.isArray(config.hooks[eventName]) ? config.hooks[eventName] : [];
-  const present = entries.some((entry) => {
-    return Array.isArray(entry?.hooks) && entry.hooks.some((hook) => commandMatches(hook, command));
-  });
-  if (present) {
-    config.hooks[eventName] = entries;
-    return false;
+  const requiredMatcher = hookEntryMatcher(eventName);
+  let changed = false;
+  let present = false;
+  const nextEntries = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") {
+      nextEntries.push(entry);
+      continue;
+    }
+    const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
+    const hasCorrectRegistration = entryMatcher(entry) === requiredMatcher
+      && hooks.some((hook) => commandMatches(hook, command));
+    if (hasCorrectRegistration) {
+      present = true;
+      nextEntries.push(entry);
+      continue;
+    }
+    const nextHooks = hooks.filter((hook) => !commandMatches(hook, command));
+    if (nextHooks.length !== hooks.length) changed = true;
+    if (nextHooks.length > 0) nextEntries.push({ ...entry, hooks: nextHooks });
   }
-  config.hooks[eventName] = [{ hooks: [{ type: "command", command }] }, ...entries];
+  if (present) {
+    config.hooks[eventName] = nextEntries;
+    return changed;
+  }
+  config.hooks[eventName] = [
+    {
+      ...(requiredMatcher ? { matcher: requiredMatcher } : {}),
+      hooks: [{ type: "command", command }],
+    },
+    ...nextEntries,
+  ];
   return true;
 }
 
