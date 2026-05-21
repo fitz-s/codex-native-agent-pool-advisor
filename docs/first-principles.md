@@ -11,6 +11,8 @@ The goal is not to make Codex use fewer subagents. The goal is to keep Codex's m
 
 The correct system preserves subagents as context-isolation lanes while making failed spawns, accidental frontier-model inheritance, and disposable lane churn harder to repeat.
 
+It must also avoid the opposite drift: a leader that treats hook safety text as a reason to do all read-heavy work in the main thread. For subagent-relevant work, the leader should explicitly choose one path: reuse a compatible lane, spawn one lane and resample capacity, or stay local because the task is tiny, urgent, user-forbidden, or blocked on evidence already being collected.
+
 ## Codex Runtime Boundaries
 
 - Capacity is per parent/session, not global.
@@ -35,6 +37,8 @@ The correct system preserves subagents as context-isolation lanes while making f
    - Block multi-spawn batches on supported hook surfaces.
    - Launch at most one child, then resample.
    - After any capacity failure, stop spawning until close/repair/reset produces a newer snapshot.
+   - Keep positive-budget guidance short unless there is zero budget, unreadable native state, invalid spawn shape, current-parent lane pressure, or narrow explicit spawn intent.
+   - Apply explicit negative intent first. Phrases such as "do not spawn agents" or "no subagents" suppress prompt-triggered spawn guidance unless an actual spawn tool payload is visible.
 
 3. Model boundary:
    - Every non-fork `spawn_agent` tool input must include a non-empty string `model`.
@@ -47,7 +51,8 @@ The correct system preserves subagents as context-isolation lanes while making f
    - Treat subagents as reusable context lanes.
    - Before spawning, compare the task contract to listed current-parent lanes.
    - Use `send_input` for same-topic compatible lanes.
-   - Close only obsolete, wrong-model, or capacity-needed lanes.
+   - A completed lane is reusable only inside the same active task/window when near-term follow-up is likely.
+   - Close only stale, unrelated, wrong-model, capacity-needed, or active-task-complete lanes.
    - Never send recursive orchestration duties to child sessions.
 
 This is the clean boundary: the hook enforces observable runtime facts and explicit spawn shape; the parent agent remains responsible for semantic model choice and same-topic reuse decisions.

@@ -266,7 +266,7 @@ test("unrelated parent native open edges do not emit zero budget on current prom
     assert.match(context, /BATCH_SPAWN_GUARANTEE=false/);
     assert.match(context, /observed_free=6/);
     assert.match(context, /remaining_spawn_budget=6/);
-    assert.match(context, /not a guaranteed batch size/);
+    assert.match(context, /not an atomic runtime reservation/);
     assert.match(context, /native_slots=slot_open=0/);
     assert.doesNotMatch(context, /native_global/);
     assert.doesNotMatch(context, /Global native/);
@@ -293,8 +293,10 @@ test("prompt-time guidance requires lane reuse check when current-parent lanes e
     assert.match(context, /LANE_REUSE_CHECK_REQUIRED=true/);
     assert.match(context, /Zeus oracle wiring verifier/);
     assert.match(context, /model=gpt-5\.4-mini/);
-    assert.match(context, /use send_input to reuse that lane instead of spawning/);
-    assert.match(context, /Close a lane only when it is no longer useful/);
+    assert.match(context, /LANES_OPEN=1/);
+    assert.match(context, /updated_at=/);
+    assert.match(context, /use send_input to reuse it/);
+    assert.match(context, /close only when stale, wrong-topic\/model, cap-needed/);
   });
 });
 
@@ -524,9 +526,50 @@ test("pending pre-spawn reservation serializes same-turn follow-up spawns", asyn
     });
 
     assert.equal(second.decision, "block");
-    assert.match(second.reason, /reserved_spawns=1/);
-    assert.match(second.reason, /pending spawn reservation/);
+    assert.match(second.reason, /pending_spawn_attempts=1/);
+    assert.match(second.reason, /observed pending spawn attempt/);
     assert.match(second.reason, /resample capacity/);
+  });
+});
+
+test("expired pending spawn attempt debt does not block follow-up spawns", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+
+    const first = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "medium",
+        message: "trace first slice",
+      },
+    });
+    assert.notEqual(first?.decision, "block");
+
+    const statePath = join(home, "state", "native-agent-pool-advisor.json");
+    const state = JSON.parse(await readFile(statePath, "utf-8"));
+    const reservations = state.sessions["thread:parent1"].spawn_reservations;
+    for (const reservation of Object.values(reservations)) {
+      reservation.expires_at = "2000-01-01T00:00:00.000Z";
+    }
+    await writeFile(statePath, JSON.stringify(state, null, 2));
+
+    const second = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "medium",
+        message: "trace second slice",
+      },
+    });
+
+    assert.notEqual(second?.decision, "block");
   });
 });
 
@@ -1715,6 +1758,24 @@ test("session start emits cap pressure after resume before a spawn is attempted"
   });
 });
 
+test("session start positive budget guidance stays concise without model lecture", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+
+    const output = await runHook(home, {
+      hook_event_name: "SessionStart",
+      session_id: "parent1",
+    });
+    const context = output.hookSpecificOutput.additionalContext;
+
+    assert.match(context, /^SPAWN_AGENT_OBSERVED_FREE=6/);
+    assert.match(context, /BATCH_SPAWN_GUARANTEE=false/);
+    assert.doesNotMatch(context, /SUBAGENT_MODEL_SELECTION_REQUIRED=true/);
+    assert.doesNotMatch(context, /task_contract=\{output,risk,state_depth/);
+    assert.doesNotMatch(context, /ZERO_BUDGET_RECOVERY_REQUIRED=true/);
+  });
+});
+
 test("zero budget guidance rejects send_input and requires capacity refresh after close", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -1737,6 +1798,20 @@ test("zero budget guidance rejects send_input and requires capacity refresh afte
     assert.match(context, /send_input and wait_agent do not increase capacity/);
     assert.match(context, /If close_agent succeeds, re-check capacity before any spawn/);
     assert.match(context, /older zero-budget snapshot is no longer authoritative/);
+  });
+});
+
+test("negative spawn intent suppresses prompt-triggered model lecture", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      prompt: "Review this locally; do not spawn agents.",
+    });
+
+    assert.equal(output, null);
   });
 });
 
@@ -2040,6 +2115,41 @@ test("live-check detects explorer role using explicit frontier model", async () 
   });
 });
 
+test("live-check supports configurable forbidden explorer models", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','closed');"
+        + "insert into threads values ('child1','/tmp/child.jsonl','Mini Explorer','explorer','gpt-5.4-mini','medium','Scout','/tmp',1779074894);",
+    );
+    const transcript = join(home, "parent-forbid-mini.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"Mini explorer lane.\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Scout\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, [
+        "--transcript", transcript,
+        "--allow-missing-guidance",
+        "--forbid-explorer-model", "gpt-5.4-mini",
+      ]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.verdict, "native_explorer_frontier_model_violation");
+    assert.equal(output.spawn_calls[0].explorer_frontier_violation, true);
+  });
+});
+
 test("live-check detects native model mismatch for explicit-model spawn", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -2195,6 +2305,7 @@ test("live-check parses nested multi-tool spawn calls", async () => {
     assert.equal(result.ok, true);
     assert.deepEqual(result.spawn_batches, [[2, 2]]);
     assert.equal(result.spawn_calls.length, 2);
+    assert.deepEqual(result.current_parent_lanes.counts, { closed: 2 });
     assert.equal(result.spawn_calls[0].source, "nested");
     assert.equal(result.spawn_calls[0].created_agent_id, "child1");
     assert.equal(result.spawn_calls[1].created_agent_id, "child2");
@@ -2348,6 +2459,27 @@ test("live-check verifies explicit model routes, closes, and current open count"
     assert.equal(result.checks.find((check) => check.name === "model_recorded:gpt-5.4-mini").status, "pass");
     assert.equal(result.checks.find((check) => check.name === "current_parent_open_count").evidence, "open=0, expected=0");
   });
+});
+
+test("docs preserve delegation control boundaries", async () => {
+  const readme = await readFile(join(repoRoot, "README.md"), "utf-8");
+  const firstPrinciples = await readFile(join(repoRoot, "docs", "first-principles.md"), "utf-8");
+  const runtimeAudit = await readFile(join(repoRoot, "docs", "runtime-audit.md"), "utf-8");
+  const checklist = await readFile(join(repoRoot, "docs", "release-checklist.md"), "utf-8");
+  const docs = [readme, firstPrinciples, runtimeAudit, checklist].join("\n");
+
+  assert.match(docs, /completed lane (?:open )?only for the same active task\/window/i);
+  assert.match(docs, /Close only stale, unrelated, wrong-model, capacity-needed, or active-task-complete lanes/i);
+  assert.match(docs, /agent_type=default/);
+  assert.match(docs, /gpt-5\.3-codex-spark/);
+  assert.match(docs, /gpt-5\.4-mini/);
+  assert.match(docs, /do not spawn agents/);
+  assert.match(docs, /no subagents/);
+  assert.match(docs, /subagent-relevant read-heavy, multi-slice/);
+  assert.match(docs, /--forbid-explorer-model/);
+  assert.match(docs, /current_parent_lanes/);
+  assert.match(docs, /tmp=\$\(mktemp -d\)/);
+  assert.match(docs, /sqlite3 "\$tmp\/state_5\.sqlite"/);
 });
 
 test("reset script requires dry-run force token before mutation", async () => {

@@ -56,6 +56,7 @@ function usage() {
     "  --parent <thread_id>          Parent thread id; defaults to transcript session_meta id.",
     "  --since-line <n>              Scan transcript records starting at this 1-based line.",
     "  --expect-model <model>        Require a successful spawn whose tool input and native DB edge both use this model. Repeatable.",
+    "  --forbid-explorer-model <m>   Fail non-fork explorer spawns using this model. Repeatable; defaults include gpt-5.5.",
     "  --expect-current-open <n>     Require this parent/session to have exactly n open native edges after the scanned window.",
     "  --expect-all-closed           Require every successful spawn in the scanned window to have closed DB edge plus close success or verified not-found release evidence.",
     "  --require-guidance            Fail if no advisor guidance marker appears before the first scanned spawn.",
@@ -77,6 +78,10 @@ function parseArgs(argv) {
     else if (arg === "--expect-model") {
       args.expectModels ??= [];
       args.expectModels.push(argv[++i]);
+    }
+    else if (arg === "--forbid-explorer-model") {
+      args.forbidExplorerModels ??= [];
+      args.forbidExplorerModels.push(argv[++i]);
     }
     else if (arg === "--expect-current-open") args.expectCurrentOpen = Number(argv[++i]);
     else if (arg === "--expect-all-closed") args.expectAllClosed = true;
@@ -158,12 +163,15 @@ function normalizeRole(value) {
   return explicitString(value).toLowerCase();
 }
 
-function forbiddenExplorerModels() {
+function forbiddenExplorerModels(extraModels = []) {
   const raw = typeof process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS === "string"
     ? process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS
     : "";
   const models = raw.split(",").map((item) => item.trim()).filter(Boolean);
-  return new Set((models.length > 0 ? models : DEFAULT_EXPLORER_FORBIDDEN_MODELS).map((model) => model.toLowerCase()));
+  return new Set([
+    ...(models.length > 0 ? models : DEFAULT_EXPLORER_FORBIDDEN_MODELS),
+    ...extraModels,
+  ].map((model) => model.toLowerCase()).filter(Boolean));
 }
 
 function isExplorerRole(value) {
@@ -438,6 +446,15 @@ function summarizeChecks(checks) {
   return "passed";
 }
 
+function summarizeLaneCounts(rows) {
+  const counts = {};
+  for (const row of rows) {
+    const status = explicitString(row?.status) || "unknown";
+    counts[status] = (counts[status] ?? 0) + 1;
+  }
+  return counts;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -457,7 +474,7 @@ async function main() {
   const spawnCallsMissingOutput = spawnCalls.filter((call) => !call.output);
   const missingModelSpawns = spawnCalls.filter((call) => !call.fork_context && !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
-  const explorerForbidden = forbiddenExplorerModels();
+  const explorerForbidden = forbiddenExplorerModels(args.forbidExplorerModels ?? []);
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
   const edgeByChild = new Map(edges.rows.map((row) => [row.child_thread_id, row]));
@@ -610,6 +627,19 @@ async function main() {
     scanned_since_line: Number.isFinite(args.sinceLine) ? args.sinceLine : 1,
     guidance_markers: transcript.markers,
     spawn_batches: spawnBatches,
+    current_parent_lanes: {
+      counts: summarizeLaneCounts(edges.rows),
+      rows: edges.rows.map((row) => ({
+        child_thread_id: row.child_thread_id,
+        status: row.status,
+        agent_role: row.agent_role ?? null,
+        model: row.model ?? null,
+        reasoning_effort: row.reasoning_effort ?? null,
+        agent_nickname: row.agent_nickname ?? null,
+        title: row.title ?? null,
+        updated_at: row.updated_at ?? null,
+      })),
+    },
     spawn_calls: spawnCalls.map((call) => ({
       line: call.line,
       call_id: call.call_id,
