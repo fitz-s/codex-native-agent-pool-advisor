@@ -755,12 +755,15 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
         const outputText = safeString(payload.output ?? payload.result ?? "");
         if (textLooksCloseTargetMissing(outputText)) {
           for (const id of closeIds) {
-            pool.closed.add(id);
             pool.missingClosed.add(id);
+          }
+          const activeCloseIds = closeIds.filter((id) => pool.active.has(id));
+          for (const id of activeCloseIds) {
+            pool.closed.add(id);
             pool.active.delete(id);
             pool.lastCloseAtMs = Math.max(pool.lastCloseAtMs, eventTimestampMs(record));
           }
-          noteSlotClose(closeIds.length);
+          if (activeCloseIds.length > 0) noteSlotClose(activeCloseIds.length);
           continue;
         }
         if (textLooksCloseFailed(outputText)) {
@@ -1579,7 +1582,7 @@ function textLooksCloseFailed(text) {
 }
 
 function textLooksCloseTargetMissing(text) {
-  return /(?:unknown agent|agent (?:with id [A-Za-z0-9_.:-]+ )?not found|not found|invalid agent)/i.test(
+  return /(?:unknown agent|agent (?:with id [A-Za-z0-9_.:-]+ )?not found|no such agent|invalid agent(?: id)?|agent [A-Za-z0-9_.:-]+ not found|(?:agent|代理|智能体)[^.!?\n]{0,80}(?:不存在|未找到))/i.test(
     safeString(text),
   );
 }
@@ -1846,7 +1849,7 @@ function nativeEdgeSummary(summary) {
   if (summary?.native_edge_failed) return "unavailable";
   if (summary?.native_edge_checked) {
     const authority = summary.native_edge_authoritative ? "authoritative" : "fallback";
-    return `slot_open=${summary.native_edge_active ?? 0}, slot_terminal=${summary.native_edge_terminal ?? 0}, slot_estimate=${summary.native_edge_slot_occupied ?? summary.occupied}/${summary.native_edge_cap ?? "?"}, db_open_edge_debt=${summary.native_edge_debt ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
+    return `slot_open=${summary.native_edge_active ?? 0}, slot_terminal=${summary.native_edge_terminal ?? 0}, slot_estimate=${summary.native_edge_slot_occupied ?? summary.occupied}/${summary.native_edge_cap ?? "?"}, ledger_lag=${summary.native_edge_ledger_lag ?? 0}, db_open_edge_debt=${summary.native_edge_debt ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
   }
   return "not_checked";
 }
@@ -1975,11 +1978,13 @@ function summarize(session) {
   });
   const running = agents.filter((agent) => agent.status === "running").length;
   const terminal = agents.filter((agent) => agent.status === "terminal_not_closed").length;
+  const trackedAgentIds = agents.map((agent) => safeString(agent.id).trim()).filter(Boolean);
   const pendingSpawnReservations = spawnReservationCount(session);
   const trackedOccupied = running + terminal;
   return {
     running,
     terminal,
+    tracked_agent_ids: trackedAgentIds,
     pending_spawn_reservations: pendingSpawnReservations,
     tracked_occupied: trackedOccupied,
     occupied: trackedOccupied + pendingSpawnReservations,
@@ -2047,6 +2052,11 @@ function mergeSummary(
   const nativeEdgeOverflow = Math.max(0, nativeUnresolved - capValue);
   const trackedUnresolved = sessionSummary.tracked_occupied ?? sessionSummary.occupied;
   const trackedOccupied = clampSlotCount(trackedUnresolved, capValue);
+  const trackedAgentIds = new Set(sessionSummary.tracked_agent_ids ?? []);
+  const nativeLedgerLagIds = nativeAuthoritative
+    ? [...trackedAgentIds].filter((id) => !nativeActive.has(id) && !nativeTerminal.has(id) && !nativeClosed.has(id))
+    : [];
+  const nativeLedgerLag = nativeLedgerLagIds.length;
   const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
   const rawLastCapHitMs = Math.max(
     transcriptPool.capHitAtMs || 0,
@@ -2063,8 +2073,12 @@ function mergeSummary(
   let evidenceOccupied = transcriptSlotOccupied;
   let slotPressureSource = "transcript_fallback";
   if (nativeAuthoritative) {
-    evidenceOccupied = nativeSlotOccupied;
-    slotPressureSource = nativeUnresolved <= capValue ? "native_open_edges" : "native_open_edges_saturated";
+    evidenceOccupied = clampSlotCount(nativeUnresolved + nativeLedgerLag, capValue);
+    slotPressureSource = nativeUnresolved > capValue
+      ? "native_open_edges_saturated"
+      : nativeLedgerLag > 0
+      ? "native_open_edges_plus_ledger"
+      : "native_open_edges";
   } else if (transcriptSlotReliable) {
     evidenceOccupied = transcriptSlotOccupied;
     slotPressureSource = "transcript_events";
@@ -2098,6 +2112,8 @@ function mergeSummary(
     native_edge_slot_occupied: nativeSlotOccupied,
     native_edge_debt: nativeUnresolved,
     native_edge_unresolved: nativeUnresolved,
+    native_edge_ledger_lag: nativeLedgerLag,
+    native_edge_ledger_lag_ids: nativeLedgerLagIds.slice(0, capValue),
     native_edge_overflow: nativeEdgeOverflow,
     native_edge_cap: capValue,
     slot_pressure_source: slotPressureSource,
@@ -2124,10 +2140,10 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const ops = operations ?? agentOperations(payload ?? {}, name);
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
+  if (isChildSession) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
   if (hasExplorerModelRouteViolationInOperations(ops)) return true;
-  if (isChildSession) return true;
   if (summary.native_edge_failed) return true;
   if (summary.occupied + requestedSpawns > cap) return true;
   if (!summary.native_edge_authoritative && summary.tracked_occupied + requestedSpawns > cap) return true;
@@ -2154,12 +2170,13 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
 
 function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payload = null, operations = null) {
   const ops = operations ?? agentOperations(payload ?? {}, "");
-  const missingSpawnModel = hasMissingSpawnModelInOperations(ops);
-  const forkContextModelConflict = hasForkContextModelConflictInOperations(ops);
-  const forkContextModelInheritance = hasForkContextModelInheritanceInOperations(ops);
-  const explorerModelRouteViolation = hasExplorerModelRouteViolationInOperations(ops);
-  const preferredExplorerContractAdvisory = hasPreferredExplorerContractAdvisoryInOperations(ops);
-  const fallbackExplorerContractAdvisory = hasFallbackExplorerContractAdvisoryInOperations(ops);
+  const checkSpawnShape = !isChildSession;
+  const missingSpawnModel = checkSpawnShape && hasMissingSpawnModelInOperations(ops);
+  const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
+  const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
+  const explorerModelRouteViolation = checkSpawnShape && hasExplorerModelRouteViolationInOperations(ops);
+  const preferredExplorerContractAdvisory = checkSpawnShape && hasPreferredExplorerContractAdvisoryInOperations(ops);
+  const fallbackExplorerContractAdvisory = checkSpawnShape && hasFallbackExplorerContractAdvisoryInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
@@ -2413,9 +2430,12 @@ async function main() {
                 .map(([id]) => id),
             );
             const currentParentRepairedIds = new Set([...repairedIds, ...currentParentUniqueIds]);
+            const verifiedFallbackMissingIds = missingCloseIds.filter((id) => {
+              return Boolean(session.agents?.[id]) || transcriptPool.active.has(id) || transcriptPool.spawned.has(id);
+            });
             const effectiveIds = nativeAuthoritative
               ? currentParentRepairedIds
-              : new Set([...missingCloseIds, ...uniqueRepairedParents.keys()]);
+              : new Set([...currentParentRepairedIds, ...verifiedFallbackMissingIds]);
             for (const id of effectiveIds) {
               delete session.agents[id];
               nativeThreadEdges.active?.delete(id);

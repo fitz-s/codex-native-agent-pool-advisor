@@ -46,7 +46,7 @@ function commandMatches(hook, command) {
 }
 
 function hookEntryMatcher(eventName) {
-  return eventName === "SessionStart" ? "startup|resume" : "";
+  return eventName === "SessionStart" ? "startup|resume|clear" : "";
 }
 
 function entryMatcher(entry) {

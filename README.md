@@ -32,15 +32,16 @@ Model routing is secondary but explicit. The hook requires every subagent spawn 
 - A spawn hook payload without `session_id`, `thread_id`, transcript `session_meta`, or `parent_thread_id` is unscoped and blocks conservatively. It must not fall back to a shared working-directory bucket.
 - Native cap comes from `~/.codex/config.toml` `[agents].max_threads`, defaulting to 6.
 - `occupied` is a saturated current-parent runtime slot estimate and is never reported above the cap. Extra current-parent `open` rows are surfaced separately as `db_open_edge_debt` and `open_edge_overflow`; they are persistent-state repair debt, not additional live subagents.
-- Successful `spawn_agent` consumes a slot; a capacity-failed spawn consumes no new slot but sets pressure to full.
+- Successful `spawn_agent` consumes a slot immediately in the local ledger. If native `thread_spawn_edges` is readable but has not caught up yet, that ledger lag still counts against admission until a matching native row appears, the lane closes, or the local running-lane TTL expires.
+- A capacity-failed spawn consumes no new slot but sets pressure to full.
 - A historical cap-hit before the latest successful close/repair/reset is diagnostic. A runtime cap-hit after that point blocks further spawns only when current native edge state is unreadable. If current parent/session native rows are readable, admission follows the scoped open-edge count plus pending reservations; stale `task_complete` open edges self-heal to `closed` and do not turn a one-open state into zero budget.
 - Positive `remaining_spawn_budget` is physical capacity. Multiple subagents may be launched together when `requested_spawns <= remaining_spawn_budget` and each lane has an independent task contract.
 - `wait_agent`, child completion notifications, and `send_input` do not by themselves free a native slot.
 - Native `open` rows whose child transcript already has `task_complete` are stale persistence edges. The hook self-heals those rows to `closed` and excludes them from current runtime occupancy.
 - A zero-budget prompt is a capacity snapshot, not a permanent turn fact. If a later `close_agent` succeeds or runtime not-found close evidence repairs a stale lane, the next hook or `PreToolUse` capacity check is authoritative and should replace the old zero-budget text.
 - A zero-budget prompt also emits a recovery protocol. The agent should not stop at "the pool is full"; it must choose between reusing a compatible current-parent lane, closing listed no-longer-needed lane(s), waiting for a needed active lane, or continuing locally.
-- The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Runtime `not found` / `unknown agent` close evidence is also treated as a stale-unreachable lane and repaired to `closed`; other close failures do not free capacity.
-- Runtime `not found` close evidence releases a stale-unreachable lane when the current parent owns the matching native edge row. If a PostToolUse payload is mis-scoped but the target child has exactly one non-closed native edge anywhere in the DB, the hook repairs that unique parent/child row; ambiguous or unknown targets do not free capacity.
+- The hook decrements and mutates Codex SQLite on exact successful `PostToolUse(close_agent)` evidence for the current parent/session. Explicit agent-target missing evidence such as `unknown agent` or `agent with id ... not found` is also treated as a stale-unreachable lane and repaired to `closed`; unrelated errors such as `endpoint not found` do not free capacity.
+- Runtime agent-target-not-found close evidence releases a stale-unreachable lane when the current parent owns the matching native edge row. If a PostToolUse payload is mis-scoped but the target child has exactly one non-closed native edge anywhere in the DB, the hook repairs that unique parent/child row; ambiguous, unknown, or typo targets do not free capacity.
 - Child transcript terminal detection checks beyond the tail window when needed, so a long transcript with an earlier `task_complete` can still be repaired instead of being mislabeled as an active open lane.
 - If the current parent has an empty readable `thread_spawn_edges` slice, its native budget is empty. Historical transcript fallback is used only when native current-parent evidence is unavailable, not to import other sessions' slots.
 - Child sessions do not receive proactive prompt-time delegation guidance. A child that needs more delegation should report that recommendation upward; the parent leader owns slot closure and relaunch.
@@ -183,7 +184,7 @@ npm run check
 npm test
 ```
 
-The test suite covers hook-script behavior: wrapper-spawn blocking, multi-spawn budget accounting, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
+The test suite covers hook-script behavior: wrapper-spawn blocking, multi-spawn budget accounting, native-DB-lag ledger accounting, explicit model enforcement when `PreToolUse` is emitted, explorer allow-list enforcement, advisory-only Spark/mini contract routing, reset-aware transcript fallback, close-agent release semantics, explicit reset markers, and live-transcript bypass detection.
 
 For real end-to-end evidence from Codex Desktop or CLI, inspect the actual parent transcript after a spawn attempt:
 
@@ -191,7 +192,7 @@ For real end-to-end evidence from Codex Desktop or CLI, inspect the actual paren
 node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl
 ```
 
-`ok=false` means the real transcript contains a native spawn path that was not protected before the child was created, or a spawn call returned a runtime/tool failure such as pool exhaustion or invalid fork/model shape. That is a runtime-boundary failure, not a passing hook test.
+`ok=false` means the real transcript contains a native spawn path that was not protected before the child was created, a spawn call returned a runtime/tool failure such as pool exhaustion or invalid fork/model shape, a nested wrapper spawn could not be matched to output evidence, or a required close/model/open-count expectation failed. That is a runtime-boundary failure, not a passing hook test.
 
 Use explicit expectations when validating a real run:
 

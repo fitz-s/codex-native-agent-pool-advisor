@@ -701,6 +701,42 @@ test("wrapped multi-spawn post responses preserve distinct successful agent ids"
   });
 });
 
+test("native-readable empty edges still count successful local spawn ledger until edges catch up", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+      tool_response: { agent_id: "child1", nickname: "Scout" },
+    });
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map another file",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /1\/1 estimated slots occupied/);
+    assert.match(output.reason, /slot_pressure_source=native_open_edges_plus_ledger/);
+    assert.match(output.reason, /ledger_lag=1/);
+  }, "[agents]\nmax_threads = 1\n");
+});
+
 test("native open edges with task_complete transcripts are self-healed and do not occupy capacity", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -831,7 +867,7 @@ test("transcript close after a cap hit does not override current-parent overfull
     assert.match(context, /occupied=6\/6/);
     assert.match(context, /remaining_spawn_budget=0/);
     assert.match(context, /slot_pressure_source=native_open_edges_saturated/);
-    assert.match(context, /native_slots=slot_open=6, slot_terminal=0, slot_estimate=6\/6, db_open_edge_debt=8/);
+    assert.match(context, /native_slots=slot_open=6, slot_terminal=0, slot_estimate=6\/6, ledger_lag=0, db_open_edge_debt=8/);
     assert.doesNotMatch(context, /terminal_open=8/);
     assert.doesNotMatch(context, /native_global/);
 
@@ -848,7 +884,7 @@ test("transcript close after a cap hit does not override current-parent overfull
       },
     });
     assert.equal(spawnOutput.decision, "block");
-    assert.match(spawnOutput.reason, /native_slots=slot_open=6, slot_terminal=0, slot_estimate=6\/6, db_open_edge_debt=8/);
+    assert.match(spawnOutput.reason, /native_slots=slot_open=6, slot_terminal=0, slot_estimate=6\/6, ledger_lag=0, db_open_edge_debt=8/);
     assert.doesNotMatch(spawnOutput.reason, /terminal_open=8/);
     assert.doesNotMatch(spawnOutput.reason, /native_global/);
   });
@@ -925,6 +961,35 @@ test("transcript close not found repairs stale open edge before next prompt", as
     assert.match(output.hookSpecificOutput.additionalContext, /occupied=5\/6/);
     assert.match(output.hookSpecificOutput.additionalContext, /remaining_spawn_budget=1/);
     assert.match(output.hookSpecificOutput.additionalContext, /native_slots=slot_open=5, slot_terminal=0/);
+  });
+});
+
+test("transcript not-found close only decrements active fallback lanes", async () => {
+  await withHome(async (home) => {
+    const transcript = join(home, "parent-typo-close.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"timestamp":"2026-05-16T08:00:00.000Z","type":"session_meta","payload":{"id":"parent1"}}',
+        '{"timestamp":"2026-05-16T08:01:00.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"explorer\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"{\\"agent_id\\":\\"child1\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:02.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn2","arguments":"{\\"agent_type\\":\\"explorer\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"spawn2","output":"collab spawn failed: agent thread limit reached"}}',
+        '{"timestamp":"2026-05-16T08:01:04.000Z","type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"typo-child\\"}"}}',
+        '{"timestamp":"2026-05-16T08:01:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"agent with id typo-child not found"}}',
+      ].join("\n"),
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "UserPromptSubmit",
+      session_id: "parent1",
+      transcript_path: transcript,
+      prompt: "spawn another agent",
+    });
+    const context = output.hookSpecificOutput.additionalContext;
+    assert.match(context, /cap_hit_after_last_close=yes/);
+    assert.match(context, /cap_hit_blocks_spawn=yes/);
+    assert.match(context, /remaining_spawn_budget=0/);
   });
 });
 
@@ -1198,6 +1263,53 @@ test("close_agent not found marks current-parent native edge unreachable", async
     });
 
     assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "closed|1");
+  });
+});
+
+test("close_agent endpoint not found does not repair native edge", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "parent1",
+      tool_input: { target: "child1" },
+      tool_response: "transport error: endpoint not found",
+    });
+
+    assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "open|1");
+  });
+});
+
+test("not-found close without native DB requires verified current-lane evidence", async () => {
+  await withHome(async (home) => {
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "explorer",
+        model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        message: "map files",
+      },
+      tool_response: "collab spawn failed: agent thread limit reached",
+    });
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "parent1",
+      tool_input: { target: "typo-child" },
+      tool_response: "agent with id typo-child not found",
+    });
+
+    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
+    const session = state.sessions["thread:parent1"];
+    assert.ok(session.last_cap_hit_at);
+    assert.equal(session.last_close_at ?? "", "");
   });
 });
 
@@ -1624,6 +1736,40 @@ test("child session user prompts receive no proactive subagent guidance", async 
   });
 });
 
+test("child session spawn denial takes precedence over model retry guidance", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const transcript = join(home, "child-spawn.jsonl");
+    await writeFile(
+      transcript,
+      JSON.stringify({
+        timestamp: "2026-05-16T08:00:00.000Z",
+        type: "session_meta",
+        payload: {
+          id: "child1",
+          source: { subagent: { thread_spawn: { parent_thread_id: "parent1" } } },
+        },
+      }),
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "child1",
+      transcript_path: transcript,
+      tool_input: {
+        agent_type: "explorer",
+        message: "child should not spawn",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /Nested native spawn is blocked/);
+    assert.doesNotMatch(output.reason, /Retry only after making model-selection judgment explicit/);
+    assert.doesNotMatch(output.reason, /Subagent spawn is blocked until tool input includes an explicit model/);
+  });
+});
+
 test("installer is idempotent for existing hooks.json", async () => {
   await withHome(async (home) => {
     await runScript(installPath, home);
@@ -1638,7 +1784,7 @@ test("installer is idempotent for existing hooks.json", async () => {
     const sessionStartEntry = config.hooks.SessionStart.find((entry) => {
       return (entry.hooks ?? []).some((hook) => hook.command.includes("native-agent-pool-advisor.mjs"));
     });
-    assert.equal(sessionStartEntry.matcher, "startup|resume");
+    assert.equal(sessionStartEntry.matcher, "startup|resume|clear");
   });
 });
 
@@ -1651,7 +1797,7 @@ test("installer restores SessionStart advisor when a startup self-heal removed i
         hooks: {
           SessionStart: [
             {
-              matcher: "startup|resume",
+              matcher: "startup|resume|clear",
               hooks: [{ type: "command", command: `node "${join(home, "hooks", "quiet-omx-status-self-heal.mjs")}"` }],
             },
           ],
@@ -1675,7 +1821,7 @@ test("installer restores SessionStart advisor when a startup self-heal removed i
       return (entry.hooks ?? []).some((hook) => hook.command.includes("native-agent-pool-advisor.mjs"));
     });
     assert.equal(advisorEntries.length, 1);
-    assert.equal(advisorEntries[0].matcher, "startup|resume");
+    assert.equal(advisorEntries[0].matcher, "startup|resume|clear");
   });
 });
 
@@ -1768,6 +1914,108 @@ test("live-check records same-response native spawn batches and fails runtime sp
     assert.equal(output.checks.find((check) => check.name === "no_spawn_failures").status, "fail");
     assert.equal(output.spawn_calls[0].output_failed, true);
     assert.equal(output.spawn_calls[1].output_failed, true);
+  });
+});
+
+test("live-check parses nested multi-tool spawn calls", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      [
+        "insert into thread_spawn_edges values ('parent1','child1','closed'),('parent1','child2','closed');",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Nested One','explorer','gpt-5.3-codex-spark','low','One','/tmp',1779075987);",
+        "insert into threads values ('child2','/tmp/child2.jsonl','Nested Two','explorer','gpt-5.4-mini','medium','Two','/tmp',1779076009);",
+      ].join(""),
+    );
+    const transcript = join(home, "parent-nested.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"multi_tool_use.parallel","call_id":"wrap1","arguments":"{\\"tool_uses\\":[{\\"recipient_name\\":\\"functions.spawn_agent\\",\\"parameters\\":{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}},{\\"recipient_name\\":\\"functions.spawn_agent\\",\\"parameters\\":{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"two\\"}}]}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"wrap1","output":"[{\\"agent_id\\":\\"child1\\"},{\\"agent_id\\":\\"child2\\"}]"}}',
+      ].join("\n"),
+    );
+
+    const result = JSON.parse((await runScript(liveCheckPath, home, [
+      "--transcript", transcript,
+      "--expect-model", "gpt-5.3-codex-spark",
+      "--expect-model", "gpt-5.4-mini",
+      "--allow-missing-guidance",
+    ])).stdout);
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.spawn_batches, [[2, 2]]);
+    assert.equal(result.spawn_calls.length, 2);
+    assert.equal(result.spawn_calls[0].source, "nested");
+    assert.equal(result.spawn_calls[0].created_agent_id, "child1");
+    assert.equal(result.spawn_calls[1].created_agent_id, "child2");
+  });
+});
+
+test("live-check treats failed close_agent outputs as failed closes", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      [
+        "insert into thread_spawn_edges values ('parent1','child1','closed');",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Close Fail','explorer','gpt-5.3-codex-spark','low','One','/tmp',1779075987);",
+      ].join(""),
+    );
+    const transcript = join(home, "parent-close-fail.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"{\\"agent_id\\":\\"child1\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child1\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"agent with id child1 not found"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--expect-all-closed", "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.checks.find((check) => check.name === "successful_spawns_closed").status, "fail");
+    assert.equal(output.close_calls[0].output_failed, true);
+  });
+});
+
+test("live-check honors configured native DB name", async () => {
+  await withHome(async (home) => {
+    const customDb = join(home, "custom-state.sqlite");
+    await execFileAsync("sqlite3", [
+      customDb,
+      [
+        "create table thread_spawn_edges(parent_thread_id text, child_thread_id text, status text);",
+        "create table threads(id text, rollout_path text, title text, agent_role text, model text, reasoning_effort text, agent_nickname text, cwd text, updated_at integer);",
+        "insert into thread_spawn_edges values ('parent1','child1','open');",
+      ].join(" "),
+    ]);
+    await writeFile(
+      join(home, "native-agent-pool-advisor.config.json"),
+      JSON.stringify({ paths: { state_db_name: "custom-state.sqlite" } }),
+    );
+    const transcript = join(home, "parent-custom-db.jsonl");
+    await writeFile(transcript, '{"type":"session_meta","payload":{"id":"parent1"}}\n');
+
+    const result = JSON.parse((await runScript(liveCheckPath, home, [
+      "--transcript", transcript,
+      "--expect-current-open", "1",
+      "--allow-missing-guidance",
+    ])).stdout);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.state_db.path, customDb);
+    assert.equal(result.checks.find((check) => check.name === "current_parent_open_count").status, "pass");
   });
 });
 

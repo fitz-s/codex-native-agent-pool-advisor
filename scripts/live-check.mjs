@@ -26,6 +26,17 @@ const FAILURE_PATTERNS = [
   /槽位.*满/,
   /上限/,
 ];
+const CLOSE_FAILURE_PATTERNS = [
+  /unknown agent/i,
+  /agent (?:with id [A-Za-z0-9_.:-]+ )?not found/i,
+  /no such agent/i,
+  /invalid agent(?: id)?/i,
+  /failed to close/i,
+  /unable to close/i,
+  /cannot close/i,
+  /could not close/i,
+  /无法关闭/,
+];
 
 function usage() {
   return [
@@ -83,13 +94,32 @@ function codexHome() {
   return home ? join(home, ".codex") : "";
 }
 
-function defaultStateDb() {
+async function readJsonFile(path) {
+  try {
+    return safeJson(await readFile(path, "utf-8")) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+async function defaultStateDb() {
   const explicit = typeof process.env.NATIVE_AGENT_POOL_STATE_DB_PATH === "string"
     ? process.env.NATIVE_AGENT_POOL_STATE_DB_PATH.trim()
     : "";
   if (explicit) return explicit;
   const home = codexHome();
-  return home ? join(home, "state_5.sqlite") : "";
+  if (!home) return "";
+  const config = await readJsonFile(join(home, "native-agent-pool-advisor.config.json"));
+  const paths = config && typeof config.paths === "object" && !Array.isArray(config.paths)
+    ? config.paths
+    : {};
+  const configPath = typeof paths.state_db_path === "string" ? paths.state_db_path.trim() : "";
+  if (configPath) return configPath;
+  const envName = typeof process.env.NATIVE_AGENT_POOL_STATE_DB_NAME === "string"
+    ? process.env.NATIVE_AGENT_POOL_STATE_DB_NAME.trim()
+    : "";
+  const configName = typeof paths.state_db_name === "string" ? paths.state_db_name.trim() : "";
+  return join(home, envName || configName || "state_5.sqlite");
 }
 
 function safeJson(text) {
@@ -121,9 +151,39 @@ function parseOutputAgentId(value) {
   return "";
 }
 
+function collectAgentIds(value, ids = []) {
+  if (!value) return ids;
+  if (typeof value === "string") {
+    const parsed = safeJson(value);
+    if (parsed) return collectAgentIds(parsed, ids);
+    for (const match of value.matchAll(/"agent_id"\s*:\s*"([^"]+)"/g)) ids.push(match[1]);
+    for (const match of value.matchAll(/\b019[a-z0-9-]{20,}\b/gi)) ids.push(match[0]);
+    return [...new Set(ids)];
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectAgentIds(item, ids);
+    return [...new Set(ids)];
+  }
+  if (typeof value === "object") {
+    if (typeof value.agent_id === "string") ids.push(value.agent_id);
+    if (typeof value.agentId === "string") ids.push(value.agentId);
+    for (const child of Object.values(value)) collectAgentIds(child, ids);
+  }
+  return [...new Set(ids)];
+}
+
 function outputLooksFailed(value) {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
   return FAILURE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function closeOutputLooksFailed(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  return outputLooksFailed(value) || CLOSE_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function toolOutputLooksFailed(toolName, value) {
+  return toolName === "close_agent" ? closeOutputLooksFailed(value) : outputLooksFailed(value);
 }
 
 function sqlQuote(value) {
@@ -143,11 +203,43 @@ function canCarryRuntimeGuidance(record) {
   return record.type === "event_msg" && typeof payload.type === "string" && payload.type.startsWith("hook_");
 }
 
+function normalizeAgentToolName(name) {
+  const text = typeof name === "string" ? name.trim().replace(/^functions\./, "") : "";
+  const last = text.split(".").pop() || text;
+  return ["spawn_agent", "close_agent", "send_input", "wait_agent"].includes(last) ? last : "";
+}
+
+function nestedToolInput(value) {
+  if (!value || typeof value !== "object") return {};
+  return value.parameters && typeof value.parameters === "object"
+    ? value.parameters
+    : value.arguments && typeof value.arguments === "object"
+    ? value.arguments
+    : {};
+}
+
+function collectNestedAgentOperations(value, operations = []) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectNestedAgentOperations(item, operations);
+    return operations;
+  }
+  if (!value || typeof value !== "object") return operations;
+
+  const name = normalizeAgentToolName(value.recipient_name ?? value.recipientName ?? value.tool_name ?? value.toolName ?? value.name);
+  if (name) operations.push({ name, args: nestedToolInput(value) });
+
+  for (const key of ["tool_uses", "toolUses", "tools", "calls", "tool_calls", "toolCalls"]) {
+    if (value[key]) collectNestedAgentOperations(value[key], operations);
+  }
+  return operations;
+}
+
 function readTranscript(text, sinceLine) {
   const markers = [];
   const calls = [];
   const spawnBatches = [];
   const outputsByCallId = new Map();
+  const nestedCallIdsByWrapper = new Map();
   const lines = text.split(/\r?\n/);
   let sessionId = "";
   let pendingSpawnBatch = [];
@@ -177,12 +269,14 @@ function readTranscript(text, sinceLine) {
     }
 
     if (record.type === "response_item" && payload.type === "function_call") {
-      const name = typeof payload.name === "string" ? payload.name : "";
-      if (["spawn_agent", "close_agent", "send_input", "wait_agent"].includes(name)) {
+      const name = normalizeAgentToolName(payload.name);
+      if (name) {
         const args = parseCallArguments(payload.arguments);
         calls.push({
           line: lineNumber,
           call_id: typeof payload.call_id === "string" ? payload.call_id : "",
+          wrapper_call_id: "",
+          source: "direct",
           name,
           agent_type: args.agent_type ?? "",
           model: args.model ?? "",
@@ -196,11 +290,46 @@ function readTranscript(text, sinceLine) {
         } else {
           flushSpawnBatch();
         }
+      } else {
+        const wrapperCallId = typeof payload.call_id === "string" ? payload.call_id : "";
+        const nested = collectNestedAgentOperations(parseCallArguments(payload.arguments));
+        const nestedIds = [];
+        nested.forEach((operation, nestedIndex) => {
+          const callId = wrapperCallId ? `${wrapperCallId}:nested:${nestedIndex}` : `line:${lineNumber}:nested:${nestedIndex}`;
+          nestedIds.push(callId);
+          const args = operation.args ?? {};
+          calls.push({
+            line: lineNumber,
+            call_id: callId,
+            wrapper_call_id: wrapperCallId,
+            source: "nested",
+            name: operation.name,
+            agent_type: args.agent_type ?? "",
+            model: args.model ?? "",
+            reasoning_effort: args.reasoning_effort ?? "",
+            target: args.target ?? "",
+            message_preview: preview(args.message),
+            has_model: Boolean(args.model),
+          });
+          if (operation.name === "spawn_agent") pendingSpawnBatch.push(lineNumber);
+          else flushSpawnBatch();
+        });
+        if (wrapperCallId && nestedIds.length > 0) nestedCallIdsByWrapper.set(wrapperCallId, nestedIds);
       }
     } else if (record.type === "response_item" && payload.type === "function_call_output") {
       flushSpawnBatch();
       const callId = typeof payload.call_id === "string" ? payload.call_id : "";
       if (callId) {
+        const nestedCallIds = nestedCallIdsByWrapper.get(callId) ?? [];
+        const nestedAgentIds = collectAgentIds(payload.output);
+        nestedCallIds.forEach((nestedCallId, nestedIndex) => {
+          outputsByCallId.set(nestedCallId, {
+            line: lineNumber,
+            output: payload.output,
+            agent_id: nestedAgentIds.length === nestedCallIds.length ? nestedAgentIds[nestedIndex] : "",
+            failed: outputLooksFailed(payload.output),
+          });
+        });
         outputsByCallId.set(callId, {
           line: lineNumber,
           output: payload.output,
@@ -216,7 +345,15 @@ function readTranscript(text, sinceLine) {
     sessionId,
     markers,
     spawnBatches,
-    calls: calls.map((call) => ({ ...call, output: outputsByCallId.get(call.call_id) ?? null })),
+    calls: calls.map((call) => {
+      const output = outputsByCallId.get(call.call_id) ?? null;
+      return {
+        ...call,
+        output: output
+          ? { ...output, failed: toolOutputLooksFailed(call.name, output.output) }
+          : null,
+      };
+    }),
   };
 }
 
@@ -267,10 +404,12 @@ async function main() {
   const transcriptPath = resolve(args.transcript);
   const transcript = readTranscript(await readFile(transcriptPath, "utf-8"), args.sinceLine);
   const parent = args.parent || transcript.sessionId;
-  const edges = await readEdges(resolve(args.stateDb || defaultStateDb()), parent);
+  const dbPath = args.stateDb || await defaultStateDb();
+  const edges = await readEdges(dbPath ? resolve(dbPath) : "", parent);
   const spawnCalls = transcript.calls.filter((call) => call.name === "spawn_agent");
   const spawnBatches = transcript.spawnBatches ?? [];
   const failedSpawnCalls = spawnCalls.filter((call) => call.output?.failed);
+  const spawnCallsMissingOutput = spawnCalls.filter((call) => !call.output);
   const missingModelSpawns = spawnCalls.filter((call) => !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
@@ -305,6 +444,13 @@ async function main() {
       missingModelCreated.length === 0
         ? "no missing-model spawn created a child"
         : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
+    ),
+    buildCheck(
+      "spawn_outputs_observed",
+      spawnCallsMissingOutput.length === 0,
+      spawnCallsMissingOutput.length === 0
+        ? "every scanned spawn_agent call has a matched output"
+        : spawnCallsMissingOutput.map((call) => `line ${call.line} (${call.source})`).join(", "),
     ),
     buildCheck(
       "no_spawn_failures",
@@ -370,6 +516,8 @@ async function main() {
     spawn_calls: spawnCalls.map((call) => ({
       line: call.line,
       call_id: call.call_id,
+      wrapper_call_id: call.wrapper_call_id || null,
+      source: call.source,
       agent_type: call.agent_type,
       model: call.model || null,
       reasoning_effort: call.reasoning_effort || null,
@@ -393,6 +541,7 @@ async function main() {
     })),
     close_calls: transcript.calls.filter((call) => call.name === "close_agent").map((call) => ({
       line: call.line,
+      source: call.source,
       target: call.target,
       output_line: call.output?.line ?? null,
       output_failed: call.output?.failed ?? null,
