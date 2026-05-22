@@ -1013,6 +1013,7 @@ async function repairClosedNativeEdgeIds(parentThreadId, closedIds) {
     const rows = parseSqliteJsonOutput(stdout);
     const changed = Number(rows?.[0]?.changed ?? 0);
     if (changed > 0) {
+      await archiveNativeChildThreadIds(repairableIds, "edge_close_repair");
       await appendAdvisorLog({
         event: "native_edge_close_repair",
         parent_thread_id: parentId,
@@ -1081,6 +1082,7 @@ async function repairUniqueMissingNativeEdgeIds(closedIds) {
     if (changed <= 0) return new Map();
 
     const repaired = new Map(uniquePairs);
+    await archiveNativeChildThreadIds(repaired.keys(), "unique_child_not_found_repair");
     await appendAdvisorLog({
       event: "native_edge_close_not_found_unique_child_repair",
       requested: ids.length,
@@ -1093,6 +1095,42 @@ async function repairUniqueMissingNativeEdgeIds(closedIds) {
     return repaired;
   } catch {
     return new Map();
+  }
+}
+
+async function archiveNativeChildThreadIds(childIds, reason = "closed_edge") {
+  const ids = [...(childIds ?? [])].map((id) => safeString(id).trim()).filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
+  if (ids.length === 0) return 0;
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return 0;
+
+  const sql = [
+    "pragma busy_timeout=250;",
+    "update threads",
+    "set archived=1, archived_at=coalesce(archived_at, cast(strftime('%s','now') as integer))",
+    "where archived=0",
+    `and id in (${ids.map(sqlString).join(",")})`,
+    "and id not in (select child_thread_id from thread_spawn_edges where status='open');",
+    "select changes() as changed;",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = Number(parseSqliteJsonOutput(stdout)?.[0]?.changed ?? 0);
+    if (changed > 0) {
+      await appendAdvisorLog({
+        event: "native_child_thread_archive",
+        reason,
+        requested: ids.length,
+        changed,
+      });
+    }
+    return Number.isFinite(changed) ? changed : 0;
+  } catch {
+    return 0;
   }
 }
 
@@ -2470,6 +2508,7 @@ async function main() {
           const closedIds = markClosed(session, operationPayload);
           if (closedIds.length > 0) {
             const changedNativeRows = await repairClosedNativeEdges(identity.poolThreadId, closedIds);
+            await archiveNativeChildThreadIds(closedIds, "close_agent_success");
             for (const id of closedIds) {
               const wasNativeOpen = nativeThreadEdges.active?.has(id) || nativeThreadEdges.terminal?.has(id);
               if (changedNativeRows > 0 || !wasNativeOpen) {

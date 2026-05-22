@@ -52,6 +52,16 @@ async function createNativeTables(home) {
   );
 }
 
+async function createNativeTablesWithArchiveColumns(home) {
+  await sqlite(
+    home,
+    [
+      "create table thread_spawn_edges(parent_thread_id text, child_thread_id text, status text);",
+      "create table threads(id text, rollout_path text, title text, agent_role text, model text, reasoning_effort text, agent_nickname text, cwd text, updated_at integer, thread_source text, archived integer, archived_at integer);",
+    ].join(" "),
+  );
+}
+
 async function writeTaskCompleteTranscript(home, id) {
   const path = join(home, `${id}.jsonl`);
   await writeFile(
@@ -1348,6 +1358,31 @@ test("successful close_agent is the only automatic native edge release", async (
     });
 
     assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "closed|1");
+  });
+});
+
+test("successful close_agent archives closed native child thread rows", async () => {
+  await withHome(async (home) => {
+    await createNativeTablesWithArchiveColumns(home);
+    await sqlite(
+      home,
+      [
+        "insert into thread_spawn_edges values ('parent1','child1','open');",
+        "insert into threads(id,rollout_path,title,agent_role,model,reasoning_effort,agent_nickname,cwd,updated_at,thread_source,archived,archived_at)",
+        "values ('child1','/tmp/child1.jsonl','Archive Me','explorer','gpt-5.4-mini','medium','Scout','/tmp',1779074894,'subagent',0,null);",
+      ].join(" "),
+    );
+
+    await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "close_agent",
+      session_id: "parent1",
+      tool_input: { target: "child1" },
+      tool_response: { status: "closed" },
+    });
+
+    assert.equal(await sqliteReadonly(home, "select status,count(*) from thread_spawn_edges group by status;"), "closed|1");
+    assert.equal(await sqliteReadonly(home, "select archived, archived_at is not null from threads where id='child1';"), "1|1");
   });
 });
 
