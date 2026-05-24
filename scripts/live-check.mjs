@@ -46,6 +46,7 @@ const CLOSE_RELEASE_NOT_FOUND_PATTERNS = [
   /invalid agent(?: id)?/i,
 ];
 const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.5"];
+const DEFAULT_ALLOWED_AGENT_TYPES = ["default", "explorer", "explore"];
 
 function usage() {
   return [
@@ -57,6 +58,7 @@ function usage() {
     "  --since-line <n>              Scan transcript records starting at this 1-based line.",
     "  --expect-model <model>        Require a successful spawn whose tool input and native DB edge both use this model. Repeatable.",
     "  --forbid-explorer-model <m>   Fail non-fork explorer spawns using this model. Repeatable; defaults include gpt-5.5.",
+    "  --allow-agent-type <type>      Permit a native spawn agent_type. Repeatable; defaults: default, explorer, explore.",
     "  --expect-current-open <n>     Require this parent/session to have exactly n open native edges after the scanned window.",
     "  --expect-all-closed           Require every successful spawn in the scanned window to have closed DB edge plus close success or verified not-found release evidence.",
     "  --require-guidance            Fail if no advisor guidance marker appears before the first scanned spawn.",
@@ -82,6 +84,10 @@ function parseArgs(argv) {
     else if (arg === "--forbid-explorer-model") {
       args.forbidExplorerModels ??= [];
       args.forbidExplorerModels.push(argv[++i]);
+    }
+    else if (arg === "--allow-agent-type") {
+      args.allowAgentTypes ??= [];
+      args.allowAgentTypes.push(argv[++i]);
     }
     else if (arg === "--expect-current-open") args.expectCurrentOpen = Number(argv[++i]);
     else if (arg === "--expect-all-closed") args.expectAllClosed = true;
@@ -172,6 +178,17 @@ function forbiddenExplorerModels(extraModels = []) {
     ...(models.length > 0 ? models : DEFAULT_EXPLORER_FORBIDDEN_MODELS),
     ...extraModels,
   ].map((model) => model.toLowerCase()).filter(Boolean));
+}
+
+function allowedAgentTypes(extraTypes = []) {
+  const raw = typeof process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES === "string"
+    ? process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES
+    : "";
+  const roles = raw.split(",").map((item) => normalizeRole(item)).filter(Boolean);
+  return new Set([
+    ...(roles.length > 0 ? roles : DEFAULT_ALLOWED_AGENT_TYPES),
+    ...extraTypes,
+  ].map((role) => normalizeRole(role)).filter(Boolean));
 }
 
 function isExplorerRole(value) {
@@ -475,6 +492,7 @@ async function main() {
   const missingModelSpawns = spawnCalls.filter((call) => !call.fork_context && !call.has_model);
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
   const explorerForbidden = forbiddenExplorerModels(args.forbidExplorerModels ?? []);
+  const allowedAgentTypeSet = allowedAgentTypes(args.allowAgentTypes ?? []);
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
   const edgeByChild = new Map(edges.rows.map((row) => [row.child_thread_id, row]));
@@ -507,6 +525,16 @@ async function main() {
     if (!report.call.has_model) return false;
     const toolModel = explicitString(report.call.model).toLowerCase();
     return isExplorerRole(report.call.agent_type) && explorerForbidden.has(toolModel);
+  });
+  const unsupportedAgentTypeAttempts = spawnCalls.filter((call) => {
+    if (call.fork_context) return false;
+    const role = normalizeRole(call.agent_type);
+    return role && !allowedAgentTypeSet.has(role);
+  });
+  const unsupportedAgentTypeReports = successfulSpawns.filter((call) => {
+    if (call.fork_context) return false;
+    const role = normalizeRole(call.agent_type);
+    return role && !allowedAgentTypeSet.has(role);
   });
   const expectedModels = Array.isArray(args.expectModels) ? args.expectModels.filter(Boolean) : [];
   const checks = [
@@ -549,6 +577,15 @@ async function main() {
         ? "no non-fork explorer spawn used a forbidden frontier model"
         : explorerFrontierReports.map((report) => {
           return `${report.call.output.agent_id}:tool_role=${report.call.agent_type || "?"}, tool_model=${report.call.model || "?"}, native_role=${report.edge?.agent_role ?? "missing"}, native_model=${report.edge?.model ?? "missing"}`;
+        }).join(", "),
+    ),
+    buildCheck(
+      "no_unsupported_native_agent_type_attempted",
+      unsupportedAgentTypeAttempts.length === 0,
+      unsupportedAgentTypeAttempts.length === 0
+        ? "no spawn attempted an unsupported native agent_type"
+        : unsupportedAgentTypeAttempts.map((call) => {
+          return `line ${call.line}:tool_role=${call.agent_type || "?"}, model=${call.model || "?"}, output=${call.output?.agent_id ? call.output.agent_id : call.output?.line ?? "missing"}, allowed=${[...allowedAgentTypeSet].join("|")}`;
         }).join(", "),
     ),
     buildCheck(
@@ -607,6 +644,8 @@ async function main() {
     ok: checkStatus !== "failed",
     verdict: checkStatus === "failed" && explorerFrontierReports.length > 0
       ? "native_explorer_frontier_model_violation"
+      : checkStatus === "failed" && unsupportedAgentTypeAttempts.length > 0
+      ? "native_unsupported_agent_type_attempted"
       : checkStatus === "failed" && modelMismatchReports.length > 0
       ? "native_spawn_model_mismatch"
       : checkStatus === "failed" && missingModelCreated.length > 0
@@ -655,6 +694,7 @@ async function main() {
       output_failed: call.output?.failed ?? null,
       native_edge: call.output?.agent_id ? edgeByChild.get(call.output.agent_id) ?? null : null,
       explorer_frontier_violation: explorerFrontierReports.some((report) => report.call === call),
+      unsupported_agent_type: unsupportedAgentTypeAttempts.includes(call),
       message_preview: call.message_preview,
     })),
     model_routes: spawnReports.map((report) => ({

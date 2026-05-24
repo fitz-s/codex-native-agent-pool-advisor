@@ -57,7 +57,8 @@ See [First-Principles Design](docs/first-principles.md) for the full boundary mo
 - Every `spawn_agent` call must include an explicit `model`. Omitted model means inherited parent model. The hook blocks that only when the native spawn call reaches a supported `PreToolUse` surface; otherwise `SessionStart`/`UserPromptSubmit` guidance and live transcript checks are the enforceable surfaces available outside Codex itself.
 - Full-history fork is the exception to model routing. If the runtime rejects `fork_context=true` together with `model`, use either `fork_context=true` without `model` and accept inherited parent model, or remove `fork_context` and pass a compact context packet with an explicit Spark/mini/frontier model. A fork/model shape failure is not native-pool exhaustion and should be retried only with corrected shape and positive budget.
 - The default subagent choice is `gpt-5.4-mini` unless the leader has a stronger reason. Use `gpt-5.3-codex-spark` for fast read-only scout/probe/grep-style evidence collection with an output cap and stop condition. Use `gpt-5.5` only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.
-- The hook does not choose the model from `agent_type`, but the native role/model shape must still be coherent. `agent_type=explorer` with a forbidden frontier model such as `gpt-5.5` is blocked; use `agent_type=default` for frontier critic/architecture/high-risk judgment and keep explorer lanes on Spark or mini.
+- Native `agent_type` is a runtime shape, not a semantic specialist role. Use only supported native types, normally `default` or `explorer`; put roles such as researcher, critic, verifier, architect, or debugger in the child message/title/task contract. The hook blocks unsupported non-fork `agent_type` values when Codex exposes a supported `PreToolUse(spawn_agent)` event, and live-check detects bypassed unsupported type creation.
+- The hook does not choose the model from `agent_type`, but the native role/model shape must still be coherent. `agent_type=explorer` with a forbidden frontier model such as `gpt-5.5` is blocked; use `agent_type=default` for semantic researcher/critic/architecture/high-risk judgment and keep explorer lanes on Spark or mini.
 - Non-universal settings can live in `~/.codex/native-agent-pool-advisor.config.json` or environment variables.
 
 ## Prerequisites
@@ -115,7 +116,9 @@ Route by output contract, risk, and context-state depth, not by complexity adjec
 
 For broad, compiled, vendor, or large-context repos, do a local `rg`/module map first. Then send Spark exact slices for anchors, not the whole tree. Use mini for synthesis once the slices exist. If two scout lanes fail or compact on context, stop spawning, shrink the slice locally, and reuse or close current lanes before trying again.
 
-When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid, and blocks `agent_type=explorer` paired with forbidden frontier models. The fix is to remove `fork_context` for model-routed lanes, intentionally accept inherited model for exact full-history fork, or change frontier critic/architecture lanes to `agent_type=default`. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
+When Codex emits `PreToolUse` for a spawn operation, the hook blocks any non-fork spawn that omits `model`, because accidental inheritance is exactly the failure mode. It also blocks `fork_context=true` combined with `model` when that runtime shape is invalid, unsupported native `agent_type` values, and `agent_type=explorer` paired with forbidden frontier models. The fix is to remove `fork_context` for model-routed lanes, intentionally accept inherited model for exact full-history fork, put semantic roles in message/title while using native `agent_type=default`, or change frontier critic/architecture lanes to `agent_type=default`. Current Codex Desktop native `spawn_agent` paths may bypass that hard-block event, so the durable rule still belongs in `AGENTS.md` and the live transcript check.
+
+Do not pass OMX/prompt role names as native `agent_type` unless this exact Codex runtime has already produced a successful live spawn for that type. Tool metadata may list role names that still return `agent type is currently not available` at execution time. For example, external reference research should use native `agent_type=default`, `model=gpt-5.4-mini`, and a message that starts with "You are a mini research agent..." instead of `agent_type=researcher`. A frontier critique should use `agent_type=default`, `model=gpt-5.5`, and a critic task contract. This prevents the wasteful runtime pattern where Codex first attempts an unsupported semantic type, fails, then retries as default.
 
 See [Delegation Control Implementation Plan](docs/delegation-control-implementation-plan.md) for the approved follow-up design that keeps the hook small while moving durable delegation policy into `AGENTS.md`.
 
@@ -139,7 +142,8 @@ If only `models.explorer` is set, the first model is treated as the scout guidan
     "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
     "explorerPreferred": "gpt-5.3-codex-spark",
     "explorerFallback": "gpt-5.4-mini",
-    "explorerForbidden": ["gpt-5.5"]
+    "explorerForbidden": ["gpt-5.5"],
+    "allowedAgentTypes": ["default", "explorer", "explore"]
   },
   "defaults": {
     "agentCap": 6,
@@ -157,6 +161,7 @@ Environment overrides are also supported:
 - `NATIVE_AGENT_POOL_EXPLORER_MODEL`: preferred explorer model.
 - `NATIVE_AGENT_POOL_EXPLORER_FALLBACK_MODEL`: fallback explorer model.
 - `NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS`: comma-separated models that must not be paired with native `agent_type=explorer`; defaults to `gpt-5.5`.
+- `NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES`: comma-separated native runtime `agent_type` allow-list; defaults to `default,explorer,explore`. This is intentionally not a semantic role catalog.
 - `NATIVE_AGENT_POOL_DEFAULT_CAP`: fallback cap when `[agents].max_threads` is absent.
 - `NATIVE_AGENT_POOL_WARN_REMAINING`: advisory threshold near the cap.
 - `NATIVE_AGENT_POOL_STATE_DB_PATH` or `NATIVE_AGENT_POOL_STATE_DB_NAME`: native DB override.
@@ -226,6 +231,8 @@ node scripts/live-check.mjs \
   --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-...jsonl \
   --since-line <line_before_test> \
   --forbid-explorer-model gpt-5.5 \
+  --allow-agent-type default \
+  --allow-agent-type explorer \
   --expect-model gpt-5.3-codex-spark \
   --expect-model gpt-5.4-mini \
   --expect-model gpt-5.5 \
@@ -243,6 +250,8 @@ node scripts/live-check.mjs \
 ```
 
 The live-check JSON includes `current_parent_lanes` with status, role, model, reasoning effort, nickname, title, and `updated_at` for the scoped parent/session. Use that block when validating lane reuse, completed-not-closed pressure, or close accounting.
+
+`--allow-agent-type` is for proven native runtime shapes, not semantic role names. The default allow-list is `default`, `explorer`, and `explore`; a researcher/critic/verifier task should normally appear as `agent_type=default` with the semantic role in the prompt.
 
 At `open=6`, a live `UserPromptSubmit` hook run for that parent should emit `SPAWN_AGENT_DISABLED_THIS_TURN=true`, `occupied=6/6`, `observed_free=0`, and `remaining_spawn_budget=0`. Do not prove this by launching a seventh child; that recreates the waste this project is designed to prevent. If a later close succeeds, run a fresh hook/live check and use the updated observed snapshot instead of the stale zero-budget prompt.
 
