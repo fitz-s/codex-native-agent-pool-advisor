@@ -56,6 +56,7 @@ Responsibilities:
   - unscoped spawn hook payload;
   - missing non-fork `model`;
   - `fork_context=true` plus explicit `model`;
+  - unsupported native `agent_type` values, because OMX/prompt semantic roles such as `researcher` should be message/title text on `agent_type=default` unless this exact runtime has successful live spawn evidence for them;
   - `agent_type=explorer` plus forbidden frontier model;
   - observed pending same-turn spawn attempt debt with TTL, using the existing `SPAWN_RESERVATION_TTL_MS` default unless renamed during implementation;
   - multi-spawn batch without runtime reservation;
@@ -289,7 +290,7 @@ Tests:
 - Do not mutate Codex runtime internals beyond current SQLite repair rules.
 - Do not infer task semantics from long prose inside the hook.
 - Do not force subagent use for every analysis task.
-- Do not make `agent_type` the semantic model router; only enforce invalid native role/model shapes.
+- Do not make `agent_type` the semantic model router; only enforce invalid native role/model shapes and unsupported native runtime types.
 - Do not ask child agents to manage slots or spawn recursively.
 
 ## Open Risks
@@ -301,7 +302,7 @@ Tests:
 
 ## Success Criteria
 
-- `live-check` reports `native_explorer_frontier_model_violation` for historical `agent_type=explorer` plus `gpt-5.5` transcripts and no such violation in a new controlled compliant transcript window.
+- `live-check` reports `native_explorer_frontier_model_violation` for historical `agent_type=explorer` plus `gpt-5.5` transcripts, reports unsupported semantic native `agent_type` usage, and shows no such violation in a new controlled compliant transcript window.
 - Positive-budget prompt guidance is materially shorter than zero-budget recovery guidance.
 - Hook output includes a compact lane digest with role/model/status/age when current-parent lanes exist.
 - Docs state completed lanes are reusable and should close only when stale, wrong-model/topic, cap-needed, or task-window complete.

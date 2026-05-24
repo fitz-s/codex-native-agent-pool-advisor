@@ -343,7 +343,7 @@ test("blocks non-explorer spawns that omit explicit model selection", async () =
       tool_name: "spawn_agent",
       session_id: "parent1",
       tool_input: {
-        agent_type: "worker",
+        agent_type: "default",
         message: "Implement a bounded low-risk fix.",
       },
     });
@@ -352,6 +352,50 @@ test("blocks non-explorer spawns that omit explicit model selection", async () =
     assert.match(output.reason, /explicit model/);
     assert.match(output.reason, /Default to gpt-5\.4-mini/);
     assert.match(output.reason, /model-selection judgment/);
+  });
+});
+
+test("blocks semantic role names used as native agent_type", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "researcher",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "high",
+        message: "External reference research with links.",
+      },
+    });
+
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /Unsupported native agent_type: researcher/);
+    assert.match(output.reason, /agent_type=default/);
+    assert.match(output.reason, /semantic role/);
+  });
+});
+
+test("post-tool advisory reports unsupported native agent_type when spawn hook was bypassed", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const output = await runHook(home, {
+      hook_event_name: "PostToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "researcher",
+        model: "gpt-5.4-mini",
+        reasoning_effort: "high",
+        message: "External reference research with links.",
+      },
+      tool_response: { agent_id: "child1", nickname: "Feynman" },
+    });
+
+    assert.notEqual(output?.decision, "block");
+    assert.match(output.hookSpecificOutput.additionalContext, /Unsupported native agent_type observed after tool execution: researcher/);
+    assert.match(output.hookSpecificOutput.additionalContext, /semantic roles such as researcher\/critic\/verifier must use native agent_type=default/);
   });
 });
 
@@ -2185,6 +2229,70 @@ test("live-check supports configurable forbidden explorer models", async () => {
   });
 });
 
+test("live-check detects unsupported semantic native agent_type attempts", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(
+      home,
+      "insert into thread_spawn_edges values ('parent1','child1','closed');"
+        + "insert into threads values ('child1','/tmp/child.jsonl','Mini Researcher','researcher','gpt-5.4-mini','high','Feynman','/tmp',1779074894);",
+    );
+    const transcript = join(home, "parent-unsupported-agent-type.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"researcher\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"External reference research.\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Feynman\\"}"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.verdict, "native_unsupported_agent_type_attempted");
+    const check = output.checks.find((item) => item.name === "no_unsupported_native_agent_type_attempted");
+    assert.equal(check.status, "fail");
+    assert.match(check.evidence, /tool_role=researcher/);
+    assert.equal(output.spawn_calls[0].unsupported_agent_type, true);
+  });
+});
+
+test("live-check detects unsupported semantic native agent_type even when runtime creates no child", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const transcript = join(home, "parent-unsupported-agent-type-failed.jsonl");
+    await writeFile(
+      transcript,
+      [
+        '{"type":"session_meta","payload":{"id":"parent1"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"researcher\\",\\"fork_context\\":false,\\"message\\":\\"External reference research.\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"agent type is currently not available"}}',
+      ].join("\n"),
+    );
+
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.verdict, "native_unsupported_agent_type_attempted");
+    const check = output.checks.find((item) => item.name === "no_unsupported_native_agent_type_attempted");
+    assert.equal(check.status, "fail");
+    assert.match(check.evidence, /line 2:tool_role=researcher/);
+    assert.equal(output.spawn_calls[0].created_agent_id, null);
+    assert.equal(output.spawn_calls[0].unsupported_agent_type, true);
+  });
+});
+
 test("live-check detects native model mismatch for explicit-model spawn", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
@@ -2512,6 +2620,8 @@ test("docs preserve delegation control boundaries", async () => {
   assert.match(docs, /no subagents/);
   assert.match(docs, /subagent-relevant read-heavy, multi-slice/);
   assert.match(docs, /--forbid-explorer-model/);
+  assert.match(docs, /unsupported native `agent_type`/);
+  assert.match(docs, /semantic role/);
   assert.match(docs, /current_parent_lanes/);
   assert.match(docs, /tmp=\$\(mktemp -d\)/);
   assert.match(docs, /sqlite3 "\$tmp\/state_5\.sqlite"/);

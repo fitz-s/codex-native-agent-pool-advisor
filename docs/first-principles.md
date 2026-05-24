@@ -43,9 +43,10 @@ It must also avoid the opposite drift: a leader that treats hook safety text as 
 3. Model boundary:
    - Every non-fork `spawn_agent` tool input must include a non-empty string `model`.
    - Boolean `fork_context=true` without `model` is the only inheritance exception.
-   - `agent_type` is never the semantic model-routing authority, but the native role/model pair must be coherent.
+   - `agent_type` is never the semantic model-routing authority, and semantic roles are not automatically native runtime shapes.
+   - Use native `agent_type=default` for researcher/critic/verifier/architect-style semantic roles; put the role in message/title/task contract and choose `model` explicitly.
    - `agent_type=explorer` with a forbidden frontier model is invalid shape; use `agent_type=default` for frontier critic/architecture/high-risk lanes.
-   - `live-check` must catch missing-model bypasses, tool-model/native-model mismatches, and explorer/frontier role-shape violations.
+   - `live-check` must catch missing-model bypasses, unsupported native agent types, tool-model/native-model mismatches, and explorer/frontier role-shape violations.
 
 4. Lane lifecycle:
    - Treat subagents as reusable context lanes.
