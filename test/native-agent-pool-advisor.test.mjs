@@ -2268,6 +2268,31 @@ test("fresh lock contention blocks spawn conservatively", async () => {
   });
 });
 
+test("fresh advisor lock contention allows a spawn from read-only native edge evidence", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await mkdir(join(home, "state", "native-agent-pool-advisor.lock"), { recursive: true });
+    await writeFile(join(home, "state", "native-agent-pool-advisor.lock", "owner"), "test lock\n");
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "code-reviewer",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "medium",
+        message: "Read-only review of one bounded diff.",
+      },
+    });
+
+    assert.notEqual(output?.decision, "block");
+    assert.match(output.hookSpecificOutput.additionalContext, /ADVISOR_STATE_LOCK_BYPASSED=true/);
+    assert.match(output.hookSpecificOutput.additionalContext, /read-only current-parent native-edge snapshot/);
+    assert.match(output.hookSpecificOutput.additionalContext, /observed_free=6/);
+  });
+});
+
 test("post-spawn thread-limit failure emits close-candidate recovery directive", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

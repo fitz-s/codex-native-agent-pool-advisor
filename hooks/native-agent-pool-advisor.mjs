@@ -47,6 +47,7 @@ const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.6-terra";
 const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.6-sol"];
 const DEFAULT_SUBAGENT_MODELS = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
 const DEFAULT_ALLOWED_AGENT_TYPES = [];
+const SPAWN_LOCK_WAIT_MS = 100;
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
 let runtimeOptionsCache = {
@@ -436,10 +437,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function acquireStateLock() {
+async function acquireStateLock(waitMs = STATE_LOCK_WAIT_MS) {
   const lockPath = stateLockPath();
   const ownerPath = join(lockPath, "owner");
-  const deadline = Date.now() + STATE_LOCK_WAIT_MS;
+  const deadline = Date.now() + Math.max(0, Number(waitMs) || 0);
   await mkdir(dirname(lockPath), { recursive: true });
   const writeOwner = async () => {
     await writeFile(ownerPath, `${process.pid} ${new Date().toISOString()}\n`);
@@ -480,8 +481,8 @@ async function acquireStateLock() {
   return null;
 }
 
-async function withStateLock(work) {
-  const lock = await acquireStateLock();
+async function withStateLock(work, waitMs = STATE_LOCK_WAIT_MS) {
+  const lock = await acquireStateLock(waitMs);
   if (!lock) return LOCK_UNAVAILABLE;
   const heartbeat = setInterval(() => {
     lock.touch().catch(() => {});
@@ -2802,7 +2803,7 @@ function nativePoolResetMs(state, poolThreadId = "") {
   return Math.max(globalResetMs, threadResetMs);
 }
 
-async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT_AGENT_CAP) {
+async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT_AGENT_CAP, options = {}) {
   const poolThreadId = identity.poolThreadId || identity.threadId;
   const preferredPath = identity.threadId === poolThreadId ? identity.transcript : "";
   const poolTranscript = await findRecentTranscriptByThreadId(
@@ -2820,8 +2821,10 @@ async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT
     discoverRecentChildSessionIds(poolThreadId, nowMs, resetAtMs),
     discoverNativeThreadEdges(poolThreadId),
   ]);
-  await applyMissingCloseEvidence(poolThreadId, transcriptPool, nativeThreadEdges);
-  await applyStaleCloseRequestEvidence(poolThreadId, transcriptPool, nativeThreadEdges, nowMs);
+  if (options.reconcile !== false) {
+    await applyMissingCloseEvidence(poolThreadId, transcriptPool, nativeThreadEdges);
+    await applyStaleCloseRequestEvidence(poolThreadId, transcriptPool, nativeThreadEdges, nowMs);
+  }
   return { transcriptPool, childSessionIds, nativeThreadEdges, poolThreadId };
 }
 
@@ -4133,6 +4136,35 @@ function buildLockUnavailableAdvisory(eventName, cap, isChildSession, operations
   };
 }
 
+async function buildReadOnlyLockContentionSpawnDecision(identity, eventName, name, payload, operations, nowMs, cap) {
+  if (eventName !== "PreToolUse" || !hasSpawnOperation(operations)) return null;
+  const statelessState = emptyState();
+  const session = normalizeSession(statelessState, identity.key);
+  const evidence = await collectPoolEvidence(identity, nowMs, 0, cap, { reconcile: false });
+  if (!evidence.nativeThreadEdges?.checked || evidence.nativeThreadEdges.failed) return null;
+
+  const summary = mergeSummary(
+    summarize(session),
+    evidence.transcriptPool,
+    evidence.childSessionIds,
+    evidence.nativeThreadEdges,
+    session,
+    0,
+    cap,
+  );
+  const blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
+  const output = buildAdvisory(eventName, summary, cap, blockSpawn, identity.isChildSession, payload, operations);
+  const context = [
+    "ADVISOR_STATE_LOCK_BYPASSED=true.",
+    "Advisor write state is busy; this decision used a read-only current-parent native-edge snapshot and did not mutate advisor or Codex state.",
+    output.hookSpecificOutput?.additionalContext,
+  ].filter(Boolean).join(" ");
+  output.hookSpecificOutput ??= { hookEventName: eventName };
+  output.hookSpecificOutput.additionalContext = context;
+  if (blockSpawn) output.reason = context;
+  return output;
+}
+
 function applyTranscriptEvidenceToSession(session, transcriptPool) {
   if (transcriptPool.scanned && !transcriptPool.truncated) {
     session.last_cap_hit_at = isoFromMs(Math.max(
@@ -4203,6 +4235,9 @@ async function main() {
       return;
     }
 
+    const stateLockWaitMs = eventName === "PreToolUse" && hasSpawnOperation(operations)
+      ? Math.min(SPAWN_LOCK_WAIT_MS, STATE_LOCK_WAIT_MS)
+      : STATE_LOCK_WAIT_MS;
     const lockResult = await withStateLock(async () => {
       const state = await readState();
       await sanitizeCodexGlobalStateNativeDisplayContext(identity.poolThreadId || identity.threadId, eventName);
@@ -4444,9 +4479,18 @@ async function main() {
       if (blockSpawn || shouldEmitAdvisory(eventName, name, summary, cap, operations)) {
         process.stdout.write(`${JSON.stringify(buildAdvisory(eventName, summary, cap, blockSpawn, identity.isChildSession, payload, operations))}\n`);
       }
-    });
+    }, stateLockWaitMs);
     if (lockResult === LOCK_UNAVAILABLE && isToolHookEvent(eventName) && operations.length > 0) {
-      process.stdout.write(`${JSON.stringify(buildLockUnavailableAdvisory(eventName, cap, identity.isChildSession, operations))}\n`);
+      const readOnlyDecision = await buildReadOnlyLockContentionSpawnDecision(
+        identity,
+        eventName,
+        name,
+        payload,
+        operations,
+        nowMs,
+        cap,
+      );
+      process.stdout.write(`${JSON.stringify(readOnlyDecision ?? buildLockUnavailableAdvisory(eventName, cap, identity.isChildSession, operations))}\n`);
     }
   } catch (error) {
     try {
