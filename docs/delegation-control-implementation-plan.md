@@ -38,7 +38,7 @@ These are not three independent bugs. They are symptoms of mixing four responsib
 - `observed_free` is a current snapshot; only the immediate PreToolUse hook can locally admit a same-tool batch whose requested count fits it.
 - `wait_agent` and `send_input` do not free capacity.
 - Current Codex hook surfaces may not hard-block every native `spawn_agent` path with `PreToolUse`.
-- `fork_context=true` may require omitted `model`, so it is an explicit full-history inheritance exception.
+- Native `fork_context=true` is disabled because it inherits the already-running parent model and effort.
 - Child agents must not recursively spawn; they report escalation needs upward.
 
 ## Target Architecture
@@ -54,8 +54,8 @@ Responsibilities:
 - Block or warn on observable hard errors:
   - child-session recursive spawn;
   - unscoped spawn hook payload;
-  - missing non-fork `model` on any native role;
-  - `fork_context=true` plus explicit `model`;
+  - missing explicit `model` on any routed native role;
+  - any `fork_context=true` call;
   - optional native `agent_type` audit warnings when an install explicitly configures an allow-list; default live admission must let Codex runtime own special-type availability;
   - `agent_type=explorer` plus forbidden frontier model;
   - multi-spawn batch whose requested count exceeds the current observed free capacity;

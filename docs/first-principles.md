@@ -42,7 +42,7 @@ It must also avoid the opposite drift: a leader that treats hook safety text as 
 
 3. Model boundary:
    - Every default/legacy non-fork `spawn_agent` tool input must include a non-empty string `model`.
-   - Boolean `fork_context=true` without `model` is the only inheritance exception. Every non-fork lane must choose an explicit Luna, Terra, or Sol model; legacy Spark/5.4/5.5 routes are retired.
+   - Native `fork_context=true` is disabled because it inherits the already-running parent model and effort. Every lane passes compact context and explicitly chooses Luna, Terra, or Sol; legacy Spark/5.4/5.5 routes are retired.
    - `agent_type` is never the semantic model-routing authority, and the hook does not own native agent-type availability.
    - If Codex runtime accepts a special native `agent_type` such as `code-reviewer`, let it run. If runtime rejects it, retry once with native `agent_type=default`, preserve the semantic role in message/title/task contract, and choose `model` explicitly.
    - A critic/code-reviewer/architect prompt on native `default` is still a named specialist lane, not a fallback or downgrade.

@@ -990,9 +990,9 @@ test("blocks fork_context spawn when it also specifies model", async () => {
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /fork_context=true cannot be combined with an explicit model/);
-    assert.match(output.reason, /tool-shape failure, not native-pool exhaustion/);
-    assert.match(output.reason, /remove fork_context/);
+    assert.match(output.reason, /fork_context=true is disabled/);
+    assert.match(output.reason, /This is not native-pool exhaustion/);
+    assert.match(output.reason, /Remove fork_context/);
     assert.match(output.reason, /do not treat this as a consumed native slot/);
   });
 });
@@ -1013,9 +1013,9 @@ test("blocks fork_context spawn when it also specifies agent_type", async () => 
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /fork_context=true cannot be combined with agent_type/);
-    assert.match(output.reason, /Full-history forks cannot override role/);
-    assert.match(output.reason, /remove fork_context/);
+    assert.match(output.reason, /fork_context=true is disabled/);
+    assert.match(output.reason, /inherits the already-running parent model and reasoning effort/);
+    assert.match(output.reason, /Remove fork_context/);
     assert.doesNotMatch(output.reason, /ZERO_BUDGET_RECOVERY_REQUIRED/);
     assert.doesNotMatch(output.reason, /observed_free=0/);
   });
@@ -1041,7 +1041,7 @@ test("does not treat string fork_context as the model-inheritance exception", as
   });
 });
 
-test("allows fork_context without model but warns about inherited model exception", async () => {
+test("blocks fork_context because it inherits parent model and effort", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     const output = await runHook(home, {
@@ -1055,9 +1055,9 @@ test("allows fork_context without model but warns about inherited model exceptio
       },
     });
 
-    assert.notEqual(output?.decision, "block");
-    assert.match(output.hookSpecificOutput.additionalContext, /Fork-context model inheritance exception/);
-    assert.match(output.hookSpecificOutput.additionalContext, /remove fork_context and pass compact context/);
+    assert.equal(output.decision, "block");
+    assert.match(output.reason, /Native full-history fork is disabled/);
+    assert.match(output.reason, /compact context packet/);
   });
 });
 
@@ -3541,8 +3541,8 @@ test("prompt-time guidance requires explicit model-selection judgment when spawn
     assert.doesNotMatch(context, /subagents require explicit user request/);
     assert.match(context, /SUBAGENT_MODEL_DECISION_REQUIRED=true/);
     assert.match(context, /FORK_CONTEXT_HARD_RULE=true/);
-    assert.match(context, /if fork_context=true, omit agent_type and model/);
-    assert.match(context, /full-history forks cannot override role or model/i);
+    assert.match(context, /fork_context=true is disabled/);
+    assert.match(context, /inherits the running parent model and effort/);
     assert.match(context, /task_contract=\{output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition\}/);
     assert.match(context, /Every non-fork spawn_agent call/);
     assert.match(context, /explicitly select one of gpt-5\.6-luna, gpt-5\.6-terra, gpt-5\.6-sol/);
@@ -3581,7 +3581,7 @@ test("post-compact emits compact native spawn shape contract", async () => {
     assert.doesNotMatch(context, /subagents require explicit user request/);
     assert.doesNotMatch(context, /inherited model is preferred/);
     assert.match(context, /FORK_CONTEXT_HARD_RULE=true/);
-    assert.match(context, /fork_context=true, omit agent_type and model/);
+    assert.match(context, /fork_context=true is disabled/);
     assert.match(context, /Native agent_type availability belongs to Codex runtime/);
     assert.match(context, /If a special native agent_type is unavailable/);
     assert.match(context, /model is optional\/inherited is unsafe/);
@@ -3916,7 +3916,7 @@ test("live-check treats blank model as missing model bypass evidence", async () 
   });
 });
 
-test("live-check allows boolean fork_context spawn without explicit model", async () => {
+test("live-check rejects a fork_context child that bypassed the advisor", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(
@@ -3934,12 +3934,18 @@ test("live-check allows boolean fork_context spawn without explicit model", asyn
       ].join("\n"),
     );
 
-    const output = JSON.parse((await runScript(liveCheckPath, home, [
-      "--transcript", transcript,
-      "--allow-missing-guidance",
-    ])).stdout);
-    assert.equal(output.ok, true);
+    let error;
+    try {
+      await runScript(liveCheckPath, home, ["--transcript", transcript, "--allow-missing-guidance"]);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error?.code, 2);
+    const output = JSON.parse(error.stdout);
+    assert.equal(output.ok, false);
+    assert.equal(output.verdict, "native_fork_context_spawn_bypassed_advisor");
     assert.equal(output.spawn_calls[0].fork_context, true);
+    assert.equal(output.spawn_calls[0].fork_context_violation, true);
     assert.equal(output.spawn_calls[0].has_model, false);
   });
 });
@@ -4005,7 +4011,7 @@ test("live-check detects fork_context role conflict that created a child", async
     }
     assert.equal(error?.code, 2);
     const output = JSON.parse(error.stdout);
-    assert.equal(output.verdict, "native_fork_context_role_conflict_bypassed_advisor");
+    assert.equal(output.verdict, "native_fork_context_spawn_bypassed_advisor");
     assert.equal(output.checks.find((item) => item.name === "no_fork_context_role_spawn_created").status, "fail");
     assert.equal(output.spawn_calls[0].fork_context_role_conflict, true);
   });

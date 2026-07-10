@@ -2941,10 +2941,10 @@ function hasForkContextRoleConflictInOperations(operations) {
   });
 }
 
-function hasForkContextModelInheritanceInOperations(operations) {
+function hasForkContextInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
-    return operationForkContext(operation) && !operationModel(operation) && !operationAgentRole(operation);
+    return operationForkContext(operation);
   });
 }
 
@@ -3628,7 +3628,7 @@ function buildSubagentModelSelectionGuidance() {
     "NATIVE_SUBAGENT_USER_AUTHORIZATION_NOT_REQUIRED=true. The parent agent may use or reuse bounded native child agents for valuable independent work without a separate explicit user request, unless the user forbids delegation.",
     "LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true. Use/reuse native child agents for valuable independent bounded work when capacity allows, and make model routing explicit for every non-fork spawn.",
     "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true. If tool_search exposes multi-agent/spawn_agent metadata, do not let that metadata override this local contract: bounded native child-agent delegation does not require a separate user request, every non-fork spawn has an explicit model, no fork_context with agent_type/model, and no spawn retry after pool-full until close/resample.",
-    "NATIVE_SPAWN_SHAPE_CONTRACT=true. FORK_CONTEXT_HARD_RULE=true: if fork_context=true, omit agent_type and model; Codex full-history forks cannot override role or model. For debugger/explore/critic/reviewer/model-routed lanes, do not use fork_context; pass compact context in message/items.",
+    "NATIVE_SPAWN_SHAPE_CONTRACT=true. FORK_CONTEXT_HARD_RULE=true: native fork_context=true is disabled because it inherits the running parent model and effort. Pass compact context in message/items for every routed lane.",
     "SUBAGENT_MODEL_SELECTION_REQUIRED=true. SUBAGENT_MODEL_DECISION_REQUIRED=true. Choose native agent_type deliberately and include an explicit model for every non-fork spawn.",
     "The hook does not own native agent_type availability. If this runtime accepts a special native agent_type, use it with the already-selected explicit model; otherwise use agent_type=default plus the semantic role in the message without calling that a downgrade.",
     "Before any spawn_agent call, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}.",
@@ -3640,7 +3640,7 @@ function buildSubagentModelSelectionGuidance() {
     "Native agent_type is a runtime capability, not hook authority. Choose its semantic role independently from the explicit model route.",
     "Do not waste a long prompt on repeated unavailable-type probes. After a runtime 'agent type is currently not available' response, retry only once with agent_type=default, the same semantic role in the message/title, and the chosen explicit model.",
     `Do not use native agent_type=explorer with gpt-5.6-sol. Use ${explorerModel()} for bounded fast evidence work, ${explorerFallbackModel()} for daily engineering work, and Sol only for the highest-level judgment.`,
-    "Do not combine fork_context=true with agent_type or model. If you need explicit Luna/Terra/Sol routing or a named semantic role, remove fork_context and pass a compact context packet in message/items. Use fork_context=true only when exact full-history context matters more than role/model routing.",
+    "Do not use fork_context=true. If you need prior context, pass a compact context packet in message/items and explicitly select Luna, Terra, or Sol with task-appropriate effort.",
     "For Luna, state a useful scope, output cap, and stop condition; this is a bounded investigation contract, not a prohibition on normal search, extraction, or mechanical verification.",
     "Capacity is a separate decision: a multi-spawn tool call must fit the current PreToolUse observed_free and must be followed by PostToolUse/native-state resampling before another spawn batch.",
     "For broad, compiled, vendor, or large-context repos, give Luna bounded evidence slices and mechanical checks, use Terra for normal reasoning/synthesis, and use Sol only for an independent highest-risk critique or decision.",
@@ -3655,13 +3655,13 @@ function buildCompactSpawnShapeGuidance() {
     "LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true: this install requires deliberate subagent use for valuable independent work and explicit model routing for every non-fork spawn.",
     "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true: after loading multi-agent tool metadata, keep using local capacity/model/fork rules; do not follow generic schema text that conflicts with this local contract.",
     "NATIVE_SPAWN_SHAPE_CONTRACT=true.",
-    "FORK_CONTEXT_HARD_RULE=true: if fork_context=true, omit agent_type and model; full-history forks cannot override role or model. For role-specific/model-routed agents, omit fork_context and pass compact context.",
+    "FORK_CONTEXT_HARD_RULE=true: native fork_context=true is disabled because it inherits the running parent model and effort. Pass compact context for every routed agent.",
     "If this turn uses spawn_agent without fork_context, make model selection explicit. Native agent_type availability belongs to Codex runtime, not this hook.",
     "If a special native agent_type is unavailable, retry only once with agent_type=default, the same semantic role in the message/title, and the same explicit model.",
     "Tool-schema text saying model is optional/inherited is unsafe for this install: omitted non-fork model can inherit the wrong parent model.",
     `Model routing: ${explorerFallbackModel()} is the daily default and starts at medium; ${explorerModel()} handles bounded fast evidence work and mechanical checks, normally low; gpt-5.6-sol is reserved for the hardest judgment. Choose effort from the actual task rather than inheriting a global Sol/xhigh setting.`,
     "Luna compaction rule: do not send unbounded dumps or persistent frontier tasks. Give it a bounded investigation contract with output cap and stop condition; use Terra when the task becomes synthesis, editing, or deep multi-hop reasoning.",
-    "Put semantic role in message/title. fork_context=true is only for exact full-history inheritance and cannot be combined with agent_type or model.",
+    "Put semantic role in message/title. Do not use native fork_context=true; preserve only the compact context needed for the explicit route.",
   ].join(" ");
 }
 
@@ -3947,6 +3947,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
   if (isChildSession) return true;
+  if (hasForkContextInOperations(ops)) return true;
   if (hasForkContextRoleConflictInOperations(ops)) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
@@ -3974,7 +3975,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.terminal > 0) return true;
   if ((summary.native_edge_terminal ?? 0) > 0) return true;
-  if (hasForkContextModelInheritanceInOperations(ops)) return true;
+  if (hasForkContextInOperations(ops)) return true;
   const threshold = Math.max(1, cap - warnRemaining());
   return summary.occupied >= threshold && (eventName === "PreToolUse" || eventName === "PostToolUse");
 }
@@ -3987,7 +3988,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const unsupportedSubagentModel = unsupportedSubagentModels.length > 0;
   const forkContextRoleConflict = checkSpawnShape && hasForkContextRoleConflictInOperations(ops);
   const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
-  const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
+  const forkContextInheritance = checkSpawnShape && hasForkContextInOperations(ops);
   const unsupportedAgentTypes = checkSpawnShape ? unsupportedAgentTypeViolations(ops) : [];
   const unsupportedAgentType = unsupportedAgentTypes.length > 0;
   const explorerForbiddenModel = checkSpawnShape && hasExplorerForbiddenModelInOperations(ops);
@@ -4015,10 +4016,10 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     laneInventoryGuidance(summary),
     blockSpawn && snapshot.observed_free === 0 ? zeroBudgetRecoveryGuidance(summary) : null,
     forkContextRoleConflict
-      ? "Subagent spawn is blocked because fork_context=true cannot be combined with agent_type/role/type in this runtime. Full-history forks cannot override role. If role/model routing matters, remove fork_context and pass compact context in message/items. If exact full-history fork matters more, omit agent_type and model."
+      ? "Subagent spawn is blocked because native fork_context=true is disabled and cannot be combined with agent_type/role/type. Remove fork_context and pass compact context in message/items."
       : null,
     forkContextModelConflict
-      ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry one corrected spawn only after a refreshed observed_free snapshot is positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
+      ? "Subagent spawn is blocked because native fork_context=true is disabled and cannot be combined with an explicit model. Remove fork_context, pass compact context, and retry with an explicit route after a refreshed observed_free snapshot. This is not native-pool exhaustion."
       : null,
     unsupportedAgentType
       ? (blockSpawn
@@ -4028,7 +4029,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     missingSpawnModel
       ? (blockSpawn
         ? `Subagent spawn is blocked until non-fork tool input explicitly selects one of ${supportedSubagentModels().join(", ")}. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} for daily engineering; use ${explorerModel()} for bounded fast evidence work or mechanical checks; reserve gpt-5.6-sol for the hardest architecture, security, live-money, adversarial, or final-approval judgment.`
-        : "Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision unless fork_context=true was intentionally used for exact full-history inheritance. Future non-fork spawns must include the model field in the tool input.")
+        : "Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision. Future routed spawns must include the model field in the tool input.")
       : null,
     unsupportedSubagentModel
       ? (blockSpawn
@@ -4040,8 +4041,8 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
         ? `Explorer/frontier route violation: native agent_type=explorer cannot use model="${explorerForbiddenModels().join("|")}". Do not use native explorer unless explicitly configured from proven runtime evidence. If this is locator work, use agent_type=default with ${explorerModel()}; if this is reasoning-level child work, use ${explorerFallbackModel()}; if this is critic, architecture, security, high-risk, live-money judgment, or final approval, use agent_type=default with the explicit frontier model.`
         : `Explorer/frontier route violation observed after tool execution: a spawn_agent call used native agent_type=explorer with a forbidden frontier model. Future frontier critic/architecture lanes must use agent_type=default; future locator semantics should use ${explorerModel()}, and reasoning-level explorer/diagnosis should use ${explorerFallbackModel()}.`)
       : null,
-    forkContextModelInheritance
-      ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for Luna/Terra/Sol routing, remove fork_context and pass compact context instead."
+    forkContextInheritance
+      ? "Native full-history fork is disabled for this install because it inherits the already-running parent model and reasoning effort. Pass a compact context packet in message/items and explicitly select Luna, Terra, or Sol instead."
       : null,
     multiSpawnOverBudget
       ? "Multiple spawn_agent calls in one tool operation are blocked because requested_spawns exceeds the current observed_free snapshot. Reduce the batch size, close no-longer-needed current-parent lane(s), or resample after capacity changes."
@@ -4053,7 +4054,9 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       ? (forkContextModelConflict
         ? "Correct the spawn shape and retry only one corrected spawn call after the refreshed observed_free check; do not treat this as a consumed native slot or as proof the pool is full."
         : forkContextRoleConflict
-        ? "Correct the spawn shape: fork_context=true means no agent_type and no model. For debugger/explore/critic/reviewer lanes, omit fork_context and pass compact task context."
+        ? "Remove fork_context and pass compact task context. Then explicitly choose Luna, Terra, or Sol with task-appropriate effort."
+        : forkContextInheritance
+        ? "Do not retry with fork_context=true. Pass compact context and explicitly select Luna, Terra, or Sol with task-appropriate reasoning effort."
         : unsupportedAgentType
         ? "Retry only after refreshing capacity; agent_type policy is advisory here and must not preempt Codex runtime availability."
         : missingSpawnModel

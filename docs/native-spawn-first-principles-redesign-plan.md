@@ -19,9 +19,8 @@ current policy and must not be replayed as a fallback.
   high-throughput evidence work and mechanical checks. Sol is reserved for the
   hardest independent judgment.
 - `agent_type` is runtime shape only. It never supplies model or effort.
-- `fork_context=true` is the sole inheritance exception. It inherits the
-  current Terra/medium global baseline and should be used only when exact full
-  history outweighs explicit routing.
+- Native `fork_context=true` is disabled because it inherits the already
+  running parent model and effort. Use compact explicit context instead.
 - Spark, 5.4, and 5.5 routes are retired for new non-fork lanes.
 
 See [First-Principles Design](first-principles.md) and the README for the

@@ -534,6 +534,7 @@ async function main() {
     return !call.has_model;
   });
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
+  const forkContextCreated = spawnCalls.filter((call) => call.fork_context && call.output?.agent_id && !call.output.failed);
   const forkContextRoleConflictCreated = spawnCalls.filter((call) => {
     return hasForkContextRoleConflict(call) && call.output?.agent_id && !call.output.failed;
   });
@@ -607,6 +608,13 @@ async function main() {
       missingModelCreated.length === 0
         ? "no missing-model spawn created a child"
         : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
+    ),
+    buildCheck(
+      "no_fork_context_spawn_created",
+      forkContextCreated.length === 0,
+      forkContextCreated.length === 0
+        ? "no fork_context=true spawn created a child"
+        : forkContextCreated.map((call) => `line ${call.line}: child=${call.output?.agent_id}`).join(", "),
     ),
     buildCheck(
       "no_fork_context_role_spawn_created",
@@ -718,6 +726,8 @@ async function main() {
     ok: checkStatus !== "failed",
     verdict: checkStatus === "failed" && explorerFrontierReports.length > 0
       ? "native_explorer_frontier_model_violation"
+      : checkStatus === "failed" && forkContextCreated.length > 0
+      ? "native_fork_context_spawn_bypassed_advisor"
       : checkStatus === "failed" && forkContextRoleConflictCreated.length > 0
       ? "native_fork_context_role_conflict_bypassed_advisor"
       : checkStatus === "failed" && unsupportedAgentTypeAttempts.length > 0
@@ -764,6 +774,7 @@ async function main() {
       model: call.model || null,
       reasoning_effort: call.reasoning_effort || null,
       fork_context: call.fork_context,
+      fork_context_violation: forkContextCreated.includes(call),
       fork_context_role_conflict: hasForkContextRoleConflict(call),
       has_model: call.has_model,
       output_line: call.output?.line ?? null,
