@@ -48,6 +48,11 @@ The installer registers the hook only for:
 
 It retires the former global-state watcher: a launchd process that fabricated `PreToolUse` every 500ms. Retired watcher files and plist are renamed with `.disabled-...`; they are not deleted.
 
+The installer removes legacy global orchestration hooks and quarantines the
+startup self-heal script that can restore them. `doctor` fails while either is
+registered, so a later startup cannot silently reintroduce a second lifecycle
+controller.
+
 `SessionStart`, prompt submission, compaction, and `SubagentStop` only remove assistant-origin legacy status records such as failed `followup_task` lanes and `live agent path ... not found`. They emit no capacity narrative. This keeps a failed dispatch from becoming fresh parent context while preserving user text and normal evidence.
 
 ## Releasing Completed Subagents
@@ -78,7 +83,10 @@ node scripts/live-check.mjs \
   --expect-model gpt-5.6-terra
 ```
 
-It fails on missing explicit route fields, inherited forks, runtime spawn failures, native DB route mismatches, and legacy `followup_task` failures. It does not message, close, or start children.
+It parses both direct native calls and the current `functions.exec` wrapper used
+by `multi_agent_v1`. It fails on missing explicit route fields, inherited forks,
+unattributed embedded calls, runtime spawn failures, native DB route mismatches,
+and legacy `followup_task` failures. It does not message, close, or start children.
 
 ## DB Policy
 
@@ -99,4 +107,4 @@ npm run check
 npm test
 ```
 
-The tests cover explicit route selection, role-independent Sol use, batch admission, exact-ID close validation, no SQLite mutation after `not found`, transcript hygiene, watcher retirement, and read-only inspection.
+The tests cover explicit route selection, role-independent Sol use, batch admission, exact-ID close validation, no SQLite mutation after `not found`, transcript hygiene, legacy-hook retirement, embedded route-mismatch detection, and read-only inspection.

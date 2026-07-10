@@ -68,13 +68,50 @@ function forkContext(args) {
 }
 
 function outputAgentId(value) {
-  const parsed = typeof value === "string" ? safeJson(value) : value;
-  if (parsed && typeof parsed === "object" && typeof parsed.agent_id === "string") return parsed.agent_id;
-  return outputText(value).match(/"agent_id"\s*:\s*"([^"]+)"/)?.[1] ?? "";
+  return outputAgentIds(value)[0] ?? "";
+}
+
+function outputAgentIds(value) {
+  const ids = [];
+  const visit = (current) => {
+    if (typeof current === "string") {
+      for (const match of current.matchAll(/"agent_id"\s*:\s*"([^"]+)"/g)) ids.push(match[1]);
+      return;
+    }
+    if (Array.isArray(current)) {
+      current.forEach(visit);
+      return;
+    }
+    if (!current || typeof current !== "object") return;
+    if (typeof current.agent_id === "string") ids.push(current.agent_id);
+    Object.entries(current).forEach(([key, nested]) => {
+      if (key !== "agent_id") visit(nested);
+    });
+  };
+  visit(typeof value === "string" ? safeJson(value) ?? value : value);
+  return ids;
 }
 
 function outputFailed(value) {
   return /(?:unable|cannot|failed) to spawn|agent.*limit|pool.*full|agent type is currently not available/i.test(outputText(value));
+}
+
+function embeddedSpawnArguments(source) {
+  const calls = [];
+  const pattern = /tools\.multi_agent_v1__spawn_agent\s*\(\s*\{/g;
+  for (const match of source.matchAll(pattern)) {
+    const remainder = source.slice(match.index, match.index + 4096);
+    const messageStart = remainder.search(/\b(?:message|items)\s*:/);
+    const header = messageStart >= 0 ? remainder.slice(0, messageStart) : remainder;
+    const property = (name) => header.match(new RegExp(`\\b${name}\\s*:\\s*["']([^"']+)["']`))?.[1] ?? "";
+    const fork = header.match(/\bfork_context\s*:\s*(true|false)/)?.[1];
+    calls.push({
+      model: property("model"),
+      reasoning_effort: property("reasoning_effort"),
+      ...(fork ? { fork_context: fork === "true" } : {}),
+    });
+  }
+  return calls;
 }
 
 function buildCheck(name, ok, detail) {
@@ -119,6 +156,7 @@ async function main() {
   if (!args.transcript) throw new Error("--transcript is required");
   const lines = (await readFile(args.transcript, "utf-8")).split(/\r?\n/);
   const calls = new Map();
+  const embeddedCalls = new Map();
   const spawns = [];
   const legacyFailures = [];
   let parent = safeString(args.parent).trim();
@@ -128,15 +166,35 @@ async function main() {
     if (!payload || typeof payload !== "object") continue;
     if (!parent && record.type === "session_meta") parent = safeString(payload.id).trim();
     if (record.type !== "response_item") continue;
-    if (payload.type === "function_call" && payload.name === "spawn_agent") {
+    if (payload.type === "function_call" && /(?:^|__)spawn_agent$/.test(safeString(payload.name))) {
       const call = { line: index + 1, callId: safeString(payload.call_id).trim(), args: argumentsObject(payload.arguments), output: null };
       spawns.push(call);
       if (call.callId) calls.set(call.callId, call);
+    }
+    if (payload.type === "custom_tool_call" && payload.name === "exec") {
+      const embedded = embeddedSpawnArguments(safeString(payload.input));
+      if (embedded.length > 0) {
+        const callId = safeString(payload.call_id).trim();
+        const nested = embedded.map((args) => ({ line: index + 1, callId, args, output: null, embedded: true, unattributed: false }));
+        spawns.push(...nested);
+        if (callId) embeddedCalls.set(callId, nested);
+      }
     }
     if (payload.type === "function_call_output") {
       if (/\blive agent path\b[^\n\r]{0,240}\bnot found\b/i.test(outputText(payload.output))) legacyFailures.push(index + 1);
       const call = calls.get(safeString(payload.call_id).trim());
       if (call) call.output = payload.output;
+    }
+    if (payload.type === "custom_tool_call_output") {
+      const nested = embeddedCalls.get(safeString(payload.call_id).trim());
+      if (nested) {
+        const ids = outputAgentIds(payload.output);
+        for (const [nestedIndex, call] of nested.entries()) {
+          if (ids[nestedIndex]) call.output = { agent_id: ids[nestedIndex] };
+          else call.unattributed = true;
+        }
+        if (ids.length !== nested.length) nested.forEach((call) => { call.unattributed = true; });
+      }
     }
   }
   const invalid = spawns.filter((call) => {
@@ -145,17 +203,21 @@ async function main() {
     return forkContext(call.args) || !MODELS.has(model) || !EFFORTS.has(effort);
   });
   const successful = spawns.filter((call) => call.output && !outputFailed(call.output) && outputAgentId(call.output));
+  const unattributed = spawns.filter((call) => call.unattributed === true);
   const db = await readEdges(args.stateDb || defaultStateDb(), parent);
   const edgeById = new Map(db.rows.map((row) => [safeString(row?.child_thread_id).trim(), row]));
   const routeMismatches = successful.filter((call) => {
     const edge = edgeById.get(outputAgentId(call.output));
     return !edge || explicit(edge.model) !== explicit(call.args.model) || explicit(edge.reasoning_effort) !== explicit(call.args.reasoning_effort ?? call.args.reasoningEffort);
   });
+  const routeProofAvailable = successful.length === 0 || db.available;
+  const routeMatches = routeProofAvailable && routeMismatches.length === 0;
   const checks = [
     buildCheck("no_legacy_followup_failure", legacyFailures.length === 0, legacyFailures.length ? `lines ${legacyFailures.join(",")}` : "none"),
     buildCheck("all_spawn_routes_explicit", invalid.length === 0, invalid.length ? `lines ${invalid.map((call) => call.line).join(",")}` : "all explicit"),
+    buildCheck("all_embedded_spawns_attributed", unattributed.length === 0, unattributed.length ? `lines ${unattributed.map((call) => call.line).join(",")}` : "all attributed"),
     buildCheck("no_runtime_spawn_failure", spawns.every((call) => !call.output || !outputFailed(call.output)), "runtime output inspected"),
-    buildCheck("native_route_matches_transcript", routeMismatches.length === 0, db.available ? (routeMismatches.length ? `children ${routeMismatches.map((call) => outputAgentId(call.output)).join(",")}` : "all matched") : "native DB unavailable"),
+    buildCheck("native_route_matches_transcript", routeMatches, !routeProofAvailable ? "native DB unavailable for successful spawn" : (routeMismatches.length ? `children ${routeMismatches.map((call) => outputAgentId(call.output)).join(",")}` : "all matched")),
   ];
   for (const model of args.expectModels.map(explicit).filter(Boolean)) {
     checks.push(buildCheck(`expected_model:${model}`, successful.some((call) => explicit(call.args.model) === model), "successful transcript spawn required"));
@@ -163,7 +225,7 @@ async function main() {
   const open = db.rows.filter((row) => explicit(row?.status) !== "closed").length;
   if (Number.isInteger(args.expectCurrentOpen)) checks.push(buildCheck("expected_current_open", db.available && open === args.expectCurrentOpen, `actual=${db.available ? open : "unavailable"}`));
   const ok = checks.every((check) => check.ok);
-  process.stdout.write(`${JSON.stringify({ ok, parent: parent || null, checks, spawns: spawns.map((call) => ({ line: call.line, model: call.args.model ?? null, reasoning_effort: call.args.reasoning_effort ?? call.args.reasoningEffort ?? null, child_id: outputAgentId(call.output) || null })), current_parent_open: db.available ? open : null }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ ok, parent: parent || null, checks, spawns: spawns.map((call) => ({ line: call.line, embedded: call.embedded === true, model: call.args.model ?? null, reasoning_effort: call.args.reasoning_effort ?? call.args.reasoningEffort ?? null, child_id: outputAgentId(call.output) || null })), current_parent_open: db.available ? open : null }, null, 2)}\n`);
   if (!ok) process.exitCode = 1;
 }
 

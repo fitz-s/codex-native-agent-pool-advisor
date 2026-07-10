@@ -13,6 +13,10 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceHook = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
 const ACTIVE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostCompact", "SubagentStop"];
 const RETIRED_EVENTS = ["PostToolUse", "PreCompact"];
+const LEGACY_HOOK_COMMANDS = [
+  /(?:^|[\\/])oh-my-codex[\\/]dist[\\/]scripts[\\/]codex-native-hook\.js(?:["'\s]|$)/i,
+  /(?:^|[\\/])quiet-omx-status-self-heal\.mjs(?:["'\s]|$)/i,
+];
 
 function codexHome() {
   const explicit = typeof process.env.CODEX_HOME === "string" ? process.env.CODEX_HOME.trim() : "";
@@ -48,6 +52,22 @@ function countHookCommand(config, eventName) {
   return entries.flatMap((entry) => Array.isArray(entry?.hooks) ? entry.hooks : []).filter(isAdvisorHookCommand).length;
 }
 
+function legacyOrchestrationHooks(config) {
+  const found = [];
+  for (const [eventName, entries] of Object.entries(config?.hooks ?? {})) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      for (const hook of Array.isArray(entry?.hooks) ? entry.hooks : []) {
+        if (hook?.type !== "command" || typeof hook.command !== "string") continue;
+        if (LEGACY_HOOK_COMMANDS.some((pattern) => pattern.test(hook.command))) {
+          found.push({ event: eventName, command: hook.command });
+        }
+      }
+    }
+  }
+  return found;
+}
+
 async function nativeEdgeCount(dbPath) {
   try {
     const { stdout } = await execFileAsync("sqlite3", ["-readonly", dbPath, "select count(*) from thread_spawn_edges;"], { timeout: 2000, maxBuffer: 1024 * 1024 });
@@ -71,6 +91,7 @@ async function main() {
   }
   const registrations = Object.fromEntries(ACTIVE_EVENTS.map((eventName) => [eventName, countHookCommand(config, eventName)]));
   const retiredRegistrations = Object.fromEntries(RETIRED_EVENTS.map((eventName) => [eventName, countHookCommand(config, eventName)]));
+  const legacyHooks = legacyOrchestrationHooks(config);
   const checks = {
     codex_home: home,
     hooks_json_exists: await pathExists(hooksPath),
@@ -78,6 +99,7 @@ async function main() {
     installed_hook_matches_repo: (await sha256(installedHook)) === (await sha256(sourceHook)),
     registrations,
     retired_registrations: retiredRegistrations,
+    legacy_orchestration_hooks: legacyHooks,
     state_db_path: dbPath,
     state_db_exists: await pathExists(dbPath),
     state_db_bytes: await pathExists(dbPath) ? (await stat(dbPath)).size : null,
@@ -89,7 +111,8 @@ async function main() {
     && checks.installed_hook_exists
     && checks.installed_hook_matches_repo
     && ACTIVE_EVENTS.every((eventName) => registrations[eventName] === 1)
-    && RETIRED_EVENTS.every((eventName) => retiredRegistrations[eventName] === 0);
+    && RETIRED_EVENTS.every((eventName) => retiredRegistrations[eventName] === 0)
+    && legacyHooks.length === 0;
   process.stdout.write(`${JSON.stringify({
     ok,
     checks,

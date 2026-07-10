@@ -203,18 +203,27 @@ test("transcript hygiene removes failed legacy agent operations but preserves us
   });
 });
 
-test("install retires watcher and registers only read-only control points", async () => {
+test("install retires watcher and conflicting orchestration hooks", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await mkdir(join(home, "hooks"), { recursive: true });
     await writeFile(join(home, "hooks", "native-agent-pool-global-state-watch.mjs"), "legacy");
+    await writeFile(join(home, "hooks", "quiet-omx-status-self-heal.mjs"), "legacy");
+    await writeFile(join(home, "hooks.json"), JSON.stringify({
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: "node /tmp/quiet-omx-status-self-heal.mjs" }] }],
+        PreToolUse: [{ hooks: [{ type: "command", command: "node /tmp/oh-my-codex/dist/scripts/codex-native-hook.js" }] }],
+        PostToolUse: [{ hooks: [{ type: "command", command: "node /tmp/oh-my-codex/dist/scripts/codex-native-hook.js" }] }],
+      },
+    }));
     await runScript(installPath, home);
     const doctor = JSON.parse((await runScript(doctorPath, home)).stdout);
     assert.equal(doctor.ok, true);
     assert.deepEqual(doctor.checks.registrations, { SessionStart: 1, UserPromptSubmit: 1, PreToolUse: 1, PostCompact: 1, SubagentStop: 1 });
     assert.deepEqual(doctor.checks.retired_registrations, { PostToolUse: 0, PreCompact: 0 });
+    assert.deepEqual(doctor.checks.legacy_orchestration_hooks, []);
     const hooks = await readFile(join(home, "hooks.json"), "utf-8");
-    assert.doesNotMatch(hooks, /PostToolUse|PreCompact/);
+    assert.doesNotMatch(hooks, /PostToolUse|PreCompact|oh-my-codex|quiet-omx-status-self-heal/);
   });
 });
 
@@ -240,5 +249,57 @@ test("live check proves explicit route and native row agreement without role res
     ].join("\n"));
     const result = JSON.parse((await runScript(liveCheckPath, home, ["--transcript", transcript, "--expect-model", "gpt-5.6-sol", "--expect-current-open", "1"])).stdout);
     assert.equal(result.ok, true);
+  });
+});
+
+test("live check fails when an embedded native spawn is routed differently at runtime", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open'); insert into threads values ('child1','gpt-5.6-terra','xhigh',0);");
+    const transcript = join(home, "embedded-mismatch.jsonl");
+    await writeFile(transcript, [
+      JSON.stringify({ type: "session_meta", payload: { id: "parent1" } }),
+      JSON.stringify({ type: "response_item", payload: {
+        type: "custom_tool_call",
+        name: "exec",
+        call_id: "exec1",
+        input: 'const child = await tools.multi_agent_v1__spawn_agent({ agent_type: "explore", model: "gpt-5.6-luna", reasoning_effort: "low", fork_context: false, message: "bounded evidence" });',
+      } }),
+      JSON.stringify({ type: "response_item", payload: {
+        type: "custom_tool_call_output",
+        call_id: "exec1",
+        output: [{ type: "input_text", text: '{"agent_id":"child1"}' }],
+      } }),
+    ].join("\n"));
+    await assert.rejects(
+      runScript(liveCheckPath, home, ["--transcript", transcript]),
+      (error) => {
+        const result = JSON.parse(error.stdout);
+        assert.equal(result.ok, false);
+        assert.equal(result.spawns[0].embedded, true);
+        assert.equal(result.checks.find((check) => check.name === "native_route_matches_transcript").ok, false);
+        return true;
+      },
+    );
+  });
+});
+
+test("live check fails closed when successful child routes cannot be read", async () => {
+  await withHome(async (home) => {
+    const transcript = join(home, "unreadable-route.jsonl");
+    await writeFile(transcript, [
+      JSON.stringify({ type: "session_meta", payload: { id: "parent1" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "spawn_agent", call_id: "spawn1", arguments: '{"model":"gpt-5.6-luna","reasoning_effort":"low"}' } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "spawn1", output: '{"agent_id":"child1"}' } }),
+    ].join("\n"));
+    await assert.rejects(
+      runScript(liveCheckPath, home, ["--transcript", transcript]),
+      (error) => {
+        const result = JSON.parse(error.stdout);
+        assert.equal(result.checks.find((check) => check.name === "native_route_matches_transcript").ok, false);
+        assert.match(result.checks.find((check) => check.name === "native_route_matches_transcript").detail, /native DB unavailable/);
+        return true;
+      },
+    );
   });
 });
