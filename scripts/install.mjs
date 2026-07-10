@@ -178,15 +178,16 @@ function ensureHook(config, eventName, command) {
       continue;
     }
     const hooks = Array.isArray(entry.hooks) ? entry.hooks : [];
-    const hasCorrectRegistration = entryMatcher(entry) === requiredMatcher
-      && hooks.some((hook) => commandMatches(hook, command));
-    if (hasCorrectRegistration) {
-      present = true;
-      nextEntries.push(entry);
-      continue;
-    }
     const nextHooks = hooks.filter((hook) => !isAdvisorHookCommand(hook));
     if (nextHooks.length !== hooks.length) changed = true;
+    if (!present && entryMatcher(entry) === requiredMatcher) {
+      present = true;
+      const canonicalHooks = [...nextHooks, { type: "command", command }];
+      const hasOnlyCanonicalAdvisor = hooks.length === 1 && commandMatches(hooks[0], command);
+      if (!hasOnlyCanonicalAdvisor) changed = true;
+      nextEntries.push({ ...entry, hooks: canonicalHooks });
+      continue;
+    }
     if (nextHooks.length > 0) nextEntries.push({ ...entry, hooks: nextHooks });
   }
   if (present) {

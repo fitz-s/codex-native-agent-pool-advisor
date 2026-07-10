@@ -3700,6 +3700,33 @@ test("installer is idempotent for existing hooks.json", async () => {
   });
 });
 
+test("installer collapses legacy and canonical advisor registrations", async () => {
+  await withHome(async (home) => {
+    const legacyCommand = `node "${join(home, "hooks", "native-agent-pool-advisor.mjs")}"`;
+    const canonicalCommand = `"${process.execPath}" "${join(home, "hooks", "native-agent-pool-advisor.mjs")}"`;
+    await writeFile(
+      join(home, "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { hooks: [{ type: "command", command: legacyCommand }] },
+            { hooks: [{ type: "command", command: canonicalCommand }] },
+          ],
+        },
+      }),
+    );
+
+    await runScript(installPath, home);
+
+    const config = JSON.parse(await readFile(join(home, "hooks.json"), "utf-8"));
+    const advisorCommands = config.hooks.PreToolUse
+      .flatMap((entry) => entry.hooks ?? [])
+      .filter((hook) => hook.command.includes("native-agent-pool-advisor.mjs"))
+      .map((hook) => hook.command);
+    assert.deepEqual(advisorCommands, [canonicalCommand]);
+  });
+});
+
 test("installer restores SessionStart advisor when a startup self-heal removed it", async () => {
   await withHome(async (home) => {
     await mkdir(join(home, "hooks"), { recursive: true });
