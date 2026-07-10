@@ -12,7 +12,7 @@
    ```
 5. Install into live `~/.codex` only after tests pass.
 6. Verify `scripts/doctor.mjs` on live state.
-7. For native-spawn claims, run `scripts/live-check.mjs --transcript <real_parent_transcript>` with expectation flags for the claim being made: `--expect-model`, `--forbid-explorer-model`, `--expect-current-open`, and `--expect-all-closed`.
-8. Inspect the `current_parent_lanes` block in live-check output when the claim involves lane reuse, completed-not-closed lanes, or close accounting.
+7. For native-spawn claims, run `scripts/live-check.mjs --transcript <real_parent_transcript>` with the relevant `--expect-model` and `--expect-current-open` assertions.
+8. Confirm the result reports explicit model and reasoning-effort routing, matching native child rows, and no failed legacy continuation lane.
 9. If `docs/index.html` changed, confirm the GitHub Pages workflow succeeds.
 10. Commit, tag, push, and create a GitHub release with the verification commands.

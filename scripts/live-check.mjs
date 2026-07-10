@@ -1,105 +1,84 @@
 #!/usr/bin/env node
 
-import { access, readFile, stat } from "node:fs/promises";
-import { constants } from "node:fs";
 import { execFile } from "node:child_process";
-import { join, resolve } from "node:path";
+import { constants } from "node:fs";
+import { access, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const GUIDANCE_MARKERS = [
-  "SUBAGENT_MODEL_SELECTION_REQUIRED",
-  "NATIVE_SPAWN_SHAPE_CONTRACT",
-  "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_CORRECTION_REQUIRED",
-  "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY",
-  "SPAWN_AGENT_OBSERVED_FREE",
-  "SPAWN_AGENT_LOCAL_COUNTER_START",
-  "SPAWN_AGENT_DISABLED_THIS_TURN",
-  "Native agent pool guard",
-  "Native agent pool advisory",
-];
-const FAILURE_PATTERNS = [
-  /unable to spawn/i,
-  /cannot spawn/i,
-  /failed to spawn/i,
-  /agent type is currently not available/i,
-  /Full-history forked agents inherit/i,
-  /agent.*limit/i,
-  /pool.*full/i,
-  /子代理.*满/,
-  /智能体.*满/,
-  /槽位.*满/,
-  /上限/,
-];
-const CLOSE_FAILURE_PATTERNS = [
-  /unknown agent/i,
-  /agent (?:with id [A-Za-z0-9_.:-]+ )?not found/i,
-  /no such agent/i,
-  /invalid agent(?: id)?/i,
-  /failed to close/i,
-  /unable to close/i,
-  /cannot close/i,
-  /could not close/i,
-  /endpoint not found/i,
-  /无法关闭/,
-];
-const CLOSE_RELEASE_NOT_FOUND_PATTERNS = [
-  /unknown agent/i,
-  /agent (?:with id [A-Za-z0-9_.:-]+ )?not found/i,
-  /no such agent/i,
-  /invalid agent(?: id)?/i,
-];
-const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.6-sol"];
-const DEFAULT_ALLOWED_AGENT_TYPES = [];
+const MODELS = new Set(["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]);
+const EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
 
 function usage() {
   return [
     "Usage: node scripts/live-check.mjs --transcript <path> [options]",
+    "  --state-db <path>             Codex SQLite DB; defaults to $CODEX_HOME/state_5.sqlite.",
+    "  --parent <thread_id>          Parent id; defaults to transcript session_meta id.",
+    "  --expect-model <model>        Require a successful native child on this route. Repeatable.",
+    "  --expect-current-open <n>     Require exact current-parent non-closed edge count.",
     "",
-    "Options:",
-    "  --state-db <path>             Native Codex SQLite DB path.",
-    "  --parent <thread_id>          Parent thread id; defaults to transcript session_meta id.",
-    "  --since-line <n>              Scan transcript records starting at this 1-based line.",
-    "  --expect-model <model>        Require a successful spawn whose tool input and native DB edge both use this model. Repeatable.",
-    "  --forbid-explorer-model <m>   Fail non-fork explorer spawns using this model. Repeatable; defaults include gpt-5.6-sol.",
-    "  --allow-agent-type <type>      Enable optional native agent_type audit allowlist. Repeatable; defaults: no agent_type restriction.",
-    "  --expect-current-open <n>     Require this parent/session to have exactly n open native edges after the scanned window.",
-    "  --expect-all-closed           Require every successful spawn in the scanned window to have closed DB edge plus close success or verified not-found release evidence.",
-    "  --require-guidance            Fail if no advisor guidance marker appears before the first scanned spawn.",
-    "  --allow-missing-guidance      Do not fail when the runtime transcript lacks prompt-time advisor markers.",
-    "",
-    "Read-only check for real Codex native spawn behavior. It does not create, close, or message subagents.",
+    "Read-only audit. It never creates, closes, repairs, or archives a child.",
   ].join("\n");
 }
 
 function parseArgs(argv) {
-  const args = {};
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    if (arg === "--help" || arg === "-h") args.help = true;
-    else if (arg === "--transcript") args.transcript = argv[++i];
-    else if (arg === "--state-db") args.stateDb = argv[++i];
-    else if (arg === "--parent") args.parent = argv[++i];
-    else if (arg === "--since-line") args.sinceLine = Number(argv[++i]);
-    else if (arg === "--expect-model") {
-      args.expectModels ??= [];
-      args.expectModels.push(argv[++i]);
-    }
-    else if (arg === "--forbid-explorer-model") {
-      args.forbidExplorerModels ??= [];
-      args.forbidExplorerModels.push(argv[++i]);
-    }
-    else if (arg === "--allow-agent-type") {
-      args.allowAgentTypes ??= [];
-      args.allowAgentTypes.push(argv[++i]);
-    }
-    else if (arg === "--expect-current-open") args.expectCurrentOpen = Number(argv[++i]);
-    else if (arg === "--expect-all-closed") args.expectAllClosed = true;
-    else if (arg === "--require-guidance") args.requireGuidance = true;
-    else if (arg === "--allow-missing-guidance") args.allowMissingGuidance = true;
-    else throw new Error(`Unknown argument: ${arg}`);
+  const args = { expectModels: [] };
+  for (let index = 0; index < argv.length; index += 1) {
+    const value = argv[index];
+    if (value === "--help" || value === "-h") args.help = true;
+    else if (value === "--transcript") args.transcript = argv[++index];
+    else if (value === "--state-db") args.stateDb = argv[++index];
+    else if (value === "--parent") args.parent = argv[++index];
+    else if (value === "--expect-model") args.expectModels.push(argv[++index]);
+    else if (value === "--expect-current-open") args.expectCurrentOpen = Number(argv[++index]);
+    else throw new Error(`Unknown argument: ${value}`);
   }
   return args;
+}
+
+function safeString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function safeJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function argumentsObject(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  return typeof value === "string" ? safeJson(value) ?? {} : {};
+}
+
+function explicit(value) {
+  return safeString(value).trim().toLowerCase();
+}
+
+function outputText(value) {
+  return typeof value === "string" ? value : JSON.stringify(value ?? "");
+}
+
+function forkContext(args) {
+  const value = args.fork_context ?? args.forkContext;
+  return value === true || explicit(value) === "true";
+}
+
+function outputAgentId(value) {
+  const parsed = typeof value === "string" ? safeJson(value) : value;
+  if (parsed && typeof parsed === "object" && typeof parsed.agent_id === "string") return parsed.agent_id;
+  return outputText(value).match(/"agent_id"\s*:\s*"([^"]+)"/)?.[1] ?? "";
+}
+
+function outputFailed(value) {
+  return /(?:unable|cannot|failed) to spawn|agent.*limit|pool.*full|agent type is currently not available/i.test(outputText(value));
+}
+
+function buildCheck(name, ok, detail) {
+  return { name, ok, detail };
 }
 
 async function exists(path) {
@@ -111,405 +90,24 @@ async function exists(path) {
   }
 }
 
-function codexHome() {
-  const explicit = typeof process.env.CODEX_HOME === "string" ? process.env.CODEX_HOME.trim() : "";
-  if (explicit) return explicit;
-  const home = typeof process.env.HOME === "string" ? process.env.HOME.trim() : "";
-  return home ? join(home, ".codex") : "";
-}
-
-async function readJsonFile(path) {
-  try {
-    return safeJson(await readFile(path, "utf-8")) ?? {};
-  } catch {
-    return {};
-  }
-}
-
-async function defaultStateDb() {
-  const explicit = typeof process.env.NATIVE_AGENT_POOL_STATE_DB_PATH === "string"
-    ? process.env.NATIVE_AGENT_POOL_STATE_DB_PATH.trim()
-    : "";
-  if (explicit) return explicit;
-  const home = codexHome();
-  if (!home) return "";
-  const config = await readJsonFile(join(home, "native-agent-pool-advisor.config.json"));
-  const paths = config && typeof config.paths === "object" && !Array.isArray(config.paths)
-    ? config.paths
-    : {};
-  const configPath = typeof paths.state_db_path === "string" ? paths.state_db_path.trim() : "";
-  if (configPath) return configPath;
-  const envName = typeof process.env.NATIVE_AGENT_POOL_STATE_DB_NAME === "string"
-    ? process.env.NATIVE_AGENT_POOL_STATE_DB_NAME.trim()
-    : "";
-  const configName = typeof paths.state_db_name === "string" ? paths.state_db_name.trim() : "";
-  return join(home, envName || configName || "state_5.sqlite");
-}
-
-function safeJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function parseCallArguments(value) {
-  if (value && typeof value === "object" && !Array.isArray(value)) return value;
-  if (typeof value === "string") return safeJson(value) ?? {};
-  return {};
-}
-
-function preview(value, length = 140) {
-  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
-  return text.length > length ? `${text.slice(0, length - 3)}...` : text;
-}
-
-function stableText(value) {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value ?? "");
-  } catch {
-    return "";
-  }
-}
-
-function toolSearchOutputLooksLikeUnsafeNativeAgentSchema(payload) {
-  const text = stableText(payload);
-  return /tool_search_output|multi_agent_v1|Tools for spawning and managing sub-agents/i.test(text)
-    && /spawn_agent/i.test(text)
-    && /(?:inherited parent model is preferred|Spawned agents inherit your current model by default|Omit `?model`?|model overrides \(optional\)|model is optional|inherited default model)/i.test(text);
-}
-
-function explicitString(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function normalizeRole(value) {
-  return explicitString(value).toLowerCase();
-}
-
-function forbiddenExplorerModels(extraModels = []) {
-  const raw = typeof process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS === "string"
-    ? process.env.NATIVE_AGENT_POOL_EXPLORER_FORBIDDEN_MODELS
-    : "";
-  const models = raw.split(",").map((item) => item.trim()).filter(Boolean);
-  return new Set([
-    ...(models.length > 0 ? models : DEFAULT_EXPLORER_FORBIDDEN_MODELS),
-    ...extraModels,
-  ].map((model) => model.toLowerCase()).filter(Boolean));
-}
-
-function allowedAgentTypes(extraTypes = []) {
-  const raw = typeof process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES === "string"
-    ? process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES
-    : "";
-  const roles = raw.split(",").map((item) => normalizeRole(item)).filter(Boolean);
-  return new Set([
-    ...(roles.length > 0 ? roles : DEFAULT_ALLOWED_AGENT_TYPES),
-    ...extraTypes,
-  ].map((role) => normalizeRole(role)).filter(Boolean));
-}
-
-function agentTypeAuditEnabled(args) {
-  const raw = typeof process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES === "string"
-    ? process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES.trim()
-    : "";
-  return raw.length > 0 || (Array.isArray(args.allowAgentTypes) && args.allowAgentTypes.length > 0);
-}
-
-function isExplorerRole(value) {
-  const role = normalizeRole(value);
-  return role === "explorer" || role === "explore";
-}
-
-function hasExplicitString(value) {
-  return explicitString(value).length > 0;
-}
-
-function hasBooleanForkContext(args) {
-  return (args?.fork_context ?? args?.forkContext) === true;
-}
-
-function hasForkContextRoleConflict(call) {
-  if (!call?.fork_context) return false;
-  const role = normalizeRole(call.agent_type);
-  return Boolean(role && role !== "default");
-}
-
-function parseOutputAgentId(value) {
-  const parsed = typeof value === "string" ? safeJson(value) : value;
-  if (parsed && typeof parsed === "object" && typeof parsed.agent_id === "string") return parsed.agent_id;
-  if (typeof value === "string") {
-    const match = value.match(/019[a-z0-9-]{20,}/i) ?? value.match(/"agent_id"\s*:\s*"([^"]+)"/);
-    return match?.[1] ?? match?.[0] ?? "";
-  }
-  return "";
-}
-
-function collectAgentIds(value, ids = []) {
-  if (!value) return ids;
-  if (typeof value === "string") {
-    const parsed = safeJson(value);
-    if (parsed) return collectAgentIds(parsed, ids);
-    for (const match of value.matchAll(/"agent_id"\s*:\s*"([^"]+)"/g)) ids.push(match[1]);
-    for (const match of value.matchAll(/\b019[a-z0-9-]{20,}\b/gi)) ids.push(match[0]);
-    return [...new Set(ids)];
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectAgentIds(item, ids);
-    return [...new Set(ids)];
-  }
-  if (typeof value === "object") {
-    if (typeof value.agent_id === "string") ids.push(value.agent_id);
-    if (typeof value.agentId === "string") ids.push(value.agentId);
-    for (const child of Object.values(value)) collectAgentIds(child, ids);
-  }
-  return [...new Set(ids)];
-}
-
-function outputLooksFailed(value) {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  return FAILURE_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function closeOutputLooksFailed(value) {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  return outputLooksFailed(value) || CLOSE_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function closeOutputReleasesLane(value) {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  return !closeOutputLooksFailed(value) || CLOSE_RELEASE_NOT_FOUND_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function toolOutputLooksFailed(toolName, value) {
-  return toolName === "close_agent" ? closeOutputLooksFailed(value) : outputLooksFailed(value);
-}
-
-function sqlQuote(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-function extractPayload(record) {
-  return record && typeof record === "object" && record.payload && typeof record.payload === "object"
-    ? record.payload
-    : {};
-}
-
-function canCarryRuntimeGuidance(record) {
-  if (!record || typeof record !== "object") return false;
-  if (record.type === "turn_context") return true;
-  const payload = extractPayload(record);
-  return record.type === "event_msg" && typeof payload.type === "string" && payload.type.startsWith("hook_");
-}
-
-function normalizeAgentToolName(name) {
-  const text = typeof name === "string" ? name.trim().replace(/^functions\./, "") : "";
-  const last = text.split(".").pop() || text;
-  return ["spawn_agent", "close_agent", "send_input", "wait_agent"].includes(last) ? last : "";
-}
-
-function nestedToolInput(value) {
-  if (!value || typeof value !== "object") return {};
-  return value.parameters && typeof value.parameters === "object"
-    ? value.parameters
-    : value.arguments && typeof value.arguments === "object"
-    ? value.arguments
-    : {};
-}
-
-function collectNestedAgentOperations(value, operations = []) {
-  if (Array.isArray(value)) {
-    for (const item of value) collectNestedAgentOperations(item, operations);
-    return operations;
-  }
-  if (!value || typeof value !== "object") return operations;
-
-  const name = normalizeAgentToolName(value.recipient_name ?? value.recipientName ?? value.tool_name ?? value.toolName ?? value.name);
-  if (name) operations.push({ name, args: nestedToolInput(value) });
-
-  for (const key of ["tool_uses", "toolUses", "tools", "calls", "tool_calls", "toolCalls"]) {
-    if (value[key]) collectNestedAgentOperations(value[key], operations);
-  }
-  return operations;
-}
-
-function readTranscript(text, sinceLine) {
-  const markers = [];
-  const calls = [];
-  const badNativeToolSearchSchemas = [];
-  const spawnBatches = [];
-  const outputsByCallId = new Map();
-  const nestedCallIdsByWrapper = new Map();
-  const lines = text.split(/\r?\n/);
-  let sessionId = "";
-  let pendingSpawnBatch = [];
-
-  const flushSpawnBatch = () => {
-    if (pendingSpawnBatch.length > 1) {
-      spawnBatches.push([...pendingSpawnBatch]);
-    }
-    pendingSpawnBatch = [];
-  };
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const lineNumber = index + 1;
-    const raw = lines[index];
-    if (!raw.trim()) continue;
-
-    const record = safeJson(raw);
-    if (!record) continue;
-    const payload = extractPayload(record);
-    if (record.type === "session_meta" && typeof payload.id === "string") sessionId = payload.id;
-    if (Number.isFinite(sinceLine) && lineNumber < sinceLine) continue;
-
-    if (canCarryRuntimeGuidance(record)) {
-      for (const marker of GUIDANCE_MARKERS) {
-        if (raw.includes(marker)) markers.push({ line: lineNumber, marker });
-      }
-    }
-
-    if (record.type === "response_item" && payload.type === "tool_search_output") {
-      if (toolSearchOutputLooksLikeUnsafeNativeAgentSchema(payload)) {
-        badNativeToolSearchSchemas.push({ line: lineNumber });
-      }
-      flushSpawnBatch();
-    } else if (record.type === "response_item" && payload.type === "function_call") {
-      const name = normalizeAgentToolName(payload.name);
-      if (name) {
-        const args = parseCallArguments(payload.arguments);
-        calls.push({
-          line: lineNumber,
-          call_id: typeof payload.call_id === "string" ? payload.call_id : "",
-          wrapper_call_id: "",
-          source: "direct",
-          name,
-          agent_type: args.agent_type ?? "",
-          model: explicitString(args.model),
-          reasoning_effort: args.reasoning_effort ?? "",
-          fork_context: hasBooleanForkContext(args),
-          target: args.target ?? "",
-          message_preview: preview(args.message),
-          has_model: hasExplicitString(args.model),
-        });
-        if (name === "spawn_agent") {
-          pendingSpawnBatch.push(lineNumber);
-        } else {
-          flushSpawnBatch();
-        }
-      } else {
-        const wrapperCallId = typeof payload.call_id === "string" ? payload.call_id : "";
-        const nested = collectNestedAgentOperations(parseCallArguments(payload.arguments));
-        const nestedIds = [];
-        nested.forEach((operation, nestedIndex) => {
-          const callId = wrapperCallId ? `${wrapperCallId}:nested:${nestedIndex}` : `line:${lineNumber}:nested:${nestedIndex}`;
-          nestedIds.push(callId);
-          const args = operation.args ?? {};
-          calls.push({
-            line: lineNumber,
-            call_id: callId,
-            wrapper_call_id: wrapperCallId,
-            source: "nested",
-            name: operation.name,
-            agent_type: args.agent_type ?? "",
-            model: explicitString(args.model),
-            reasoning_effort: args.reasoning_effort ?? "",
-            fork_context: hasBooleanForkContext(args),
-            target: args.target ?? "",
-            message_preview: preview(args.message),
-            has_model: hasExplicitString(args.model),
-          });
-          if (operation.name === "spawn_agent") pendingSpawnBatch.push(lineNumber);
-          else flushSpawnBatch();
-        });
-        if (wrapperCallId && nestedIds.length > 0) nestedCallIdsByWrapper.set(wrapperCallId, nestedIds);
-      }
-    } else if (record.type === "response_item" && payload.type === "function_call_output") {
-      flushSpawnBatch();
-      const callId = typeof payload.call_id === "string" ? payload.call_id : "";
-      if (callId) {
-        const nestedCallIds = nestedCallIdsByWrapper.get(callId) ?? [];
-        const nestedAgentIds = collectAgentIds(payload.output);
-        nestedCallIds.forEach((nestedCallId, nestedIndex) => {
-          outputsByCallId.set(nestedCallId, {
-            line: lineNumber,
-            output: payload.output,
-            agent_id: nestedAgentIds.length === nestedCallIds.length ? nestedAgentIds[nestedIndex] : "",
-            failed: outputLooksFailed(payload.output),
-          });
-        });
-        outputsByCallId.set(callId, {
-          line: lineNumber,
-          output: payload.output,
-          agent_id: parseOutputAgentId(payload.output),
-          failed: outputLooksFailed(payload.output),
-        });
-      }
-    }
-  }
-  flushSpawnBatch();
-
-  return {
-    sessionId,
-    markers,
-    badNativeToolSearchSchemas,
-    spawnBatches,
-    calls: calls.map((call) => {
-      const output = outputsByCallId.get(call.call_id) ?? null;
-      return {
-        ...call,
-        output: output
-          ? { ...output, failed: toolOutputLooksFailed(call.name, output.output) }
-          : null,
-      };
-    }),
-  };
+function defaultStateDb() {
+  const home = safeString(process.env.CODEX_HOME).trim() || (safeString(process.env.HOME).trim() ? join(process.env.HOME, ".codex") : "");
+  return home ? join(home, "state_5.sqlite") : "";
 }
 
 async function readEdges(dbPath, parent) {
   if (!dbPath || !parent || !(await exists(dbPath))) return { available: false, rows: [] };
-  const query = [
-    "select e.parent_thread_id, e.child_thread_id, e.status, t.agent_role, t.model, t.reasoning_effort, t.agent_nickname, t.title, t.updated_at",
-    "from thread_spawn_edges e",
-    "left join threads t on t.id = e.child_thread_id",
-    `where e.parent_thread_id = ${sqlQuote(parent)}`,
-    "order by coalesce(t.updated_at, 0) desc, e.child_thread_id;",
-  ].join("\n");
+  const sql = [
+    "select e.child_thread_id,e.status,t.model,t.reasoning_effort",
+    "from thread_spawn_edges e left join threads t on t.id=e.child_thread_id",
+    `where e.parent_thread_id='${parent.replace(/'/g, "''")}'`,
+  ].join(" ");
   try {
-    const dbStat = await stat(dbPath);
-    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, query], {
-      timeout: 3000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-    return { available: true, path: dbPath, bytes: dbStat.size, rows: safeJson(stdout.trim() || "[]") ?? [] };
-  } catch (error) {
-    return {
-      available: false,
-      path: dbPath,
-      error: error instanceof Error ? error.message : String(error),
-      rows: [],
-    };
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], { timeout: 2000, maxBuffer: 1024 * 1024 });
+    return { available: true, rows: JSON.parse(stdout.trim() || "[]") };
+  } catch {
+    return { available: false, rows: [] };
   }
-}
-
-function buildCheck(name, passed, evidence, severity = "fail") {
-  return { name, status: passed ? "pass" : severity, evidence };
-}
-
-function summarizeChecks(checks) {
-  if (checks.some((check) => check.status === "fail")) return "failed";
-  if (checks.some((check) => check.status === "warn")) return "passed_with_warnings";
-  return "passed";
-}
-
-function summarizeLaneCounts(rows) {
-  const counts = {};
-  for (const row of rows) {
-    const status = explicitString(row?.status) || "unknown";
-    counts[status] = (counts[status] ?? 0) + 1;
-  }
-  return counts;
 }
 
 async function main() {
@@ -519,299 +117,54 @@ async function main() {
     return;
   }
   if (!args.transcript) throw new Error("--transcript is required");
-
-  const transcriptPath = resolve(args.transcript);
-  const transcript = readTranscript(await readFile(transcriptPath, "utf-8"), args.sinceLine);
-  const parent = args.parent || transcript.sessionId;
-  const dbPath = args.stateDb || await defaultStateDb();
-  const edges = await readEdges(dbPath ? resolve(dbPath) : "", parent);
-  const spawnCalls = transcript.calls.filter((call) => call.name === "spawn_agent");
-  const spawnBatches = transcript.spawnBatches ?? [];
-  const failedSpawnCalls = spawnCalls.filter((call) => call.output?.failed);
-  const spawnCallsMissingOutput = spawnCalls.filter((call) => !call.output);
-  const missingModelSpawns = spawnCalls.filter((call) => {
-    if (call.fork_context) return false;
-    return !call.has_model;
+  const lines = (await readFile(args.transcript, "utf-8")).split(/\r?\n/);
+  const calls = new Map();
+  const spawns = [];
+  const legacyFailures = [];
+  let parent = safeString(args.parent).trim();
+  for (const [index, line] of lines.entries()) {
+    const record = safeJson(line);
+    const payload = record?.payload;
+    if (!payload || typeof payload !== "object") continue;
+    if (!parent && record.type === "session_meta") parent = safeString(payload.id).trim();
+    if (record.type !== "response_item") continue;
+    if (payload.type === "function_call" && payload.name === "spawn_agent") {
+      const call = { line: index + 1, callId: safeString(payload.call_id).trim(), args: argumentsObject(payload.arguments), output: null };
+      spawns.push(call);
+      if (call.callId) calls.set(call.callId, call);
+    }
+    if (payload.type === "function_call_output") {
+      if (/\blive agent path\b[^\n\r]{0,240}\bnot found\b/i.test(outputText(payload.output))) legacyFailures.push(index + 1);
+      const call = calls.get(safeString(payload.call_id).trim());
+      if (call) call.output = payload.output;
+    }
+  }
+  const invalid = spawns.filter((call) => {
+    const model = explicit(call.args.model);
+    const effort = explicit(call.args.reasoning_effort ?? call.args.reasoningEffort);
+    return forkContext(call.args) || !MODELS.has(model) || !EFFORTS.has(effort);
   });
-  const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
-  const forkContextCreated = spawnCalls.filter((call) => call.fork_context && call.output?.agent_id && !call.output.failed);
-  const forkContextRoleConflictCreated = spawnCalls.filter((call) => {
-    return hasForkContextRoleConflict(call) && call.output?.agent_id && !call.output.failed;
-  });
-  const explorerForbidden = forbiddenExplorerModels(args.forbidExplorerModels ?? []);
-  const auditAgentTypes = agentTypeAuditEnabled(args);
-  const allowedAgentTypeSet = allowedAgentTypes(args.allowAgentTypes ?? []);
-  const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
-  const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
-  const edgeByChild = new Map(edges.rows.map((row) => [row.child_thread_id, row]));
-  const successfulSpawns = spawnCalls.filter((call) => call.output?.agent_id && !call.output.failed);
-  const closeReleaseTargetSet = new Set(
-    transcript.calls
-      .filter((call) => call.name === "close_agent" && call.target && call.output && closeOutputReleasesLane(call.output.output))
-      .map((call) => call.target),
-  );
-  const openRows = edges.rows.filter((row) => row.status === "open");
-  const spawnReports = successfulSpawns.map((call) => {
-    const edge = edgeByChild.get(call.output.agent_id) ?? null;
-    return {
-      call,
-      edge,
-      tool_model_matches_native: Boolean(call.model && edge?.model === call.model),
-      closed: Boolean(edge?.status === "closed" && closeReleaseTargetSet.has(call.output.agent_id)),
-    };
-  });
-  const missingNativeEdgeReports = edges.available
-    ? spawnReports.filter((report) => !report.edge)
-    : [];
-  const modelMismatchReports = spawnReports.filter((report) => {
-    if (!report.call.model) return false;
-    if (!report.edge) return false;
-    return report.edge?.model !== report.call.model;
-  });
-  const explorerFrontierReports = spawnReports.filter((report) => {
-    if (report.call.fork_context) return false;
-    if (!report.call.has_model) return false;
-    const toolModel = explicitString(report.call.model).toLowerCase();
-    return isExplorerRole(report.call.agent_type) && explorerForbidden.has(toolModel);
-  });
-  const unsupportedAgentTypeAttempts = spawnCalls.filter((call) => {
-    if (!auditAgentTypes) return false;
-    const role = normalizeRole(call.agent_type);
-    return role && !allowedAgentTypeSet.has(role);
-  });
-  const unsupportedAgentTypeReports = successfulSpawns.filter((call) => {
-    if (!auditAgentTypes) return false;
-    const role = normalizeRole(call.agent_type);
-    return role && !allowedAgentTypeSet.has(role);
-  });
-  const expectedModels = Array.isArray(args.expectModels) ? args.expectModels.filter(Boolean) : [];
-  const badToolSearchSchemasBeforeSpawn = transcript.badNativeToolSearchSchemas.filter((entry) => entry.line < earliestSpawnLine);
-  const badToolSearchSchemasWithoutCorrection = badToolSearchSchemasBeforeSpawn.filter((entry) => {
-    return !transcript.markers.some((marker) => {
-      return marker.line > entry.line
-        && marker.line < earliestSpawnLine
-        && (
-          marker.marker === "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_CORRECTION_REQUIRED"
-          || marker.marker === "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY"
-        );
-    });
+  const successful = spawns.filter((call) => call.output && !outputFailed(call.output) && outputAgentId(call.output));
+  const db = await readEdges(args.stateDb || defaultStateDb(), parent);
+  const edgeById = new Map(db.rows.map((row) => [safeString(row?.child_thread_id).trim(), row]));
+  const routeMismatches = successful.filter((call) => {
+    const edge = edgeById.get(outputAgentId(call.output));
+    return !edge || explicit(edge.model) !== explicit(call.args.model) || explicit(edge.reasoning_effort) !== explicit(call.args.reasoning_effort ?? call.args.reasoningEffort);
   });
   const checks = [
-    buildCheck(
-      "native_db_available",
-      edges.available,
-      edges.available ? `state_db=${edges.path}` : (edges.error || "state DB unavailable"),
-    ),
-    buildCheck(
-      "no_missing_model_spawn_created",
-      missingModelCreated.length === 0,
-      missingModelCreated.length === 0
-        ? "no missing-model spawn created a child"
-        : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
-    ),
-    buildCheck(
-      "no_fork_context_spawn_created",
-      forkContextCreated.length === 0,
-      forkContextCreated.length === 0
-        ? "no fork_context=true spawn created a child"
-        : forkContextCreated.map((call) => `line ${call.line}: child=${call.output?.agent_id}`).join(", "),
-    ),
-    buildCheck(
-      "no_fork_context_role_spawn_created",
-      forkContextRoleConflictCreated.length === 0,
-      forkContextRoleConflictCreated.length === 0
-        ? "no fork_context=true spawn created a role/model-routed child"
-        : forkContextRoleConflictCreated.map((call) => `line ${call.line}:tool_role=${call.agent_type || "?"}, child=${call.output?.agent_id}`).join(", "),
-    ),
-    buildCheck(
-      "tool_model_matches_native",
-      modelMismatchReports.length === 0,
-      modelMismatchReports.length === 0
-        ? "every successful explicit-model spawn matches the native DB model"
-        : modelMismatchReports.map((report) => {
-          return `${report.call.output.agent_id}:tool_model=${report.call.model || "?"}, native_model=${report.edge?.model ?? "missing"}`;
-        }).join(", "),
-    ),
-    buildCheck(
-      "native_edges_observed_for_successful_spawns",
-      missingNativeEdgeReports.length === 0,
-      !edges.available
-        ? "skipped because native DB is unavailable"
-        : missingNativeEdgeReports.length === 0
-        ? "every successful spawn has a native DB edge row"
-        : missingNativeEdgeReports.map((report) => {
-          return `${report.call.output.agent_id}:tool_role=${report.call.agent_type || "?"}, tool_model=${report.call.model || "?"}`;
-        }).join(", "),
-    ),
-    buildCheck(
-      "no_explorer_frontier_spawn_created",
-      explorerFrontierReports.length === 0,
-      explorerFrontierReports.length === 0
-        ? "no non-fork explorer spawn used a forbidden frontier model"
-        : explorerFrontierReports.map((report) => {
-          return `${report.call.output.agent_id}:tool_role=${report.call.agent_type || "?"}, tool_model=${report.call.model || "?"}, native_role=${report.edge?.agent_role ?? "missing"}, native_model=${report.edge?.model ?? "missing"}`;
-        }).join(", "),
-    ),
-    buildCheck(
-      "no_unsupported_native_agent_type_attempted",
-      unsupportedAgentTypeAttempts.length === 0,
-      unsupportedAgentTypeAttempts.length === 0
-        ? (auditAgentTypes ? "no spawn attempted an unsupported native agent_type" : "native agent_type audit disabled; runtime owns availability")
-        : unsupportedAgentTypeAttempts.map((call) => {
-          return `line ${call.line}:tool_role=${call.agent_type || "?"}, model=${call.model || "?"}, output=${call.output?.agent_id ? call.output.agent_id : call.output?.line ?? "missing"}, allowed=${[...allowedAgentTypeSet].join("|")}`;
-        }).join(", "),
-    ),
-    buildCheck(
-      "spawn_outputs_observed",
-      spawnCallsMissingOutput.length === 0,
-      spawnCallsMissingOutput.length === 0
-        ? "every scanned spawn_agent call has a matched output"
-        : spawnCallsMissingOutput.map((call) => `line ${call.line} (${call.source})`).join(", "),
-    ),
-    buildCheck(
-      "no_spawn_failures",
-      failedSpawnCalls.length === 0,
-      failedSpawnCalls.length === 0
-        ? "no spawn_agent calls returned runtime/tool failure"
-        : failedSpawnCalls.map((call) => `line ${call.line} -> output line ${call.output?.line ?? "?"}`).join(", "),
-    ),
-    buildCheck(
-      "unsafe_tool_search_schema_corrected_before_spawn",
-      badToolSearchSchemasWithoutCorrection.length === 0,
-      badToolSearchSchemasBeforeSpawn.length === 0
-        ? "no unsafe native-agent tool_search schema appeared before a scanned spawn"
-        : badToolSearchSchemasWithoutCorrection.length === 0
-        ? "unsafe native-agent tool_search schema was followed by local correction before spawn"
-        : badToolSearchSchemasWithoutCorrection.map((entry) => `line ${entry.line} -> first spawn line ${earliestSpawnLine}`).join(", "),
-    ),
-    buildCheck(
-      "guidance_before_first_spawn",
-      spawnCalls.length === 0 || guidanceBeforeFirstSpawn || args.allowMissingGuidance || !args.requireGuidance,
-      guidanceBeforeFirstSpawn
-        ? `first marker line=${transcript.markers.find((marker) => marker.line < earliestSpawnLine)?.line}`
-        : "no advisor guidance marker found before first scanned spawn",
-      args.requireGuidance && !args.allowMissingGuidance ? "fail" : "warn",
-    ),
-    ...expectedModels.map((model) => {
-      const matches = spawnReports.filter((report) => report.call.model === model && report.edge?.model === model);
-      return buildCheck(
-        `model_recorded:${model}`,
-        matches.length > 0,
-        matches.length > 0
-          ? matches.map((report) => `${report.call.output.agent_id}:${report.edge.agent_role}/${report.edge.reasoning_effort}/${report.edge.status}`).join(", ")
-          : `no successful spawn with tool input and native DB model=${model}`,
-      );
-    }),
+    buildCheck("no_legacy_followup_failure", legacyFailures.length === 0, legacyFailures.length ? `lines ${legacyFailures.join(",")}` : "none"),
+    buildCheck("all_spawn_routes_explicit", invalid.length === 0, invalid.length ? `lines ${invalid.map((call) => call.line).join(",")}` : "all explicit"),
+    buildCheck("no_runtime_spawn_failure", spawns.every((call) => !call.output || !outputFailed(call.output)), "runtime output inspected"),
+    buildCheck("native_route_matches_transcript", routeMismatches.length === 0, db.available ? (routeMismatches.length ? `children ${routeMismatches.map((call) => outputAgentId(call.output)).join(",")}` : "all matched") : "native DB unavailable"),
   ];
-  if (Number.isFinite(args.expectCurrentOpen)) {
-    checks.push(buildCheck(
-      "current_parent_open_count",
-      openRows.length === args.expectCurrentOpen,
-      `open=${openRows.length}, expected=${args.expectCurrentOpen}`,
-    ));
+  for (const model of args.expectModels.map(explicit).filter(Boolean)) {
+    checks.push(buildCheck(`expected_model:${model}`, successful.some((call) => explicit(call.args.model) === model), "successful transcript spawn required"));
   }
-  if (args.expectAllClosed) {
-    const notClosed = spawnReports.filter((report) => !report.closed);
-    checks.push(buildCheck(
-      "successful_spawns_closed",
-      notClosed.length === 0,
-      notClosed.length === 0
-        ? "every successful spawn in the scanned window has a successful close and closed native edge"
-        : notClosed.map((report) => `${report.call.output.agent_id}:edge=${report.edge?.status ?? "missing"}, close_release=${closeReleaseTargetSet.has(report.call.output.agent_id)}`).join(", "),
-    ));
-  }
-  const checkStatus = summarizeChecks(checks);
-
-  const result = {
-    ok: checkStatus !== "failed",
-    verdict: checkStatus === "failed" && explorerFrontierReports.length > 0
-      ? "native_explorer_frontier_model_violation"
-      : checkStatus === "failed" && forkContextCreated.length > 0
-      ? "native_fork_context_spawn_bypassed_advisor"
-      : checkStatus === "failed" && forkContextRoleConflictCreated.length > 0
-      ? "native_fork_context_role_conflict_bypassed_advisor"
-      : checkStatus === "failed" && unsupportedAgentTypeAttempts.length > 0
-      ? "native_unsupported_agent_type_attempted"
-      : checkStatus === "failed" && modelMismatchReports.length > 0
-      ? "native_spawn_model_mismatch"
-      : checkStatus === "failed" && missingModelCreated.length > 0
-      ? "native_spawn_missing_model_bypassed_advisor"
-      : checkStatus === "failed" && !edges.available
-      ? "native_db_unavailable"
-      : checkStatus === "failed" && missingNativeEdgeReports.length > 0
-      ? "native_spawn_edge_missing"
-      : checkStatus === "failed"
-      ? "live_check_failed"
-      : spawnCalls.length > 0 && !guidanceBeforeFirstSpawn
-      ? "live_check_passed_without_transcript_guidance"
-      : "no_bypass_detected_in_scanned_window",
-    check_status: checkStatus,
-    checks,
-    transcript_path: transcriptPath,
-    parent_thread_id: parent,
-    scanned_since_line: Number.isFinite(args.sinceLine) ? args.sinceLine : 1,
-    guidance_markers: transcript.markers,
-    spawn_batches: spawnBatches,
-    current_parent_lanes: {
-      counts: summarizeLaneCounts(edges.rows),
-      rows: edges.rows.map((row) => ({
-        child_thread_id: row.child_thread_id,
-        status: row.status,
-        agent_role: row.agent_role ?? null,
-        model: row.model ?? null,
-        reasoning_effort: row.reasoning_effort ?? null,
-        agent_nickname: row.agent_nickname ?? null,
-        title: row.title ?? null,
-        updated_at: row.updated_at ?? null,
-      })),
-    },
-    spawn_calls: spawnCalls.map((call) => ({
-      line: call.line,
-      call_id: call.call_id,
-      wrapper_call_id: call.wrapper_call_id || null,
-      source: call.source,
-      agent_type: call.agent_type,
-      model: call.model || null,
-      reasoning_effort: call.reasoning_effort || null,
-      fork_context: call.fork_context,
-      fork_context_violation: forkContextCreated.includes(call),
-      fork_context_role_conflict: hasForkContextRoleConflict(call),
-      has_model: call.has_model,
-      output_line: call.output?.line ?? null,
-      created_agent_id: call.output?.agent_id || null,
-      output_failed: call.output?.failed ?? null,
-      native_edge: call.output?.agent_id ? edgeByChild.get(call.output.agent_id) ?? null : null,
-      explorer_frontier_violation: explorerFrontierReports.some((report) => report.call === call),
-      unsupported_agent_type: unsupportedAgentTypeAttempts.includes(call),
-      message_preview: call.message_preview,
-    })),
-    model_routes: spawnReports.map((report) => ({
-      child_thread_id: report.call.output.agent_id,
-      tool_model: report.call.model || null,
-      native_model: report.edge?.model ?? null,
-      agent_type: report.call.agent_type || null,
-      native_role: report.edge?.agent_role ?? null,
-      reasoning_effort: report.edge?.reasoning_effort ?? report.call.reasoning_effort ?? null,
-      native_status: report.edge?.status ?? null,
-      tool_model_matches_native: report.tool_model_matches_native,
-      closed_after_spawn: report.closed,
-    })),
-    close_calls: transcript.calls.filter((call) => call.name === "close_agent").map((call) => ({
-      line: call.line,
-      source: call.source,
-      target: call.target,
-      output_line: call.output?.line ?? null,
-      output_failed: call.output?.failed ?? null,
-    })),
-    state_db: edges,
-    interpretation: [
-      "ok=false means this real transcript contains a native spawn path that was not protected by the advisor before the child was created.",
-      "This check is read-only; it proves observed runtime behavior from transcript and SQLite evidence, not synthetic hook behavior.",
-    ],
-  };
-
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  if (!result.ok) process.exitCode = 2;
+  const open = db.rows.filter((row) => explicit(row?.status) !== "closed").length;
+  if (Number.isInteger(args.expectCurrentOpen)) checks.push(buildCheck("expected_current_open", db.available && open === args.expectCurrentOpen, `actual=${db.available ? open : "unavailable"}`));
+  const ok = checks.every((check) => check.ok);
+  process.stdout.write(`${JSON.stringify({ ok, parent: parent || null, checks, spawns: spawns.map((call) => ({ line: call.line, model: call.args.model ?? null, reasoning_effort: call.args.reasoning_effort ?? call.args.reasoningEffort ?? null, child_id: outputAgentId(call.output) || null })), current_parent_open: db.available ? open : null }, null, 2)}\n`);
+  if (!ok) process.exitCode = 1;
 }
 
 main().catch((error) => {
