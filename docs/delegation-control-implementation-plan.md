@@ -181,7 +181,7 @@ Tests:
 - Documentation grep checks for:
   - `completed lane is reusable`;
   - `close only when stale/wrong/cap-needed`;
-  - `agent_type=default` for frontier critic lanes;
+  - no role-derived native `agent_type` or fallback worker lane;
   - Luna for bounded fast evidence work and mechanical checks; Terra as the daily default for exploration, diagnosis, implementation, and verification; Sol only for highest-risk judgment.
 - Local deployment check, outside package tests:
   - root `~/.codex/AGENTS.md` contains the same compact protocol;
@@ -224,7 +224,7 @@ Already implemented baseline:
 - Block non-fork missing `model` for every native role; semantic role never
   substitutes for an explicit 5.6 model route.
 - Block `agent_type=explorer` plus `gpt-5.6-sol`.
-- Allow frontier lanes as `agent_type=default`.
+- Require every intended lane to choose model and effort from its task contract.
 - Detect bypasses in `live-check`.
 
 Additional changes:

@@ -481,7 +481,7 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
                 </tr>
                 <tr>
                   <th><code>models.explorerForbidden</code></th>
-                  <td>Models that cannot be paired with native <code>agent_type=explorer</code> if that type is explicitly allowed from live runtime evidence; ordinary scout and frontier critic lanes should use <code>agent_type=default</code> with semantic role text in the message.</td>
+                  <td>Models that cannot be paired with native <code>agent_type=explorer</code> if that type is explicitly required by proven runtime evidence. Native type is not inferred from semantic role and never selects model or effort.</td>
                 </tr>
                 <tr>
                   <th><code>defaults.agentCap</code></th>

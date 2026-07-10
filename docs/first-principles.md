@@ -43,9 +43,8 @@ It must also avoid the opposite drift: a leader that treats hook safety text as 
 3. Model boundary:
    - Every default/legacy non-fork `spawn_agent` tool input must include a non-empty string `model`.
    - Native `fork_context=true` is disabled because it inherits the already-running parent model and effort. Every lane passes compact context and explicitly chooses Luna, Terra, or Sol; legacy Spark/5.4/5.5 routes are retired.
-   - `agent_type` is never the semantic model-routing authority, and the hook does not own native agent-type availability.
-   - If Codex runtime accepts a special native `agent_type` such as `code-reviewer`, let it run. If runtime rejects it, retry once with native `agent_type=default`, preserve the semantic role in message/title/task contract, and choose `model` explicitly.
-   - A critic/code-reviewer/architect prompt on native `default` is still a named specialist lane, not a fallback or downgrade.
+   - `agent_type` is never semantic model-routing authority. Omit it unless the actual native tool requires it; role/profile never provides model or effort.
+   - A rejected spawn/tool shape is a source-contract error. Do not probe alternate types, retry with a fallback, or launch another worker tool.
    - Native `agent_type=explorer` with Sol is invalid shape. Luna owns bounded fast evidence work and mechanical checks, Terra is the daily engineering default, and Sol is reserved for highest-risk independent judgment.
    - `live-check` must catch missing-model bypasses, runtime spawn failures, tool-model/native-model mismatches, and explorer/frontier role-shape violations. Agent-type allow-list checks are optional diagnostics, not default admission control.
 

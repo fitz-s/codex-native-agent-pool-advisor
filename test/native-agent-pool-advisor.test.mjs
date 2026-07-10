@@ -310,10 +310,8 @@ test("unrelated parent native open edges do not block current parent", async () 
       },
     });
 
-    assert.notEqual(output?.decision, "block");
-    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
-    const reservations = Object.values(state.sessions["thread:empty-parent"].spawn_reservations);
-    assert.equal(reservations.length, 0);
+    assert.equal(output, null);
+    assert.equal(await pathExists(join(home, "state", "native-agent-pool-advisor.json")), false);
   });
 });
 
@@ -343,7 +341,8 @@ test("unrelated parent native open edges do not emit zero budget on current prom
     assert.match(context, /positive observed_free snapshot as the current authority/);
     assert.match(context, /Do not report native subagent capacity as 0/);
     assert.match(context, /NATIVE_SPAWN_SHAPE_CONTRACT=true/);
-    assert.match(context, /Choose native agent_type deliberately/);
+    assert.match(context, /Omit agent_type unless the native tool requires it/);
+    assert.match(context, /rejected spawn\/tool shape is an error/);
     assert.match(context, /not an atomic runtime reservation/);
     assert.match(context, /native_slots=slot_open=0/);
     assert.doesNotMatch(context, /When observed_free is 0, do not call spawn_agent/);
@@ -1116,10 +1115,8 @@ test("allows Terra route for default spawns without persisting a reservation", a
       },
     });
 
-    assert.notEqual(output?.decision, "block");
-    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
-    const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
-    assert.equal(reservations.length, 0);
+    assert.equal(output, null);
+    assert.equal(await pathExists(join(home, "state", "native-agent-pool-advisor.json")), false);
   });
 });
 
@@ -1156,34 +1153,20 @@ test("unconfirmed pre-spawn attempts do not serialize a later spawn", async () =
   });
 });
 
-test("legacy persisted reservations are purged before admission", async () => {
+test("native spawn admission ignores legacy persisted reservations without rewriting state", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
-
-    const first = await runHook(home, {
-      hook_event_name: "PreToolUse",
-      tool_name: "spawn_agent",
-      session_id: "parent1",
-      tool_input: {
-        agent_type: "default",
-        model: "gpt-5.6-terra",
-        reasoning_effort: "medium",
-        message: "trace first slice",
-      },
-    });
-    assert.notEqual(first?.decision, "block");
-
     const statePath = join(home, "state", "native-agent-pool-advisor.json");
-    const state = JSON.parse(await readFile(statePath, "utf-8"));
-    state.sessions["thread:parent1"].spawn_reservations = {
-      legacy: { count: 6, expires_at: "2999-01-01T00:00:00.000Z" },
-    };
-    state.sessions["thread:other-parent"] = {
-      session_id: "thread:other-parent",
+    const state = {
+      version: 1,
       updated_at: new Date().toISOString(),
-      agents: {},
-      spawn_reservations: {
-        legacy: { count: 6, expires_at: "2999-01-01T00:00:00.000Z" },
+      sessions: {
+        "thread:parent1": {
+          session_id: "thread:parent1",
+          updated_at: new Date().toISOString(),
+          agents: {},
+          spawn_reservations: { legacy: { count: 6, expires_at: "2999-01-01T00:00:00.000Z" } },
+        },
       },
     };
     await writeFile(statePath, JSON.stringify(state, null, 2));
@@ -1200,10 +1183,8 @@ test("legacy persisted reservations are purged before admission", async () => {
       },
     });
 
-    assert.notEqual(second?.decision, "block");
-    const migrated = JSON.parse(await readFile(statePath, "utf-8"));
-    assert.deepEqual(migrated.sessions["thread:parent1"].spawn_reservations, {});
-    assert.deepEqual(migrated.sessions["thread:other-parent"].spawn_reservations, {});
+    assert.equal(second, null);
+    assert.deepEqual(JSON.parse(await readFile(statePath, "utf-8")), state);
   });
 });
 
@@ -1337,8 +1318,8 @@ test("blocks explorer role when it explicitly selects a frontier model", async (
 
     assert.equal(output?.decision, "block");
     assert.match(output.reason, /Explorer\/frontier route violation/);
-    assert.match(output.reason, /agent_type=default/);
-    assert.match(output.reason, /Do not use native explorer unless explicitly configured/);
+    assert.match(output.reason, /This call shape is invalid/);
+    assert.match(output.reason, /Correct the invalid role\/model shape at its source/);
   });
 });
 
@@ -1360,7 +1341,7 @@ test("post-tool advisory reports explorer frontier route violation when spawn ho
 
     assert.notEqual(output?.decision, "block");
     assert.match(output.hookSpecificOutput.additionalContext, /Explorer\/frontier route violation observed after tool execution/);
-    assert.match(output.hookSpecificOutput.additionalContext, /frontier critic\/architecture lanes must use agent_type=default/i);
+    assert.match(output.hookSpecificOutput.additionalContext, /do not convert the rejection into a retry through another agent type or worker tool/i);
   });
 });
 
@@ -1437,10 +1418,8 @@ test("allows wrapped multi-spawn when requested count fits observed capacity", a
       },
     });
 
-    assert.notEqual(output?.decision, "block");
-    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
-    const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
-    assert.equal(reservations.length, 0);
+    assert.equal(output, null);
+    assert.equal(await pathExists(join(home, "state", "native-agent-pool-advisor.json")), false);
   });
 });
 
@@ -1502,7 +1481,7 @@ test("wrapped multi-spawn post responses are matched by same-tool ordinal", asyn
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /cap_hit_after_last_close=yes/);
+    assert.match(output.reason, /cap_hit_after_last_close=no/);
     assert.match(output.reason, /native_slots=slot_open=6/);
   });
 });
@@ -1549,7 +1528,7 @@ test("wrapped multi-spawn post responses preserve distinct successful agent ids"
   });
 });
 
-test("native-readable empty edges still count successful local spawn ledger until edges catch up", async () => {
+test("native-readable empty edges do not let a local spawn ledger block admission", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
 
@@ -1578,14 +1557,11 @@ test("native-readable empty edges still count successful local spawn ledger unti
       },
     });
 
-    assert.equal(output.decision, "block");
-    assert.match(output.reason, /1\/1 estimated slots occupied/);
-    assert.match(output.reason, /slot_pressure_source=native_open_edges_plus_ledger/);
-    assert.match(output.reason, /ledger_lag=1/);
+    assert.equal(output, null);
   }, "[agents]\nmax_threads = 1\n");
 });
 
-test("stale local spawn ledger lag does not override authoritative native DB", async () => {
+test("native spawn admission does not rewrite stale local ledger state", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
 
@@ -1620,9 +1596,9 @@ test("stale local spawn ledger lag does not override authoritative native DB", a
       },
     });
 
-    assert.notEqual(output?.decision, "block");
+    assert.equal(output, null);
     const nextState = JSON.parse(await readFile(statePath, "utf-8"));
-    assert.equal(nextState.sessions["thread:parent1"].agents["stale-ledger-child"], undefined);
+    assert.deepEqual(nextState, state);
   }, "[agents]\nmax_threads = 1\n");
 });
 
@@ -1672,9 +1648,8 @@ test("native open edges with task_complete transcripts remain occupied close can
     });
     assert.equal(spawnOutput?.decision, "block");
     assert.match(spawnOutput.reason, /6\/6 estimated slots occupied/);
-    assert.match(spawnOutput.reason, /native_slots=slot_open=0, slot_terminal=6/);
-    assert.match(spawnOutput.reason, /LANES_COMPLETED_NOT_CLOSED=6/);
-    assert.match(spawnOutput.reason, /close enough listed completed_not_closed current-parent lane\(s\)/);
+    assert.match(spawnOutput.reason, /native_slots=slot_open=6, slot_terminal=0/);
+    assert.doesNotMatch(spawnOutput.reason, /LANES_COMPLETED_NOT_CLOSED=6/);
   });
 });
 
@@ -1940,7 +1915,7 @@ test("failed close after a cap hit does not free runtime capacity", async () => 
 
     assert.equal(output.decision, "block");
     assert.match(output.reason, /6\/6/);
-    assert.match(output.reason, /failed_closes=1/);
+    assert.match(output.reason, /failed_closes=0/);
   });
 });
 
@@ -2094,11 +2069,9 @@ test("native authoritative state ignores stale transcript and never persists a s
     const output = await runHook(home, input);
     const retry = await runHook(home, input);
 
-    assert.notEqual(output?.decision, "block");
-    assert.notEqual(retry?.decision, "block");
-    const state = JSON.parse(await readFile(join(home, "state", "native-agent-pool-advisor.json"), "utf-8"));
-    const reservations = Object.values(state.sessions["thread:parent1"].spawn_reservations);
-    assert.equal(reservations.length, 0);
+    assert.equal(output, null);
+    assert.equal(retry, null);
+    assert.equal(await pathExists(join(home, "state", "native-agent-pool-advisor.json")), false);
   });
 });
 
@@ -2161,7 +2134,7 @@ test("empty native table falls back to transcripts unless an explicit reset mark
   });
 });
 
-test("truncated transcript tail estimates do not undercut discovered child fallback", async () => {
+test("spawn admission fails closed without native edge DB despite truncated transcript children", async () => {
   await withHome(async (home) => {
     const now = new Date();
     const dateParts = [
@@ -2197,14 +2170,11 @@ test("truncated transcript tail estimates do not undercut discovered child fallb
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /6\/6/);
-    assert.match(output.reason, /transcript_slot=6/);
-    assert.match(output.reason, /transcript_unresolved=7/);
-    assert.doesNotMatch(output.reason, /transcript_slot=1/);
+    assert.match(output.reason, /Native thread_spawn_edges could not be read/);
   });
 });
 
-test("truncated transcript tail close does not erase discovered child fallback", async () => {
+test("spawn admission fails closed without native edge DB despite truncated close transcript", async () => {
   await withHome(async (home) => {
     const now = new Date();
     const dateParts = [
@@ -2240,10 +2210,7 @@ test("truncated transcript tail close does not erase discovered child fallback",
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /6\/6/);
-    assert.match(output.reason, /transcript_slot=6/);
-    assert.match(output.reason, /transcript_unresolved=6/);
-    assert.doesNotMatch(output.reason, /transcript_slot=0/);
+    assert.match(output.reason, /Native thread_spawn_edges could not be read/);
   });
 });
 
@@ -2264,16 +2231,17 @@ test("fresh lock contention blocks spawn conservatively", async () => {
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /state lock is unavailable/);
+    assert.match(output.reason, /Native thread_spawn_edges could not be read/);
   });
 });
 
-test("fresh advisor lock contention allows a spawn from read-only native edge evidence", async () => {
+test("spawn admission bypasses advisor state lock and uses native edge evidence only", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await mkdir(join(home, "state", "native-agent-pool-advisor.lock"), { recursive: true });
     await writeFile(join(home, "state", "native-agent-pool-advisor.lock", "owner"), "test lock\n");
 
+    const startedAt = Date.now();
     const output = await runHook(home, {
       hook_event_name: "PreToolUse",
       tool_name: "spawn_agent",
@@ -2286,10 +2254,41 @@ test("fresh advisor lock contention allows a spawn from read-only native edge ev
       },
     });
 
-    assert.notEqual(output?.decision, "block");
-    assert.match(output.hookSpecificOutput.additionalContext, /ADVISOR_STATE_LOCK_BYPASSED=true/);
-    assert.match(output.hookSpecificOutput.additionalContext, /read-only current-parent native-edge snapshot/);
-    assert.match(output.hookSpecificOutput.additionalContext, /observed_free=6/);
+    assert.equal(output, null);
+    assert.ok(Date.now() - startedAt < 1000);
+    assert.equal(await pathExists(join(home, "state", "native-agent-pool-advisor.json")), false);
+  });
+});
+
+test("spawn admission does not repair stale edges or inspect child transcripts", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const oldSeconds = Math.floor(Date.now() / 1000) - (2 * 60 * 60);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','old-child','open');");
+    await sqlite(
+      home,
+      `insert into threads values ('old-child','/missing/old-child.jsonl','old child','default','gpt-5.6-terra','medium','Old','/tmp',${oldSeconds});`,
+    );
+
+    const output = await runHook(home, {
+      hook_event_name: "PreToolUse",
+      tool_name: "spawn_agent",
+      session_id: "parent1",
+      tool_input: {
+        agent_type: "default",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "medium",
+        message: "Review one bounded diff.",
+      },
+    }, {
+      NATIVE_AGENT_POOL_STALE_OPEN_EDGE_RETENTION_HOURS: "1",
+    });
+
+    assert.equal(output, null);
+    assert.equal(
+      await sqliteReadonly(home, "select status from thread_spawn_edges where child_thread_id='old-child';"),
+      "open",
+    );
   });
 });
 
@@ -2993,7 +2992,7 @@ test("session start positive budget guidance stays concise without model lecture
     assert.match(context, /do not say "I cannot\/no subagents"/);
     assert.match(context, /Do not report native subagent capacity as 0/);
     assert.match(context, /NATIVE_SPAWN_SHAPE_CONTRACT=true/);
-    assert.match(context, /make model selection explicit/);
+    assert.match(context, /Choose model and reasoning_effort for the task/);
     assert.doesNotMatch(context, /SUBAGENT_MODEL_SELECTION_REQUIRED=true/);
     assert.doesNotMatch(context, /task_contract=\{output,risk,state_depth/);
     assert.doesNotMatch(context, /ZERO_BUDGET_RECOVERY_REQUIRED=true/);
@@ -3482,12 +3481,12 @@ test("post-tool tool_search native schema output is corrected before spawn", asy
     assert.match(context, /generic native subagent metadata/);
     assert.match(context, /model optional/);
     assert.match(context, /inherited parent model is preferred/);
-    assert.match(context, /TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true/);
-    assert.match(context, /Tool-schema text saying model is optional\/inherited is unsafe/);
+    assert.match(context, /choose model and reasoning_effort from the task contract/);
+    assert.match(context, /Omit agent_type unless the native tool requires it/);
     assert.match(context, /SPAWN_AGENT_DISABLED_THIS_TURN=true/);
     assert.match(context, /CLOSE_BEFORE_SPAWN_REQUIRED=true/);
     assert.match(context, /CLOSE_CANDIDATES=done1,done2,done3,done4,done5,done6/);
-    assert.match(context, /Every non-fork spawn_agent call/);
+    assert.match(context, /Allowed models are gpt-5\.6-luna, gpt-5\.6-terra, gpt-5\.6-sol/);
   });
 });
 
@@ -3558,33 +3557,13 @@ test("prompt-time guidance requires explicit model-selection judgment when spawn
     });
     const context = output.hookSpecificOutput.additionalContext;
 
-    assert.match(context, /SUBAGENT_MODEL_SELECTION_REQUIRED=true/);
-    assert.match(context, /NATIVE_SUBAGENT_USER_AUTHORIZATION_NOT_REQUIRED=true/);
-    assert.match(context, /LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true/);
-    assert.match(context, /TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true/);
-    assert.match(context, /bounded native child-agent delegation does not require a separate user request/);
-    assert.doesNotMatch(context, /subagents require explicit user request/);
-    assert.match(context, /SUBAGENT_MODEL_DECISION_REQUIRED=true/);
-    assert.match(context, /FORK_CONTEXT_HARD_RULE=true/);
-    assert.match(context, /fork_context=true is disabled/);
-    assert.match(context, /inherits the running parent model and effort/);
-    assert.match(context, /task_contract=\{output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition\}/);
-    assert.match(context, /Every non-fork spawn_agent call/);
-    assert.match(context, /explicitly select one of gpt-5\.6-luna, gpt-5\.6-terra, gpt-5\.6-sol/);
-    assert.match(context, /gpt-5\.6-terra as the daily default/);
-    assert.match(context, /bounded, high-throughput search, extraction/);
-    assert.match(context, /short evidence-led investigations/);
-    assert.match(context, /Start reasoning_effort at medium/);
-    assert.match(context, /hardest ambiguous architecture/);
-    assert.match(context, /Luna contracts need scope, output cap, and stop condition/);
-    assert.match(context, /runtime 'agent type is currently not available'/);
-    assert.match(context, /bounded investigation contract, not a prohibition/);
-    assert.match(context, /multi-spawn tool call must fit the current PreToolUse observed_free/);
-    assert.match(context, /large-context repos, give Luna bounded evidence slices/);
-    assert.match(context, /This judgment step is mandatory/);
-    assert.match(context, /inheritance can silently select the wrong 5\.6 family member/);
-    assert.match(context, /must not override positive-capacity guidance/);
-    assert.match(context, /use or reuse native subagents deliberately/);
+    assert.match(context, /NATIVE_SPAWN_SHAPE_CONTRACT=true/);
+    assert.match(context, /choose model and reasoning_effort from the task contract/);
+    assert.match(context, /Allowed models are gpt-5\.6-luna, gpt-5\.6-terra, gpt-5\.6-sol/);
+    assert.match(context, /Do not use fork_context/);
+    assert.match(context, /Omit agent_type unless the native tool requires it/);
+    assert.match(context, /rejected spawn\/tool shape is an error/);
+    assert.doesNotMatch(context, /retry only once with agent_type=default/);
   });
 });
 
@@ -3599,22 +3578,12 @@ test("post-compact emits compact native spawn shape contract", async () => {
     const context = output.hookSpecificOutput.additionalContext;
 
     assert.match(context, /NATIVE_SPAWN_SHAPE_CONTRACT=true/);
-    assert.match(context, /NATIVE_SUBAGENT_USER_AUTHORIZATION_NOT_REQUIRED=true/);
-    assert.match(context, /LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true/);
-    assert.match(context, /TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true/);
-    assert.match(context, /does not require a separate explicit user request/);
-    assert.doesNotMatch(context, /subagents require explicit user request/);
-    assert.doesNotMatch(context, /inherited model is preferred/);
-    assert.match(context, /FORK_CONTEXT_HARD_RULE=true/);
-    assert.match(context, /fork_context=true is disabled/);
-    assert.match(context, /Native agent_type availability belongs to Codex runtime/);
-    assert.match(context, /If a special native agent_type is unavailable/);
-    assert.match(context, /model is optional\/inherited is unsafe/);
-    assert.match(context, /gpt-5\.6-luna/);
-    assert.match(context, /gpt-5\.6-terra/);
-    assert.match(context, /gpt-5\.6-sol/);
-    assert.match(context, /Luna compaction rule/);
-    assert.match(context, /bounded investigation contract with output cap and stop condition/);
+    assert.match(context, /Choose model and reasoning_effort for the task/);
+    assert.match(context, /do not inherit parent settings/);
+    assert.match(context, /Use compact context and no fork_context/);
+    assert.match(context, /Omit agent_type unless the native tool requires it/);
+    assert.match(context, /rejected spawn\/tool shape is an error/);
+    assert.doesNotMatch(context, /agent_type=default/);
   });
 });
 
@@ -3650,9 +3619,9 @@ test("generic user prompts get periodic compact spawn shape reminder", async () 
       prompt: "Continue implementation.",
     });
     assert.match(first.hookSpecificOutput.additionalContext, /NATIVE_SPAWN_SHAPE_CONTRACT=true/);
-    assert.match(first.hookSpecificOutput.additionalContext, /TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true/);
-    assert.match(first.hookSpecificOutput.additionalContext, /FORK_CONTEXT_HARD_RULE=true/);
-    assert.match(first.hookSpecificOutput.additionalContext, /Native agent_type availability belongs to Codex runtime/);
+    assert.match(first.hookSpecificOutput.additionalContext, /Choose model and reasoning_effort for the task/);
+    assert.match(first.hookSpecificOutput.additionalContext, /Omit agent_type unless the native tool requires it/);
+    assert.match(first.hookSpecificOutput.additionalContext, /rejected spawn\/tool shape is an error/);
 
     const second = await runHook(home, {
       hook_event_name: "UserPromptSubmit",
@@ -4560,7 +4529,7 @@ test("docs preserve delegation control boundaries", async () => {
 
   assert.match(docs, /completed lane (?:open )?only for the same active task\/window/i);
   assert.match(docs, /Close only stale, unrelated, wrong-model, capacity-needed, or active-task-complete lanes/i);
-  assert.match(docs, /agent_type=default/);
+  assert.match(docs, /Omit it unless the actual native tool requires it/);
   assert.match(docs, /gpt-5\.6-luna/);
   assert.match(docs, /gpt-5\.6-terra/);
   assert.match(docs, /gpt-5\.6-sol/);
@@ -4568,7 +4537,7 @@ test("docs preserve delegation control boundaries", async () => {
   assert.match(docs, /no subagents/);
   assert.match(docs, /subagent-relevant read-heavy, multi-slice/);
   assert.match(docs, /--forbid-explorer-model/);
-  assert.match(docs, /runtime owns availability/);
+  assert.match(docs, /rejected spawn\/tool shape is a source-contract error/i);
   assert.match(docs, /semantic role/);
   assert.match(docs, /current_parent_lanes/);
   assert.match(docs, /tmp=\$\(mktemp -d\)/);

@@ -47,7 +47,6 @@ const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.6-terra";
 const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.6-sol"];
 const DEFAULT_SUBAGENT_MODELS = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
 const DEFAULT_ALLOWED_AGENT_TYPES = [];
-const SPAWN_LOCK_WAIT_MS = 100;
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
 let runtimeOptionsCache = {
@@ -437,10 +436,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function acquireStateLock(waitMs = STATE_LOCK_WAIT_MS) {
+async function acquireStateLock() {
   const lockPath = stateLockPath();
   const ownerPath = join(lockPath, "owner");
-  const deadline = Date.now() + Math.max(0, Number(waitMs) || 0);
+  const deadline = Date.now() + STATE_LOCK_WAIT_MS;
   await mkdir(dirname(lockPath), { recursive: true });
   const writeOwner = async () => {
     await writeFile(ownerPath, `${process.pid} ${new Date().toISOString()}\n`);
@@ -481,8 +480,8 @@ async function acquireStateLock(waitMs = STATE_LOCK_WAIT_MS) {
   return null;
 }
 
-async function withStateLock(work, waitMs = STATE_LOCK_WAIT_MS) {
-  const lock = await acquireStateLock(waitMs);
+async function withStateLock(work) {
+  const lock = await acquireStateLock();
   if (!lock) return LOCK_UNAVAILABLE;
   const heartbeat = setInterval(() => {
     lock.touch().catch(() => {});
@@ -1956,6 +1955,61 @@ async function repairStaleOpenNativeEdges(parentThreadId, nowMs) {
   }
 }
 
+async function readNativeSpawnAdmissionEdges(parentThreadId) {
+  const edges = emptyNativeThreadEdges();
+  if (!parentThreadId) return edges;
+
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) {
+    edges.checked = true;
+    edges.failed = true;
+    return edges;
+  }
+
+  const sql = [
+    "select e.child_thread_id,e.status,t.agent_role,t.model,t.reasoning_effort,t.cwd,t.updated_at",
+    "from thread_spawn_edges e",
+    "left join threads t on t.id=e.child_thread_id",
+    `where e.parent_thread_id=${sqlString(parentThreadId)}`,
+    "order by coalesce(t.updated_at,0) desc",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const text = safeString(stdout).trim();
+    const rows = JSON.parse(text || "[]");
+    if (!Array.isArray(rows)) throw new Error("native edge query returned non-array JSON");
+
+    edges.checked = true;
+    for (const row of rows) {
+      const childId = safeString(row?.child_thread_id).trim();
+      if (!childId) continue;
+      edges.lanes.set(childId, {
+        id: childId,
+        parent_thread_id: parentThreadId,
+        role: compactOneLine(row?.agent_role, 32),
+        model: compactOneLine(row?.model, 48),
+        reasoning_effort: compactOneLine(row?.reasoning_effort, 16),
+        cwd: compactOneLine(row?.cwd, 72),
+        updated_at: row?.updated_at,
+      });
+      if (safeString(row?.status).trim().toLowerCase() === "closed") {
+        edges.closed.add(childId);
+      } else {
+        edges.active.add(childId);
+      }
+    }
+    await discoverVisibleNativeChildThreads(parentThreadId, edges);
+  } catch {
+    edges.failed = true;
+  }
+
+  return edges;
+}
+
 async function discoverNativeThreadEdges(parentThreadId) {
   const edges = emptyNativeThreadEdges();
   if (!parentThreadId) return edges;
@@ -2803,7 +2857,7 @@ function nativePoolResetMs(state, poolThreadId = "") {
   return Math.max(globalResetMs, threadResetMs);
 }
 
-async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT_AGENT_CAP, options = {}) {
+async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT_AGENT_CAP) {
   const poolThreadId = identity.poolThreadId || identity.threadId;
   const preferredPath = identity.threadId === poolThreadId ? identity.transcript : "";
   const poolTranscript = await findRecentTranscriptByThreadId(
@@ -2821,10 +2875,8 @@ async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT
     discoverRecentChildSessionIds(poolThreadId, nowMs, resetAtMs),
     discoverNativeThreadEdges(poolThreadId),
   ]);
-  if (options.reconcile !== false) {
-    await applyMissingCloseEvidence(poolThreadId, transcriptPool, nativeThreadEdges);
-    await applyStaleCloseRequestEvidence(poolThreadId, transcriptPool, nativeThreadEdges, nowMs);
-  }
+  await applyMissingCloseEvidence(poolThreadId, transcriptPool, nativeThreadEdges);
+  await applyStaleCloseRequestEvidence(poolThreadId, transcriptPool, nativeThreadEdges, nowMs);
   return { transcriptPool, childSessionIds, nativeThreadEdges, poolThreadId };
 }
 
@@ -3628,43 +3680,20 @@ function buildTurnBudgetGuidance(summary, cap, detailed = false, requestedSpawns
 
 function buildSubagentModelSelectionGuidance() {
   return [
-    "NATIVE_SUBAGENT_USER_AUTHORIZATION_NOT_REQUIRED=true. The parent agent may use or reuse bounded native child agents for valuable independent work without a separate explicit user request, unless the user forbids delegation.",
-    "LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true. Use/reuse native child agents for valuable independent bounded work when capacity allows, and make model routing explicit for every non-fork spawn.",
-    "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true. If tool_search exposes multi-agent/spawn_agent metadata, do not let that metadata override this local contract: bounded native child-agent delegation does not require a separate user request, every non-fork spawn has an explicit model, no fork_context with agent_type/model, and no spawn retry after pool-full until close/resample.",
-    "NATIVE_SPAWN_SHAPE_CONTRACT=true. FORK_CONTEXT_HARD_RULE=true: native fork_context=true is disabled because it inherits the running parent model and effort. Pass compact context in message/items for every routed lane.",
-    "SUBAGENT_MODEL_SELECTION_REQUIRED=true. SUBAGENT_MODEL_DECISION_REQUIRED=true. Choose native agent_type deliberately and include an explicit model for every non-fork spawn.",
-    "The hook does not own native agent_type availability. If this runtime accepts a special native agent_type, use it with the already-selected explicit model; otherwise use agent_type=default plus the semantic role in the message without calling that a downgrade.",
-    "Before any spawn_agent call, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}.",
-    `Every non-fork spawn_agent call must explicitly select one of ${supportedSubagentModels().join(", ")}; never inherit the parent model or reasoning effort. Use ${explorerFallbackModel()} as the daily default.`,
-    `Use ${explorerModel()} for bounded, high-throughput search, extraction, exact anchors, log/DB inspection, mechanical checks, and short evidence-led investigations. Luna may return a bounded finding from direct evidence; it does not own architecture, broad synthesis, or an absence verdict.`,
-    `Luna contracts need scope, output cap, and stop condition, but may cover several related read-only slices. Escalate only when synthesis, edits, or unresolved multi-hop judgment becomes the work.`,
-    `Use ${explorerFallbackModel()} for normal tracing, diagnosis, research synthesis, implementation, review preparation, and verification. Start reasoning_effort at medium; lower it for straightforward mechanical work and raise it only when the task contract needs it.`,
-    "Use gpt-5.6-sol only for the hardest ambiguous architecture, security, live-money/destructive decisions, adversarial critique, or final approval. Choose reasoning_effort from the task; high is not a default for ordinary review or investigation.",
-    "Native agent_type is a runtime capability, not hook authority. Choose its semantic role independently from the explicit model route.",
-    "Do not waste a long prompt on repeated unavailable-type probes. After a runtime 'agent type is currently not available' response, retry only once with agent_type=default, the same semantic role in the message/title, and the chosen explicit model.",
-    `Do not use native agent_type=explorer with gpt-5.6-sol. Use ${explorerModel()} for bounded fast evidence work, ${explorerFallbackModel()} for daily engineering work, and Sol only for the highest-level judgment.`,
-    "Do not use fork_context=true. If you need prior context, pass a compact context packet in message/items and explicitly select Luna, Terra, or Sol with task-appropriate effort.",
-    "For Luna, state a useful scope, output cap, and stop condition; this is a bounded investigation contract, not a prohibition on normal search, extraction, or mechanical verification.",
-    "Capacity is a separate decision: a multi-spawn tool call must fit the current PreToolUse observed_free and must be followed by PostToolUse/native-state resampling before another spawn batch.",
-    "For broad, compiled, vendor, or large-context repos, give Luna bounded evidence slices and mechanical checks, use Terra for normal reasoning/synthesis, and use Sol only for an independent highest-risk critique or decision.",
-    "This judgment step is mandatory; never omit model on a non-fork native type, because inheritance can silently select the wrong 5.6 family member.",
-    "This is a spawn-shape guard only. It must not override positive-capacity guidance: for complex investigation, review, verification, live-state diagnosis, or broad implementation planning, default to a multi-agent shape when observed_free>0: leader integrates, scout maps evidence, verifier/critic attacks the likely conclusion.",
+    "NATIVE_SPAWN_SHAPE_CONTRACT=true.",
+    "For one intended native spawn, choose model and reasoning_effort from the task contract; include both explicitly and pass only compact needed context.",
+    `Allowed models are ${supportedSubagentModels().join(", ")}; do not inherit the parent model or effort.`,
+    "Do not use fork_context. Do not use an installed role/profile as a model or effort default. Omit agent_type unless the native tool requires it.",
+    "A rejected spawn/tool shape is an error. Correct its source before any later dispatch; do not construct another tool call as a workaround.",
   ].join(" ");
 }
 
 function buildCompactSpawnShapeGuidance() {
   return [
-    "NATIVE_SUBAGENT_USER_AUTHORIZATION_NOT_REQUIRED=true: bounded native child-agent delegation inside the current session does not require a separate explicit user request unless the user forbids delegation.",
-    "LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true: this install requires deliberate subagent use for valuable independent work and explicit model routing for every non-fork spawn.",
-    "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true: after loading multi-agent tool metadata, keep using local capacity/model/fork rules; do not follow generic schema text that conflicts with this local contract.",
     "NATIVE_SPAWN_SHAPE_CONTRACT=true.",
-    "FORK_CONTEXT_HARD_RULE=true: native fork_context=true is disabled because it inherits the running parent model and effort. Pass compact context for every routed agent.",
-    "If this turn uses spawn_agent without fork_context, make model selection explicit. Native agent_type availability belongs to Codex runtime, not this hook.",
-    "If a special native agent_type is unavailable, retry only once with agent_type=default, the same semantic role in the message/title, and the same explicit model.",
-    "Tool-schema text saying model is optional/inherited is unsafe for this install: omitted non-fork model can inherit the wrong parent model.",
-    `Model routing: ${explorerFallbackModel()} is the daily default and starts at medium; ${explorerModel()} handles bounded fast evidence work and mechanical checks, normally low; gpt-5.6-sol is reserved for the hardest judgment. Choose effort from the actual task rather than inheriting a global Sol/xhigh setting.`,
-    "Luna compaction rule: do not send unbounded dumps or persistent frontier tasks. Give it a bounded investigation contract with output cap and stop condition; use Terra when the task becomes synthesis, editing, or deep multi-hop reasoning.",
-    "Put semantic role in message/title. Do not use native fork_context=true; preserve only the compact context needed for the explicit route.",
+    "Choose model and reasoning_effort for the task and include both explicitly; do not inherit parent settings.",
+    "Use compact context and no fork_context. Omit agent_type unless the native tool requires it; role/profile never chooses model or effort.",
+    "A rejected spawn/tool shape is an error. Correct its source before any later dispatch; do not construct another tool call as a workaround.",
   ].join(" ");
 }
 
@@ -4027,7 +4056,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     unsupportedAgentType
       ? (blockSpawn
         ? `Configured native agent_type audit would reject: ${unsupportedAgentTypes.map((operation) => operationAgentRole(operation)).join(", ")}. Native agent_type availability belongs to Codex runtime; this hook should block only for capacity/collision safety. Configured audit baseline: ${allowedAgentTypes().join(", ")}.`
-        : `Configured native agent_type audit observed: ${unsupportedAgentTypes.map((operation) => operationAgentRole(operation)).join(", ")}. If runtime accepts it, the special native type is valid; if runtime rejects it, retry once with agent_type=default plus the same semantic role and explicit model.`)
+        : `Configured native agent_type audit observed: ${unsupportedAgentTypes.map((operation) => operationAgentRole(operation)).join(", ")}. A runtime rejection is a call-shape error; do not probe another type or replace it with a fallback worker call.`)
       : null,
     missingSpawnModel
       ? (blockSpawn
@@ -4041,8 +4070,8 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       : null,
     explorerForbiddenModel
       ? (blockSpawn
-        ? `Explorer/frontier route violation: native agent_type=explorer cannot use model="${explorerForbiddenModels().join("|")}". Do not use native explorer unless explicitly configured from proven runtime evidence. If this is locator work, use agent_type=default with ${explorerModel()}; if this is reasoning-level child work, use ${explorerFallbackModel()}; if this is critic, architecture, security, high-risk, live-money judgment, or final approval, use agent_type=default with the explicit frontier model.`
-        : `Explorer/frontier route violation observed after tool execution: a spawn_agent call used native agent_type=explorer with a forbidden frontier model. Future frontier critic/architecture lanes must use agent_type=default; future locator semantics should use ${explorerModel()}, and reasoning-level explorer/diagnosis should use ${explorerFallbackModel()}.`)
+        ? `Explorer/frontier route violation: native agent_type=explorer cannot use model="${explorerForbiddenModels().join("|")}". This call shape is invalid. Reconstruct the next intended call from its task contract with explicit model and effort; do not probe types or use a fallback worker.`
+        : "Explorer/frontier route violation observed after tool execution. Record the invalid call shape; do not convert the rejection into a retry through another agent type or worker tool.")
       : null,
     forkContextInheritance
       ? "Native full-history fork is disabled for this install because it inherits the already-running parent model and reasoning effort. Pass a compact context packet in message/items and explicitly select Luna, Terra, or Sol instead."
@@ -4067,7 +4096,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
         : unsupportedSubagentModel
         ? `Retry with explicit ${explorerModel()}, ${explorerFallbackModel()}, or gpt-5.6-sol. Do not substitute a legacy model or rely on inherited parent Sol/xhigh.`
         : explorerForbiddenModel
-        ? "Retry only after correcting the role/model shape: Luna for bounded fast evidence work, Terra as the normal worker, or default with explicit Sol only for the hardest judgment. Do not re-label a frontier critic lane as explorer."
+        ? "Correct the invalid role/model shape at its source before any later dispatch. Do not re-label the lane, probe another type, or construct another worker call as a workaround."
         : multiSpawnOverBudget
         ? "Retry only with requested_spawns<=observed_free, or close/resample first; do not restate every child prompt after a batch block."
         : isChildSession
@@ -4136,33 +4165,55 @@ function buildLockUnavailableAdvisory(eventName, cap, isChildSession, operations
   };
 }
 
-async function buildReadOnlyLockContentionSpawnDecision(identity, eventName, name, payload, operations, nowMs, cap) {
-  if (eventName !== "PreToolUse" || !hasSpawnOperation(operations)) return null;
+function hasOnlySpawnOperations(operations) {
+  return operations.length > 0 && operations.every((operation) => operation.name === "spawn_agent");
+}
+
+function emptyAdmissionTranscriptPool() {
+  return {
+    active: new Set(),
+    closed: new Set(),
+    capHitAtMs: 0,
+    lastCloseAtMs: 0,
+    lastSpawnSuccessAtMs: 0,
+    slotEstimateReliable: false,
+    slotEstimateEvents: 0,
+    slotOccupied: 0,
+    scanned: false,
+    truncated: false,
+  };
+}
+
+async function buildNativeSpawnAdmissionDecision(identity, eventName, name, payload, operations, cap) {
+  if (eventName !== "PreToolUse" || !hasOnlySpawnOperations(operations)) return null;
   const statelessState = emptyState();
   const session = normalizeSession(statelessState, identity.key);
-  const evidence = await collectPoolEvidence(identity, nowMs, 0, cap, { reconcile: false });
-  if (!evidence.nativeThreadEdges?.checked || evidence.nativeThreadEdges.failed) return null;
-
+  const nativeThreadEdges = await readNativeSpawnAdmissionEdges(identity.poolThreadId || identity.threadId);
+  const transcriptPool = emptyAdmissionTranscriptPool();
   const summary = mergeSummary(
     summarize(session),
-    evidence.transcriptPool,
-    evidence.childSessionIds,
-    evidence.nativeThreadEdges,
+    transcriptPool,
+    [],
+    nativeThreadEdges,
     session,
     0,
     cap,
   );
   const blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
+  if (!blockSpawn && !shouldEmitAdvisory(eventName, name, summary, cap, operations)) {
+    return { handled: true, output: null };
+  }
+
   const output = buildAdvisory(eventName, summary, cap, blockSpawn, identity.isChildSession, payload, operations);
   const context = [
-    "ADVISOR_STATE_LOCK_BYPASSED=true.",
-    "Advisor write state is busy; this decision used a read-only current-parent native-edge snapshot and did not mutate advisor or Codex state.",
+    "NATIVE_SPAWN_ADMISSION_READ_ONLY=true.",
+    "Spawn admission used only the current-parent native-edge snapshot and current tool input; it did not read or write advisor state, scan transcripts, sanitize context, or run maintenance.",
     output.hookSpecificOutput?.additionalContext,
   ].filter(Boolean).join(" ");
   output.hookSpecificOutput ??= { hookEventName: eventName };
   output.hookSpecificOutput.additionalContext = context;
   if (blockSpawn) output.reason = context;
-  return output;
+  return { handled: true, output };
 }
 
 function applyTranscriptEvidenceToSession(session, transcriptPool) {
@@ -4235,9 +4286,21 @@ async function main() {
       return;
     }
 
-    const stateLockWaitMs = eventName === "PreToolUse" && hasSpawnOperation(operations)
-      ? Math.min(SPAWN_LOCK_WAIT_MS, STATE_LOCK_WAIT_MS)
-      : STATE_LOCK_WAIT_MS;
+    const nativeSpawnAdmission = await buildNativeSpawnAdmissionDecision(
+      identity,
+      eventName,
+      name,
+      payload,
+      operations,
+      cap,
+    );
+    if (nativeSpawnAdmission?.handled) {
+      if (nativeSpawnAdmission.output) {
+        process.stdout.write(`${JSON.stringify(nativeSpawnAdmission.output)}\n`);
+      }
+      return;
+    }
+
     const lockResult = await withStateLock(async () => {
       const state = await readState();
       await sanitizeCodexGlobalStateNativeDisplayContext(identity.poolThreadId || identity.threadId, eventName);
@@ -4479,18 +4542,9 @@ async function main() {
       if (blockSpawn || shouldEmitAdvisory(eventName, name, summary, cap, operations)) {
         process.stdout.write(`${JSON.stringify(buildAdvisory(eventName, summary, cap, blockSpawn, identity.isChildSession, payload, operations))}\n`);
       }
-    }, stateLockWaitMs);
+    });
     if (lockResult === LOCK_UNAVAILABLE && isToolHookEvent(eventName) && operations.length > 0) {
-      const readOnlyDecision = await buildReadOnlyLockContentionSpawnDecision(
-        identity,
-        eventName,
-        name,
-        payload,
-        operations,
-        nowMs,
-        cap,
-      );
-      process.stdout.write(`${JSON.stringify(readOnlyDecision ?? buildLockUnavailableAdvisory(eventName, cap, identity.isChildSession, operations))}\n`);
+      process.stdout.write(`${JSON.stringify(buildLockUnavailableAdvisory(eventName, cap, identity.isChildSession, operations))}\n`);
     }
   } catch (error) {
     try {
