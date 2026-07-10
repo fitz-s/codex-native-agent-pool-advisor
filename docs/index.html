@@ -356,9 +356,9 @@
 <span class="bad">runtime:</span> native subagent pool is full
 <span class="dim">agent:</span> closing old agents, retrying long prompt...
 
-<span class="good">advisor:</span> occupied=5/6, observed_free=1
-<span class="good">advisor:</span> requested_spawns=2, close_needed_for_request=1
-<span class="good">advisor:</span> no batch guarantee: launch one, or close a current-parent lane first</pre>
+<span class="good">advisor:</span> occupied=3/6, observed_free=3
+<span class="good">advisor:</span> requested_spawns=4, close_needed_for_request=1
+<span class="good">advisor:</span> batch over budget: run at most observed_free now, or close a current-parent lane first</pre>
           </div>
         </section>
 
@@ -382,7 +382,7 @@
             </article>
             <article class="card">
               <h3>Batch overbooking</h3>
-              <p>Blocks multi-spawn tool batches on supported hook surfaces because observed capacity is not an atomic runtime reservation.</p>
+              <p>Blocks multi-spawn tool batches on supported hook surfaces when the requested count exceeds observed free capacity.</p>
             </article>
             <article class="card">
               <h3>Stale open rows</h3>
@@ -394,7 +394,7 @@
             </article>
             <article class="card">
               <h3>Model drift</h3>
-              <p>Requires every non-fork spawn to set an explicit model when the spawn is visible to the hook, and makes missing-model bypasses detectable after the fact.</p>
+              <p>Requires every non-fork spawn to set an explicit model. Native agent types describe runtime shape; they never supply a role-owned model route.</p>
             </article>
             <article class="card">
               <h3>Lane churn</h3>
@@ -406,7 +406,7 @@
             </article>
             <article class="card">
               <h3>Silent local drift</h3>
-              <p>Documents the parent-side choice: reuse, spawn one and resample, or stay local for a concrete reason when work is subagent-relevant.</p>
+              <p>Documents the parent-side choice: reuse, spawn up to observed free capacity in the same tool call and resample after the tool result, or stay local for a concrete reason when work is subagent-relevant.</p>
             </article>
             <article class="card">
               <h3>Unsafe reset drift</h3>
@@ -461,11 +461,11 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
           <div class="grid" style="margin-bottom: 22px;">
             <article class="card">
               <h3>Shared hook runtime</h3>
-              <p>The installer writes to <code>$CODEX_HOME/hooks/</code> and registers <code>SessionStart</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, and <code>PostToolUse</code>.</p>
+              <p>The installer writes to <code>$CODEX_HOME/hooks/</code> and registers <code>SessionStart</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, <code>PostToolUse</code>, <code>PreCompact</code>, and <code>PostCompact</code>.</p>
             </article>
             <article class="card">
               <h3>Native state source</h3>
-              <p>The default budget source is <code>state_5.sqlite</code> and <code>thread_spawn_edges</code>. Override it when a Codex build moves the DB.</p>
+              <p>The default budget source is <code>state_5.sqlite</code>, <code>thread_spawn_edges</code>, and unarchived current-parent child rows in <code>threads</code>. Override it when a Codex build moves the DB.</p>
             </article>
             <article class="card">
               <h3>Model advisory</h3>
@@ -481,7 +481,7 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
                 </tr>
                 <tr>
                   <th><code>models.explorerForbidden</code></th>
-                  <td>Models that cannot be paired with native <code>agent_type=explorer</code>; default frontier critic lanes should use <code>agent_type=default</code>.</td>
+                  <td>Models that cannot be paired with native <code>agent_type=explorer</code> if that type is explicitly allowed from live runtime evidence; ordinary scout and frontier critic lanes should use <code>agent_type=default</code> with semantic role text in the message.</td>
                 </tr>
                 <tr>
                   <th><code>defaults.agentCap</code></th>
@@ -492,6 +492,10 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
                   <td>How early advisory context appears near the native cap.</td>
                 </tr>
                 <tr>
+                  <th><code>defaults.closedEdgeRetentionHours</code></th>
+                  <td>How long closed native edge rows are kept before bounded maintenance prunes them. The default is 168 hours; open rows are never pruned by maintenance.</td>
+                </tr>
+                <tr>
                   <th><code>paths.stateDbName</code></th>
                   <td>Codex native state DB filename when it is not <code>state_5.sqlite</code>.</td>
                 </tr>
@@ -500,14 +504,15 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
             <div class="code-block">
               <pre>{
   "models": {
-    "explorer": ["gpt-5.3-codex-spark", "gpt-5.4-mini"],
-    "explorerPreferred": "gpt-5.3-codex-spark",
-    "explorerFallback": "gpt-5.4-mini",
-    "explorerForbidden": ["gpt-5.5"]
+    "explorer": ["gpt-5.6-luna", "gpt-5.6-terra"],
+    "explorerPreferred": "gpt-5.6-luna",
+    "explorerFallback": "gpt-5.6-terra",
+    "explorerForbidden": ["gpt-5.6-sol"]
   },
   "defaults": {
     "agentCap": 6,
-    "warnRemaining": 1
+    "warnRemaining": 1,
+    "closedEdgeRetentionHours": 168
   },
   "paths": {
     "stateDbName": "state_5.sqlite"
@@ -524,12 +529,12 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
           </div>
           <div class="grid">
             <article class="card">
-              <h3>Spark scout</h3>
-              <p>Use fast scout lanes for bounded anchors, file maps, log filters, and hypothesis probes that protect the leader context.</p>
+              <h3>Luna locator</h3>
+              <p>Use Luna for bounded locating: anchors, file maps, log filters, DB rows, and exact evidence pointers with an output cap and stop condition.</p>
             </article>
             <article class="card">
-              <h3>Mini reasoning lane</h3>
-              <p>Use mini for compact synthesis, light low-risk execution, and bounded verification when the child owns a durable conclusion.</p>
+              <h3>Terra reasoning lane</h3>
+              <p>Use Terra for normal tracing, diagnosis, implementation, synthesis, and bounded verification. Reserve Sol for frontier review, architecture, security, or high-risk judgment.</p>
             </article>
             <article class="card">
               <h3>Hook boundary</h3>
@@ -545,7 +550,7 @@ node scripts/live-check.mjs --transcript ~/.codex/sessions/YYYY/MM/DD/rollout-..
         <section>
           <div class="section-heading">
             <h2>Safety boundary</h2>
-            <p>Normal hook execution writes advisor JSON state and logs. SQLite mutation is limited to successful close-agent evidence or the explicit reset script.</p>
+            <p>Normal hook execution writes advisor JSON state and logs. SQLite mutation is limited to successful close-agent evidence, stale-open repair, closed-child archival, bounded closed-edge pruning, or the explicit reset script.</p>
           </div>
           <div class="code-block">
             <pre>node scripts/reset-pool.mjs --parent &lt;thread_id&gt; --dry-run

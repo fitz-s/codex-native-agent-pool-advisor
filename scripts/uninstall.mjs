@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 
 import { constants } from "node:fs";
+import { execFile } from "node:child_process";
 import { access, copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
-const EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"];
+const execFileAsync = promisify(execFile);
+const EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact"];
+const WATCHER_LABEL = "com.fitz.codex-native-agent-pool-global-state-watch";
 
 function codexHome() {
   const explicit = typeof process.env.CODEX_HOME === "string" ? process.env.CODEX_HOME.trim() : "";
@@ -14,8 +18,33 @@ function codexHome() {
   throw new Error("CODEX_HOME or HOME must be set");
 }
 
-function hookCommand(home) {
-  return `node "${join(home, "hooks", "native-agent-pool-advisor.mjs")}"`;
+function watcherTarget(home) {
+  return join(home, "hooks", "native-agent-pool-global-state-watch.mjs");
+}
+
+function launchAgentPath() {
+  const home = typeof process.env.HOME === "string" ? process.env.HOME.trim() : "";
+  return home ? join(home, "Library", "LaunchAgents", `${WATCHER_LABEL}.plist`) : "";
+}
+
+function defaultCodexHome() {
+  const home = typeof process.env.HOME === "string" ? process.env.HOME.trim() : "";
+  return home ? join(home, ".codex") : "";
+}
+
+function shouldManageLaunchd(home) {
+  if (process.env.NATIVE_AGENT_POOL_SKIP_WATCHER === "1") return false;
+  if (process.env.NATIVE_AGENT_POOL_INSTALL_WATCHER === "1") return process.platform === "darwin";
+  return process.platform === "darwin" && home === defaultCodexHome();
+}
+
+async function runLaunchctl(args) {
+  try {
+    await execFileAsync("launchctl", args, { timeout: 5000, maxBuffer: 1024 * 1024 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function pathExists(path) {
@@ -50,7 +79,14 @@ function parseArgs(argv) {
   return args;
 }
 
-function removeCommand(config, command) {
+function isAdvisorHookCommand(hook) {
+  return hook
+    && hook.type === "command"
+    && typeof hook.command === "string"
+    && hook.command.includes("native-agent-pool-advisor.mjs");
+}
+
+function removeCommand(config) {
   let removed = 0;
   config.hooks ??= {};
   for (const eventName of EVENTS) {
@@ -59,7 +95,7 @@ function removeCommand(config, command) {
     for (const entry of entries) {
       const hooks = Array.isArray(entry?.hooks) ? entry.hooks : [];
       const nextHooks = hooks.filter((hook) => {
-        const match = hook?.type === "command" && hook.command === command;
+        const match = isAdvisorHookCommand(hook);
         if (match) removed += 1;
         return !match;
       });
@@ -81,18 +117,27 @@ async function main() {
   const home = codexHome();
   const hooksPath = join(home, "hooks.json");
   const targetHook = join(home, "hooks", "native-agent-pool-advisor.mjs");
+  const targetWatcher = watcherTarget(home);
+  const manageLaunchd = shouldManageLaunchd(home);
+  const plist = manageLaunchd ? launchAgentPath() : "";
   const config = await readJsonOrDefault(hooksPath, { hooks: {} });
-  const command = hookCommand(home);
-  const removed = removeCommand(config, command);
+  const removed = removeCommand(config);
   const hookFileExists = await pathExists(targetHook);
+  const watcherFileExists = await pathExists(targetWatcher);
+  const plistExists = plist ? await pathExists(plist) : false;
 
   if (!args.dryRun) {
+    if (manageLaunchd) {
+      await runLaunchctl(["bootout", `gui/${process.getuid?.() ?? ""}/${WATCHER_LABEL}`]);
+    }
     if (await pathExists(hooksPath)) {
       const backupPath = `${hooksPath}.backup-native-agent-pool-advisor-uninstall-${new Date().toISOString().replace(/[-:.]/g, "")}`;
       await copyFile(hooksPath, backupPath);
     }
     await writeJsonAtomic(hooksPath, config);
     if (args.removeHookFile) await rm(targetHook, { force: true });
+    await rm(targetWatcher, { force: true });
+    if (plist) await rm(plist, { force: true });
   }
 
   process.stdout.write(`${JSON.stringify({
@@ -100,6 +145,10 @@ async function main() {
     removed_registrations: removed,
     hook_file_exists: hookFileExists,
     hook_file_removed: !args.dryRun && args.removeHookFile && hookFileExists,
+    watcher_file_exists: watcherFileExists,
+    watcher_file_removed: !args.dryRun && watcherFileExists,
+    launch_agent_exists: plistExists,
+    launch_agent_removed: !args.dryRun && plistExists,
   }, null, 2)}\n`);
 }
 

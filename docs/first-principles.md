@@ -11,7 +11,7 @@ The goal is not to make Codex use fewer subagents. The goal is to keep Codex's m
 
 The correct system preserves subagents as context-isolation lanes while making failed spawns, accidental frontier-model inheritance, and disposable lane churn harder to repeat.
 
-It must also avoid the opposite drift: a leader that treats hook safety text as a reason to do all read-heavy work in the main thread. For subagent-relevant work, the leader should explicitly choose one path: reuse a compatible lane, spawn one lane and resample capacity, or stay local because the task is tiny, urgent, user-forbidden, or blocked on evidence already being collected.
+It must also avoid the opposite drift: a leader that treats hook safety text as a reason to do all read-heavy work in the main thread. For subagent-relevant work, the leader should explicitly choose one path: reuse a compatible lane, spawn up to the observed free capacity in the same observable tool call and resample after the tool result, or stay local because the task is tiny, urgent, user-forbidden, or blocked on evidence already being collected.
 
 ## Codex Runtime Boundaries
 
@@ -26,27 +26,28 @@ It must also avoid the opposite drift: a leader that treats hook safety text as 
 ## Structural Solution
 
 1. Capacity oracle:
-   - Read current-parent native `thread_spawn_edges`.
+   - Read current-parent native `thread_spawn_edges` plus unarchived current-parent child thread rows that Codex can still surface as active/closable lanes.
    - Saturate occupied count at the native cap.
    - Treat overflow as repair debt, not more live agents.
    - Ignore other parents for admission.
    - Repair stale `task_complete` open edges.
 
 2. Launch protocol:
-   - Treat `observed_free` as a snapshot, not a batch reservation.
-   - Block multi-spawn batches on supported hook surfaces.
-   - Launch at most one child, then resample.
+   - Treat `observed_free` as a scoped snapshot, not a future batch guarantee.
+   - Admit a multi-spawn batch on supported hook surfaces only when `requested_spawns <= observed_free`, then reserve that same call locally.
+   - Resample after the tool result before launching another spawn batch.
    - After any capacity failure, stop spawning until close/repair/reset produces a newer snapshot.
    - Keep positive-budget guidance short unless there is zero budget, unreadable native state, invalid spawn shape, current-parent lane pressure, or narrow explicit spawn intent.
    - Apply explicit negative intent first. Phrases such as "do not spawn agents" or "no subagents" suppress prompt-triggered spawn guidance unless an actual spawn tool payload is visible.
 
 3. Model boundary:
-   - Every non-fork `spawn_agent` tool input must include a non-empty string `model`.
-   - Boolean `fork_context=true` without `model` is the only inheritance exception.
-   - `agent_type` is never the semantic model-routing authority, and semantic roles are not automatically native runtime shapes.
-   - Use native `agent_type=default` for researcher/critic/verifier/architect-style semantic roles; put the role in message/title/task contract and choose `model` explicitly.
-   - `agent_type=explorer` with a forbidden frontier model is invalid shape; use `agent_type=default` for frontier critic/architecture/high-risk lanes.
-   - `live-check` must catch missing-model bypasses, unsupported native agent types, tool-model/native-model mismatches, and explorer/frontier role-shape violations.
+   - Every default/legacy non-fork `spawn_agent` tool input must include a non-empty string `model`.
+   - Boolean `fork_context=true` without `model` is the only inheritance exception. Every non-fork lane must choose an explicit 5.6 model.
+   - `agent_type` is never the semantic model-routing authority, and the hook does not own native agent-type availability.
+   - If Codex runtime accepts a special native `agent_type` such as `code-reviewer`, let it run. If runtime rejects it, retry once with native `agent_type=default`, preserve the semantic role in message/title/task contract, and choose `model` explicitly.
+   - A critic/code-reviewer/architect prompt on native `default` is still a named specialist lane, not a fallback or downgrade.
+   - Native `agent_type=explorer` with Sol is invalid shape; use Luna only for locator semantics, Terra for reasoning-level child work, and Sol for parallel critic/code-reviewer/architecture/high-risk lanes.
+   - `live-check` must catch missing-model bypasses, runtime spawn failures, tool-model/native-model mismatches, and explorer/frontier role-shape violations. Agent-type allow-list checks are optional diagnostics, not default admission control.
 
 4. Lane lifecycle:
    - Treat subagents as reusable context lanes.

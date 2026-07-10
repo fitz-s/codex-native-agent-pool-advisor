@@ -2,9 +2,10 @@
 
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { finished } from "node:stream/promises";
 import { promisify } from "node:util";
 
 const STATE_VERSION = 1;
@@ -16,21 +17,36 @@ const TRANSCRIPT_TAIL_BYTES = 12 * 1024 * 1024;
 const CHILD_SESSION_SCAN_MS = 36 * 60 * 60 * 1000;
 const SESSION_CAPACITY_GUIDANCE_TTL_MS = 24 * 60 * 60 * 1000;
 const PROMPT_CAPACITY_GUIDANCE_TTL_MS = 2 * 60 * 60 * 1000;
-const SPAWN_RESERVATION_TTL_MS = 90 * 1000;
+const POST_TOOL_CAPACITY_GUIDANCE_TTL_MS = 60 * 1000;
+const SPAWN_SHAPE_REMINDER_TTL_MS = 30 * 60 * 1000;
+const NATIVE_LEDGER_LAG_TTL_MS = 5 * 60 * 1000;
 const STATE_LOCK_WAIT_MS = 2500;
 const STATE_LOCK_STALE_MS = 10000;
 const NATIVE_EDGE_QUERY_TIMEOUT_MS = 750;
 const NATIVE_EDGE_QUERY_MAX_BUFFER = 1024 * 1024;
 const NATIVE_EDGE_TERMINAL_TAIL_BYTES = 2 * 1024 * 1024;
 const NATIVE_EDGE_REPAIR_BATCH = 50;
+const TRANSCRIPT_MENTIONED_CHILD_REF_QUERY_LIMIT = 1000;
 const NATIVE_EDGE_MAINTENANCE_TTL_MS = 6 * 60 * 60 * 1000;
+const NATIVE_EDGE_CLOSED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const NATIVE_ORPHAN_VISIBLE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const NATIVE_STALE_OPEN_EDGE_RETENTION_MS = 0;
+const NATIVE_CLOSE_REQUEST_GRACE_MS = 90 * 1000;
+const NATIVE_EDGE_CLOSED_PRUNE_BATCH = 5000;
 const ADVISOR_SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TRANSCRIPT_SUBAGENT_CONTEXT_SANITIZE_MAX_BYTES = 512 * 1024 * 1024;
+const TRANSCRIPT_SUBAGENT_CONTEXT_STREAM_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const TRANSCRIPT_SANITIZE_STREAM_CHUNK_BYTES = 1024 * 1024;
+const TRANSCRIPT_SANITIZE_STREAM_OVERLAP_CHARS = 1024;
+const TRANSCRIPT_SUBAGENT_CONTEXT_SANITIZE_TTL_MS = 30 * 60 * 1000;
+const GLOBAL_STATE_CONTEXT_SANITIZE_MAX_BYTES = 16 * 1024 * 1024;
 const COMMAND_NAME = "native-agent-pool-advisor";
 const DEFAULT_STATE_DB_NAME = "state_5.sqlite";
-const DEFAULT_EXPLORER_MODEL = "gpt-5.3-codex-spark";
-const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.4-mini";
-const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.5"];
-const DEFAULT_ALLOWED_AGENT_TYPES = ["default", "explorer", "explore"];
+const DEFAULT_EXPLORER_MODEL = "gpt-5.6-luna";
+const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.6-terra";
+const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.6-sol"];
+const DEFAULT_ALLOWED_AGENT_TYPES = [];
+const DEFAULT_MODEL_FIXED_AGENT_TYPES = [];
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
 let runtimeOptionsCache = {
@@ -42,6 +58,10 @@ let runtimeOptionsCache = {
   explorerFallbackModel: DEFAULT_EXPLORER_FALLBACK_MODEL,
   explorerForbiddenModels: [...DEFAULT_EXPLORER_FORBIDDEN_MODELS],
   allowedAgentTypes: [...DEFAULT_ALLOWED_AGENT_TYPES],
+  modelFixedAgentTypes: [...DEFAULT_MODEL_FIXED_AGENT_TYPES],
+  closedEdgeRetentionMs: NATIVE_EDGE_CLOSED_RETENTION_MS,
+  orphanVisibleRetentionMs: NATIVE_ORPHAN_VISIBLE_RETENTION_MS,
+  staleOpenEdgeRetentionMs: NATIVE_STALE_OPEN_EDGE_RETENTION_MS,
 };
 
 function safeString(value) {
@@ -117,6 +137,10 @@ function stateDbPath() {
   return join(codexHome(), runtimeOptionsCache.stateDbName || DEFAULT_STATE_DB_NAME);
 }
 
+function codexGlobalStatePath() {
+  return join(codexHome(), ".codex-global-state.json");
+}
+
 function advisorLogPath() {
   return join(codexHome(), "log", `${COMMAND_NAME}.log`);
 }
@@ -163,6 +187,14 @@ function readFirstPositiveInteger(fallback, ...values) {
   for (const value of values) {
     const parsed = Number.parseInt(String(value ?? ""), 10);
     if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  }
+  return fallback;
+}
+
+function readFirstNonNegativeInteger(fallback, ...values) {
+  for (const value of values) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    if (Number.isInteger(parsed) && parsed >= 0) return parsed;
   }
   return fallback;
 }
@@ -223,6 +255,12 @@ async function loadRuntimeOptions() {
       ?? models.nativeAgentTypes
       ?? DEFAULT_ALLOWED_AGENT_TYPES,
   ).map((role) => normalizeAgentRole(role)).filter(Boolean);
+  const configuredModelFixedAgentTypes = parseStringList(
+    process.env.NATIVE_AGENT_POOL_MODEL_FIXED_AGENT_TYPES
+      ?? models.model_fixed_agent_types
+      ?? models.modelFixedAgentTypes
+      ?? DEFAULT_MODEL_FIXED_AGENT_TYPES,
+  ).map((role) => normalizeAgentRole(role)).filter(Boolean);
 
   runtimeOptionsCache = {
     defaultAgentCap: readFirstPositiveInteger(
@@ -257,6 +295,27 @@ async function loadRuntimeOptions() {
     allowedAgentTypes: configuredAgentTypes.length > 0
       ? [...new Set(configuredAgentTypes)]
       : [...DEFAULT_ALLOWED_AGENT_TYPES],
+    modelFixedAgentTypes: configuredModelFixedAgentTypes.length > 0
+      ? [...new Set(configuredModelFixedAgentTypes)]
+      : [...DEFAULT_MODEL_FIXED_AGENT_TYPES],
+    closedEdgeRetentionMs: readFirstPositiveInteger(
+      Math.floor(NATIVE_EDGE_CLOSED_RETENTION_MS / (60 * 60 * 1000)),
+      process.env.NATIVE_AGENT_POOL_CLOSED_EDGE_RETENTION_HOURS,
+      defaults.closed_edge_retention_hours,
+      defaults.closedEdgeRetentionHours,
+    ) * 60 * 60 * 1000,
+    orphanVisibleRetentionMs: readFirstPositiveInteger(
+      Math.floor(NATIVE_ORPHAN_VISIBLE_RETENTION_MS / (60 * 60 * 1000)),
+      process.env.NATIVE_AGENT_POOL_ORPHAN_VISIBLE_RETENTION_HOURS,
+      defaults.orphan_visible_retention_hours,
+      defaults.orphanVisibleRetentionHours,
+    ) * 60 * 60 * 1000,
+    staleOpenEdgeRetentionMs: readFirstNonNegativeInteger(
+      Math.floor(NATIVE_STALE_OPEN_EDGE_RETENTION_MS / (60 * 60 * 1000)),
+      process.env.NATIVE_AGENT_POOL_STALE_OPEN_EDGE_RETENTION_HOURS,
+      defaults.stale_open_edge_retention_hours,
+      defaults.staleOpenEdgeRetentionHours,
+    ) * 60 * 60 * 1000,
   };
 }
 
@@ -303,6 +362,38 @@ function allowedAgentTypes() {
     : [];
   const roles = configured.map((role) => normalizeAgentRole(role)).filter(Boolean);
   return roles.length > 0 ? [...new Set(roles)] : [...DEFAULT_ALLOWED_AGENT_TYPES];
+}
+
+function modelFixedAgentTypes() {
+  const configured = Array.isArray(runtimeOptionsCache.modelFixedAgentTypes)
+    ? runtimeOptionsCache.modelFixedAgentTypes
+    : [];
+  const roles = configured.map((role) => normalizeAgentRole(role)).filter(Boolean);
+  return roles.length > 0 ? [...new Set(roles)] : [...DEFAULT_MODEL_FIXED_AGENT_TYPES];
+}
+
+function operationUsesModelFixedNativeType(operation) {
+  const role = operationAgentRole(operation);
+  if (!role) return false;
+  return new Set(modelFixedAgentTypes()).has(role);
+}
+
+function closedEdgeRetentionMs() {
+  return runtimeOptionsCache.closedEdgeRetentionMs > 0
+    ? runtimeOptionsCache.closedEdgeRetentionMs
+    : NATIVE_EDGE_CLOSED_RETENTION_MS;
+}
+
+function orphanVisibleRetentionMs() {
+  return runtimeOptionsCache.orphanVisibleRetentionMs > 0
+    ? runtimeOptionsCache.orphanVisibleRetentionMs
+    : NATIVE_ORPHAN_VISIBLE_RETENTION_MS;
+}
+
+function staleOpenEdgeRetentionMs() {
+  return runtimeOptionsCache.staleOpenEdgeRetentionMs > 0
+    ? runtimeOptionsCache.staleOpenEdgeRetentionMs
+    : 0;
 }
 
 function warnRemaining() {
@@ -445,8 +536,37 @@ function isManagedBridgeInvocation() {
   return safeString(process.env.OMX_NATIVE_AGENT_ADVISOR_BRIDGE).trim() === "1";
 }
 
+function shouldStreamLargeTranscriptSanitize() {
+  return safeString(process.env.NATIVE_AGENT_POOL_FORCE_LARGE_TRANSCRIPT_SANITIZE).trim() === "1";
+}
+
 function normalizeToolName(name) {
   return safeString(name).trim().replace(/^functions\./, "");
+}
+
+function shellCommandText(payload) {
+  const input = toolInput(payload);
+  return [input.cmd, input.command, input.script].map((value) => safeString(value)).find(Boolean) ?? "";
+}
+
+function invokesExternalCodexExec(payload, name) {
+  if (!new Set(["bash", "shell", "exec_command", "terminal"]).has(normalizeToolName(name).toLowerCase())) {
+    return false;
+  }
+  return /(?:^|[\s;|&()])(?:\S+\/)?codex\s+exec(?:\s|$)/i.test(shellCommandText(payload));
+}
+
+function externalCodexExecGuard(eventName, payload, name) {
+  if (eventName !== "PreToolUse" || !invokesExternalCodexExec(payload, name)) return null;
+  const context = "Native-agent pool guard: blocking `codex exec` from this interactive task. A CLI worker is outside the current parent/session native pool, cannot reconcile its lifecycle with native edges, and can reintroduce unmanaged agent context. Use the native spawn surface with an explicit gpt-5.6 model, or continue locally when delegation is not needed.";
+  return {
+    decision: "block",
+    reason: context,
+    hookSpecificOutput: {
+      hookEventName: eventName,
+      additionalContext: context,
+    },
+  };
 }
 
 function isAgentTool(name) {
@@ -542,6 +662,27 @@ async function readFilePrefix(path, byteLimit = 64 * 1024) {
     handle = await open(path, "r");
     const buffer = Buffer.alloc(byteLimit);
     const { bytesRead } = await handle.read(buffer, 0, byteLimit, 0);
+    return buffer.subarray(0, bytesRead).toString("utf-8");
+  } catch {
+    return "";
+  } finally {
+    try {
+      await handle?.close();
+    } catch {
+      // best effort
+    }
+  }
+}
+
+async function readFileTail(path, byteLimit = 64 * 1024) {
+  if (!path) return "";
+  let handle;
+  try {
+    const stats = await stat(path);
+    const start = Math.max(0, stats.size - byteLimit);
+    handle = await open(path, "r");
+    const buffer = Buffer.alloc(stats.size - start);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
     return buffer.subarray(0, bytesRead).toString("utf-8");
   } catch {
     return "";
@@ -656,6 +797,16 @@ function parentThreadIdFromChildMeta(meta) {
   return safeString(threadSpawn?.parent_thread_id).trim();
 }
 
+function parentThreadIdFromSourceText(text) {
+  const raw = safeString(text).trim();
+  if (!raw || !raw.includes("parent_thread_id")) return "";
+  try {
+    return parentThreadIdFromChildMeta({ source: JSON.parse(raw) });
+  } catch {
+    return "";
+  }
+}
+
 function directParentThreadId(payload) {
   const direct = safeString(payload.parent_thread_id ?? payload.parentThreadId).trim();
   if (direct) return direct;
@@ -677,6 +828,7 @@ function emptyTranscriptPool() {
     spawned: new Set(),
     closed: new Set(),
     missingClosed: new Set(),
+    closeRequested: new Map(),
     slotOccupied: 0,
     slotEstimateEvents: 0,
     slotEstimateReliable: false,
@@ -685,6 +837,7 @@ function emptyTranscriptPool() {
     failedCloses: 0,
     capHitAtMs: 0,
     lastCloseAtMs: 0,
+    lastSpawnSuccessAtMs: 0,
     scanned: false,
     truncated: false,
   };
@@ -722,6 +875,14 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
     }
     slotEstimateEvents += amount;
   };
+  const clearCloseRequestEvidence = (ids, outputMs = 0) => {
+    for (const id of ids ?? []) {
+      const requestedAtMs = pool.closeRequested.get(id);
+      if (!requestedAtMs) continue;
+      if (outputMs > 0 && requestedAtMs > outputMs) continue;
+      pool.closeRequested.delete(id);
+    }
+  };
 
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -739,6 +900,7 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
       if (newThreadId) {
         pool.spawned.add(newThreadId);
         pool.active.add(newThreadId);
+        pool.lastSpawnSuccessAtMs = Math.max(pool.lastSpawnSuccessAtMs, eventTimestampMs(record));
         noteSlotSpawn(1);
       } else {
         pool.failedSpawns += 1;
@@ -762,6 +924,7 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
             pool.spawned.add(id);
             pool.active.add(id);
           }
+          pool.lastSpawnSuccessAtMs = Math.max(pool.lastSpawnSuccessAtMs, eventTimestampMs(record));
           noteSlotSpawn(spawnedIds.length);
         } else {
           pool.failedSpawns += 1;
@@ -775,6 +938,7 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
       const closeIds = callId ? pendingCloseCalls.get(callId) : null;
       if (closeIds) {
         pendingCloseCalls.delete(callId);
+        clearCloseRequestEvidence(closeIds, eventTimestampMs(record));
         const outputText = safeString(payload.output ?? payload.result ?? "");
         if (textLooksCloseTargetMissing(outputText)) {
           for (const id of closeIds) {
@@ -812,6 +976,10 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
     }
     if (normalized !== "close_agent") continue;
     const closeIds = [...collectAgentIdsFromValue(parseToolArguments(payload).target, new Set(), "target")];
+    for (const id of closeIds) {
+      const atMs = eventTimestampMs(record);
+      if (atMs > 0) pool.closeRequested.set(id, Math.max(pool.closeRequested.get(id) ?? 0, atMs));
+    }
     const callId = safeString(payload.call_id ?? payload.callId).trim();
     if (callId && closeIds.length > 0) {
       pendingCloseCalls.set(callId, closeIds);
@@ -822,6 +990,7 @@ function parseTranscriptPool(text, parentThreadId = "", sinceMs = 0, cap = DEFAU
       pool.active.delete(id);
       pool.lastCloseAtMs = Math.max(pool.lastCloseAtMs, eventTimestampMs(record));
     }
+    clearCloseRequestEvidence(closeIds, eventTimestampMs(record));
     noteSlotClose(closeIds.length);
   }
 
@@ -895,15 +1064,276 @@ function emptyNativeThreadEdges() {
     active: new Set(),
     closed: new Set(),
     terminal: new Set(),
+    visible: new Set(),
     lanes: new Map(),
     checked: false,
     failed: false,
     repaired: 0,
+    visible_checked: false,
+    visible_archived: 0,
   };
 }
 
 function sqlString(value) {
   return `'${safeString(value).replace(/'/g, "''")}'`;
+}
+
+function escapeRegExpLiteral(value) {
+  return safeString(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function removeSubagentContextLine(text, id) {
+  const target = safeString(id).trim();
+  if (!target) return { text, removed: 0 };
+  let current = safeString(text);
+  let removed = 0;
+  for (const marker of [`\\n    - ${target}:`, `\n    - ${target}:`]) {
+    const terminator = marker.startsWith("\\n") ? "\\n" : "\n";
+    for (;;) {
+      const start = current.indexOf(marker);
+      if (start < 0) break;
+      const end = current.indexOf(terminator, start + marker.length);
+      if (end < 0) break;
+      current = `${current.slice(0, start)}${terminator}${current.slice(end + terminator.length)}`;
+      removed += 1;
+    }
+  }
+  return { text: current, removed };
+}
+
+function replacementCount(text, needle) {
+  const target = safeString(needle).trim();
+  if (!target) return 0;
+  let count = 0;
+  let offset = 0;
+  for (;;) {
+    const next = text.indexOf(target, offset);
+    if (next < 0) return count;
+    count += 1;
+    offset = next + target.length;
+  }
+}
+
+function scrubNonOpenChildReferenceText(text, ref) {
+  let current = safeString(text);
+  let removed = 0;
+  const id = safeString(ref?.id).trim();
+  if (id) {
+    removed += replacementCount(current, id);
+    current = current.split(id).join("[archived-child-id]");
+    const shortId = id.slice(0, 8);
+    if (shortId.length >= 8) {
+      const shortPattern = new RegExp(`\\b${escapeRegExpLiteral(shortId)}\\b`, "g");
+      const matches = current.match(shortPattern);
+      if (matches) {
+        removed += matches.length;
+        current = current.replace(shortPattern, "[archived-child-id]");
+      }
+    }
+  }
+
+  for (const label of [ref?.nickname, ref?.title]) {
+    const value = safeString(label).trim();
+    if (value.length < 3) continue;
+    if (/^(?:agent|default|explore|debugger|critic|reviewer|worker)$/i.test(value)) continue;
+    const pattern = new RegExp(`\\b${escapeRegExpLiteral(value)}\\b`, "g");
+    const matches = current.match(pattern);
+    if (!matches) continue;
+    removed += matches.length;
+    current = current.replace(pattern, "[archived-child]");
+  }
+  for (const legacyPlaceholder of ["stale-closed-agent", "stale-closed-handle"]) {
+    const matches = current.match(new RegExp(escapeRegExpLiteral(legacyPlaceholder), "g"));
+    if (!matches) continue;
+    removed += matches.length;
+    current = current.split(legacyPlaceholder).join("[archived-child]");
+  }
+  return { text: current, removed };
+}
+
+function scrubNativeDisplayNameContextText(text) {
+  let current = safeString(text);
+  let removed = 0;
+  const placeholder = "[removed-native-display-label]";
+  const replace = (pattern) => {
+    current = current.replace(pattern, () => {
+      removed += 1;
+      return placeholder;
+    });
+  };
+  const replaceValue = (pattern) => {
+    current = current.replace(pattern, (...args) => {
+      const groups = args.at(-1);
+      removed += 1;
+      if (groups && typeof groups === "object" && Object.hasOwn(groups, "prefix")) {
+        return `${groups.prefix}${placeholder}${groups.suffix ?? ""}`;
+      }
+      return placeholder;
+    });
+  };
+  const nativeRolePattern = "(?:explore|debugger|verifier|test-engineer|critic|code-reviewer|architect|researcher|executor|dependency-expert|default)";
+  replaceValue(/(?<prefix>"(?:nickname|agent_nickname)"\s*:\s*")(?<value>[^"\n\r]{1,160})(?<suffix>")/gi);
+  replaceValue(/(?<prefix>'(?:nickname|agent_nickname)'\s*:\s*')(?<value>[^'\n\r]{1,160})(?<suffix>')/gi);
+  replaceValue(/(?<prefix>\\+"(?:nickname|agent_nickname)\\+"\s*:\s*\\+")(?<value>[^"\\\n\r]{1,160})(?<suffix>\\+")/gi);
+  replaceValue(/(?<prefix>\b(?:nickname|agent_nickname)=)(?<value>[^\s,|)]{1,160})/gi);
+  replace(/(?:正在关闭|无法关闭|已关闭|关闭失败|已创建|创建中|创建失败)\s*(?:(?:正在关闭|无法关闭|已关闭|关闭失败|已创建|创建中|创建失败)\s*)?\d+\s*个智能体/gi);
+  replace(/当前父会话里还有\s*\d+\s*个旧\s*subagent\s*槽位/gi);
+  replace(new RegExp(`(?:正在关闭|无法关闭|已关闭|关闭失败|创建中|已创建|创建失败)[^\\n\\r]{0,220}\\s+[^\\n\\r"'\\\`{}[\\]]+?\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  replace(new RegExp(`(?:正在关闭|无法关闭|已关闭|关闭失败|创建中|已创建|创建失败)[^\\n\\r]{0,220}\\s+\\[archived-child\\]\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  replace(new RegExp(`\\b(?:closing|closed|close failed|creating|created|spawn failed)\\b[^\\n\\r]{0,220}\\s+[^\\n\\r"'\\\`{}[\\]]+?\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  replace(/\bAgent\s+"[^"\n\r]{1,160}"\s+(?:completed|failed|canceled|cancelled)\b/gi);
+  replace(/\bAgent\s+\\+"[^"\\\n\r]{1,160}\\+"\s+(?:completed|failed|canceled|cancelled)\b/gi);
+  current = current.replace(/(\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\s*)[A-Z][A-Za-z0-9_. -]{1,80}(?=(?:\\n|\n|\\r|\r|<))/gi, (match, prefix) => {
+    removed += 1;
+    return `${prefix}${placeholder}`;
+  });
+  current = current.replace(/(^|\\n|\\r|[^A-Za-z])([A-Z][A-Za-z0-9_. -]{1,80})\s+(review\b|在审|还没返回|已关闭|返回了|查|的[^\\\n\r]{0,60}?返回)/g, (match, prefix, label) => {
+    const value = safeString(label).trim();
+    if (value.length < 5 || /^(?:This|That|Current|Code|No|Test|Review)$/i.test(value)) return match;
+    removed += 1;
+    return `${prefix}${placeholder}`;
+  });
+  replace(/\b[A-Za-z][A-Za-z0-9_. -]{1,80}\s*又在被关闭/gi);
+  replace(new RegExp(`\\[archived-child\\]\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  replace(new RegExp(`\\b(?!019[0-9a-f-]{20,}\\b)[A-Za-z][A-Za-z0-9_. -]{1,80}\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  return { text: current, removed };
+}
+
+function nativeDisplayLabelsFromContextText(text) {
+  const source = safeString(text);
+  const labels = new Set();
+  const nativeRolePattern = "(?:explore|debugger|verifier|test-engineer|critic|code-reviewer|architect|researcher|executor|dependency-expert|default)";
+  const patterns = [
+    /"(?:nickname|agent_nickname)"\s*:\s*"([^"\n\r]{1,160})"/gi,
+    /'(?:nickname|agent_nickname)'\s*:\s*'([^'\n\r]{1,160})'/gi,
+    /\\+"(?:nickname|agent_nickname)\\+"\s*:\s*\\+"([^"\\\n\r]{1,160})\\+"/gi,
+    /\b(?:nickname|agent_nickname)=([^\s,|)]{1,160})/gi,
+    new RegExp(`(?:正在关闭|无法关闭|已关闭|关闭失败|创建中|已创建|创建失败)[^\\n\\r]{0,220}?\\b([A-Z][A-Za-z0-9_. -]{1,80})\\s*\\(${nativeRolePattern}\\)`, "gi"),
+    new RegExp(`\\b(?:closing|closed|close failed|creating|created|spawn failed)\\b[^\\n\\r]{0,220}?\\b([A-Z][A-Za-z0-9_. -]{1,80})\\s*\\(${nativeRolePattern}\\)`, "gi"),
+    /(^|\\n|\\r|[^A-Za-z])([A-Z][A-Za-z0-9_. -]{1,80})\s+(?:review\b|在审|还没返回|已关闭|返回了|查|的[^\\\n\r]{0,60}?返回)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const value = safeString(match[2] ?? match[1]).trim();
+      if (value.length < 3) continue;
+      if (/^(?:agent|default|explore|debugger|critic|reviewer|worker|current|review|code|test|archived-[0-9a-f]{8})$/i.test(value)) continue;
+      labels.add(value);
+    }
+  }
+  return [...labels];
+}
+
+function scrubNativeDisplayLabelsFromText(text, labels) {
+  let current = safeString(text);
+  let removed = 0;
+  for (const label of labels ?? []) {
+    const value = safeString(label).trim();
+    if (value.length < 3) continue;
+    const pattern = new RegExp(`\\b${escapeRegExpLiteral(value)}\\b`, "g");
+    const matches = current.match(pattern);
+    if (!matches) continue;
+    removed += matches.length;
+    current = current.replace(pattern, "[archived-child]");
+  }
+  return { text: current, removed };
+}
+
+function scrubHistoricalNativeAgentIdContextText(text) {
+  let current = safeString(text);
+  let removed = 0;
+  const placeholder = "[removed-native-agent-id]";
+  const replaceValue = (pattern) => {
+    current = current.replace(pattern, (...args) => {
+      const groups = args.at(-1);
+      removed += 1;
+      if (groups && typeof groups === "object" && Object.hasOwn(groups, "prefix")) {
+        return `${groups.prefix}${placeholder}${groups.suffix ?? ""}`;
+      }
+      return placeholder;
+    });
+  };
+  const idKeys = "agent_id|child_thread_id|close_target_id";
+  replaceValue(new RegExp(`(?<prefix>"(?:${idKeys})"\\s*:\\s*")(?<value>[^"\\n\\r]{1,180})(?<suffix>")`, "gi"));
+  replaceValue(new RegExp(`(?<prefix>'(?:${idKeys})'\\s*:\\s*')(?<value>[^'\\n\\r]{1,180})(?<suffix>')`, "gi"));
+  replaceValue(new RegExp(`(?<prefix>\\\\+"(?:${idKeys})\\\\+"\\s*:\\s*\\\\+")(?<value>[^"\\\\\\n\\r]{1,180})(?<suffix>\\\\+")`, "gi"));
+  replaceValue(new RegExp(`(?<prefix>\\b(?:${idKeys})=)(?<value>[^\\s,|)]{1,180})`, "gi"));
+  return { text: current, removed };
+}
+
+function scrubNativeDisplayContextText(text) {
+  let current = safeString(text);
+  let removed = 0;
+  const displayLabels = nativeDisplayLabelsFromContextText(current);
+  const bareLabelScrub = scrubNativeDisplayLabelsFromText(current, displayLabels);
+  current = bareLabelScrub.text;
+  removed += bareLabelScrub.removed;
+  const displayScrub = scrubNativeDisplayNameContextText(current);
+  current = displayScrub.text;
+  removed += displayScrub.removed;
+  const historicalIdScrub = scrubHistoricalNativeAgentIdContextText(current);
+  current = historicalIdScrub.text;
+  removed += historicalIdScrub.removed;
+  const removedLabelScrub = scrubRemovedNativeDisplayLabelText(current);
+  current = removedLabelScrub.text;
+  removed += removedLabelScrub.removed;
+  return { text: current, removed };
+}
+
+function scrubPromptHistoryNativeAgentStatusText(text) {
+  let current = safeString(text);
+  let removed = 0;
+  const placeholder = "[removed-native-agent-status]";
+  const nativeRolePattern = "(?:explore|debugger|verifier|test-engineer|critic|code-reviewer|architect|researcher|executor|dependency-expert|default)";
+  const replace = (pattern) => {
+    current = current.replace(pattern, () => {
+      removed += 1;
+      return placeholder;
+    });
+  };
+  replace(new RegExp(`(?:正在关闭|无法关闭|已关闭|关闭失败|创建中|已创建|创建失败)\\s*(?:(?:正在关闭|无法关闭|已关闭|关闭失败|创建中|已创建|创建失败)\\s*)?\\d+\\s*个智能体(?:[^\\n\\r]{0,220}?\\s+[^\\n\\r"'\\\`{}[\\]]+?\\s*\\(${nativeRolePattern}\\))?`, "gi"));
+  replace(new RegExp(`\\b(?:closing|closed|close failed|creating|created|spawn failed)\\b[^\\n\\r]{0,220}?\\s+[^\\n\\r"'\\\`{}[\\]]+?\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  replace(new RegExp(`\\bThe\\s+(?:verifier|reviewer|critic|debugger|explorer|agent|sidecar)\\b[^\\n\\r]{0,320}\\bclosing\\s+it\\s+now\\b[^\\n\\r]{0,320}`, "gi"));
+  replace(/\bI(?:'m| am)\s+closing\s+it\s+now\b[^\n\r]{0,320}/gi);
+  replace(/\bclosing\s+it\s+now\s+rather\s+than\s+holding\b[^\n\r]{0,320}/gi);
+  replace(new RegExp(`(?:已使用以下指令创建|使用以下指令创建)\\s+\\[archived-child\\]\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  replace(new RegExp(`\\[archived-child\\]\\s*\\(${nativeRolePattern}\\)`, "gi"));
+  return { text: current, removed };
+}
+
+function scrubCodexGlobalStateNativeStatusObject(value) {
+  let removed = 0;
+  const scrubEntry = (entry) => {
+    let text = safeString(entry);
+    const displayScrub = scrubNativeDisplayContextText(text);
+    text = displayScrub.text;
+    removed += displayScrub.removed;
+    const statusScrub = scrubPromptHistoryNativeAgentStatusText(text);
+    text = statusScrub.text;
+    removed += statusScrub.removed;
+    return text;
+  };
+  const walk = (node) => {
+    if (Array.isArray(node)) {
+      for (let index = 0; index < node.length; index += 1) {
+        if (typeof node[index] === "string") {
+          node[index] = scrubEntry(node[index]);
+        } else {
+          walk(node[index]);
+        }
+      }
+      return;
+    }
+    if (!node || typeof node !== "object") return;
+    for (const [key, child] of Object.entries(node)) {
+      if (typeof child === "string") {
+        node[key] = scrubEntry(child);
+      } else {
+        walk(child);
+      }
+    }
+  };
+  walk(value);
+  return { value, removed };
 }
 
 function parseSqliteJsonOutput(stdout) {
@@ -922,6 +1352,15 @@ function parseSqliteJsonOutput(stdout) {
     }
   }
   return [];
+}
+
+function sqliteChangedCount(stdout) {
+  const rows = parseSqliteJsonOutput(stdout);
+  for (const row of Array.isArray(rows) ? rows.slice().reverse() : []) {
+    const changed = Number(row?.changed ?? row?.["changes()"] ?? row?.["changes"]);
+    if (Number.isFinite(changed)) return changed;
+  }
+  return 0;
 }
 
 async function transcriptHasTaskComplete(path) {
@@ -1048,6 +1487,19 @@ async function repairClosedNativeEdgeIds(parentThreadId, closedIds) {
   }
 }
 
+async function repairClosedNativeEdgeRefs(parentThreadId, refs) {
+  const targets = [...(refs ?? [])]
+    .map((ref) => safeString(ref).trim())
+    .filter(Boolean)
+    .slice(0, NATIVE_EDGE_REPAIR_BATCH);
+  const parentId = safeString(parentThreadId).trim();
+  if (targets.length === 0 || !parentId) return new Set();
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return new Set();
+
+  return await repairClosedNativeEdgeIds(parentId, targets);
+}
+
 async function repairUniqueMissingNativeEdgeIds(closedIds) {
   const ids = [...(closedIds ?? [])].filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
   if (ids.length === 0) return new Map();
@@ -1099,7 +1551,7 @@ async function repairUniqueMissingNativeEdgeIds(closedIds) {
       timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
       maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
     });
-    const changed = Number(parseSqliteJsonOutput(stdout)?.[0]?.changed ?? 0);
+    const changed = sqliteChangedCount(stdout);
     if (changed <= 0) return new Map();
 
     const repaired = new Map(uniquePairs);
@@ -1119,17 +1571,38 @@ async function repairUniqueMissingNativeEdgeIds(closedIds) {
   }
 }
 
+function archivedThreadSetParts(threadColumns) {
+  const parts = ["archived=1"];
+  if (threadColumns.has("title") && threadColumns.has("agent_nickname")) {
+    parts.push("title=case when title=agent_nickname then 'archived child ' || substr(id,1,8) else title end");
+  }
+  if (threadColumns.has("agent_nickname")) {
+    parts.push("agent_nickname='archived-' || substr(id,1,8)");
+  }
+  if (threadColumns.has("source")) {
+    parts.push("source=case when json_valid(source) and json_extract(source,'$.subagent.thread_spawn.agent_nickname') is not null then json_set(source,'$.subagent.thread_spawn.agent_nickname','archived-' || substr(id,1,8)) else source end");
+  }
+  if (threadColumns.has("archived_at")) {
+    parts.push("archived_at=coalesce(archived_at, cast(strftime('%s','now') as integer))");
+  }
+  return parts;
+}
+
 async function archiveNativeChildThreadIds(childIds, reason = "closed_edge") {
   const ids = [...(childIds ?? [])].map((id) => safeString(id).trim()).filter(Boolean).slice(0, NATIVE_EDGE_REPAIR_BATCH);
   if (ids.length === 0) return 0;
   const dbPath = stateDbPath();
   if (!existsSync(dbPath)) return 0;
 
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("archived")) return 0;
+  const setParts = archivedThreadSetParts(threadColumns);
+
   const sql = [
     "pragma busy_timeout=250;",
     "update threads",
-    "set archived=1, archived_at=coalesce(archived_at, cast(strftime('%s','now') as integer))",
-    "where archived=0",
+    `set ${setParts.join(", ")}`,
+    "where coalesce(archived,0)=0",
     `and id in (${ids.map(sqlString).join(",")})`,
     "and id not in (select child_thread_id from thread_spawn_edges where status='open');",
     "select changes() as changed;",
@@ -1140,7 +1613,7 @@ async function archiveNativeChildThreadIds(childIds, reason = "closed_edge") {
       timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
       maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
     });
-    const changed = Number(parseSqliteJsonOutput(stdout)?.[0]?.changed ?? 0);
+    const changed = sqliteChangedCount(stdout);
     if (changed > 0) {
       await appendAdvisorLog({
         event: "native_child_thread_archive",
@@ -1183,10 +1656,324 @@ async function applyMissingCloseEvidence(parentThreadId, transcriptPool, nativeT
   return repairedIds.size;
 }
 
+async function applyStaleCloseRequestEvidence(parentThreadId, transcriptPool, nativeThreadEdges, nowMs) {
+  const parentId = safeString(parentThreadId).trim();
+  if (!parentId || !(transcriptPool?.closeRequested instanceof Map)) return 0;
+  const ids = [];
+  for (const [id, requestedAtMs] of transcriptPool.closeRequested.entries()) {
+    if (!id || !Number.isFinite(requestedAtMs) || requestedAtMs <= 0) continue;
+    if (nowMs - requestedAtMs < NATIVE_CLOSE_REQUEST_GRACE_MS) continue;
+    if (nativeThreadEdges?.closed?.has(id)) continue;
+    if (!(nativeThreadEdges?.active?.has(id) || nativeThreadEdges?.terminal?.has(id))) continue;
+    ids.push(id);
+    if (ids.length >= NATIVE_EDGE_REPAIR_BATCH) break;
+  }
+  if (ids.length === 0) return 0;
+
+  const repairedIds = await repairClosedNativeEdgeIds(parentId, ids);
+  for (const id of repairedIds) {
+    nativeThreadEdges?.active?.delete(id);
+    nativeThreadEdges?.terminal?.delete(id);
+    nativeThreadEdges?.closed?.add(id);
+  }
+  if (repairedIds.size > 0) {
+    await appendAdvisorLog({
+      event: "native_edge_stale_close_request_repair",
+      parent_thread_id: parentId,
+      requested: ids.length,
+      changed: repairedIds.size,
+      grace_seconds: Math.floor(NATIVE_CLOSE_REQUEST_GRACE_MS / 1000),
+    });
+  }
+  return repairedIds.size;
+}
+
 async function maintainNativePoolStorage(state, nowMs, nowIso) {
   const last = msFromIso(state.last_native_edge_maintenance_at);
   if (last && nowMs - last < NATIVE_EDGE_MAINTENANCE_TTL_MS) return;
+  const unarchivedOpenThreads = await unarchiveOpenNativeEdgeThreads();
+  const archivedClosedThreads = await archiveClosedNativeEdgeThreads();
+  const archivedOrphanVisibleThreads = await archiveStaleOrphanVisibleNativeChildThreads(nowMs);
+  const prunedClosedEdges = await pruneClosedNativeEdges(nowMs);
   state.last_native_edge_maintenance_at = nowIso;
+  if (unarchivedOpenThreads > 0) {
+    state.last_native_open_edge_unarchive_at = nowIso;
+    state.last_native_open_edge_unarchive_count = unarchivedOpenThreads;
+  }
+  if (archivedClosedThreads > 0) {
+    state.last_native_edge_closed_archive_at = nowIso;
+    state.last_native_edge_closed_archive_count = archivedClosedThreads;
+  }
+  if (archivedOrphanVisibleThreads > 0) {
+    state.last_native_orphan_visible_archive_at = nowIso;
+    state.last_native_orphan_visible_archive_count = archivedOrphanVisibleThreads;
+  }
+  if (prunedClosedEdges > 0) {
+    state.last_native_edge_closed_prune_at = nowIso;
+    state.last_native_edge_closed_prune_count = prunedClosedEdges;
+  }
+}
+
+async function sqliteTableColumns(dbPath, tableName) {
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, `pragma table_info(${tableName});`], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(stdout);
+    return new Set((Array.isArray(rows) ? rows : []).map((row) => safeString(row?.name).trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+async function pruneClosedNativeEdges(nowMs) {
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return 0;
+
+  const cutoffSeconds = Math.floor((nowMs - closedEdgeRetentionMs()) / 1000);
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  const hasArchivedAt = threadColumns.has("archived_at");
+  const hasUpdatedAt = threadColumns.has("updated_at");
+  const ageCondition = hasArchivedAt
+    ? `(t.id is null or (coalesce(t.archived_at,0)>0 and t.archived_at<${cutoffSeconds}))`
+    : hasUpdatedAt
+    ? `(t.id is null or (coalesce(t.updated_at,0)>0 and t.updated_at<${cutoffSeconds}))`
+    : "t.id is null";
+  const sql = [
+    "pragma busy_timeout=250;",
+    "create index if not exists idx_thread_spawn_edges_status_child on thread_spawn_edges(status,child_thread_id);",
+    "delete from thread_spawn_edges",
+    "where child_thread_id in (",
+    "select e.child_thread_id",
+    "from thread_spawn_edges e",
+    "left join threads t on t.id=e.child_thread_id",
+    "where e.status='closed'",
+    `and ${ageCondition}`,
+    `limit ${NATIVE_EDGE_CLOSED_PRUNE_BATCH}`,
+    ");",
+    "select changes() as changed;",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = sqliteChangedCount(stdout);
+    if (changed > 0) {
+      await appendAdvisorLog({
+        event: "native_closed_edge_prune",
+        changed,
+        cutoff_seconds: cutoffSeconds,
+        retention_hours: Math.floor(closedEdgeRetentionMs() / (60 * 60 * 1000)),
+      });
+    }
+    return Number.isFinite(changed) ? changed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function archiveClosedNativeEdgeThreads() {
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return 0;
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("archived")) return 0;
+
+  const setParts = archivedThreadSetParts(threadColumns);
+  const sql = [
+    "pragma busy_timeout=250;",
+    "create index if not exists idx_thread_spawn_edges_status_child on thread_spawn_edges(status,child_thread_id);",
+    "update threads",
+    `set ${setParts.join(", ")}`,
+    "where coalesce(archived,0)=0",
+    "and id in (",
+    "select child_thread_id from thread_spawn_edges",
+    "where status='closed'",
+    `limit ${NATIVE_EDGE_CLOSED_PRUNE_BATCH}`,
+    ");",
+    "select changes() as changed;",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = sqliteChangedCount(stdout);
+    if (changed > 0) {
+      await appendAdvisorLog({
+        event: "native_closed_edge_thread_archive",
+        changed,
+      });
+    }
+    return Number.isFinite(changed) ? changed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function unarchiveOpenNativeEdgeThreads(parentThreadId = "") {
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return 0;
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("archived")) return 0;
+
+  const setParts = ["archived=0"];
+  if (threadColumns.has("archived_at")) {
+    setParts.push("archived_at=null");
+  }
+  const parentClause = parentThreadId
+    ? `and e.parent_thread_id=${sqlString(parentThreadId)}`
+    : "";
+  const sql = [
+    "pragma busy_timeout=250;",
+    "create index if not exists idx_thread_spawn_edges_status_child on thread_spawn_edges(status,child_thread_id);",
+    "update threads",
+    `set ${setParts.join(", ")}`,
+    "where coalesce(archived,0)=1",
+    "and id in (",
+    "select e.child_thread_id from thread_spawn_edges e",
+    "where e.status='open'",
+    parentClause,
+    ");",
+    "select changes() as changed;",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = sqliteChangedCount(stdout);
+    if (changed > 0) {
+      await appendAdvisorLog({
+        event: "native_open_edge_thread_unarchive",
+        parent_thread_id: parentThreadId || null,
+        changed,
+      });
+    }
+    return Number.isFinite(changed) ? changed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function archiveStaleOrphanVisibleNativeChildThreads(nowMs) {
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return 0;
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("archived")) return 0;
+  if (!threadColumns.has("source") && !threadColumns.has("thread_source")) return 0;
+
+  const cutoffSeconds = Math.floor((nowMs - orphanVisibleRetentionMs()) / 1000);
+  const hasArchivedAt = threadColumns.has("archived_at");
+  const hasUpdatedAt = threadColumns.has("updated_at");
+  const hasSource = threadColumns.has("source");
+  const hasThreadSource = threadColumns.has("thread_source");
+  const setParts = archivedThreadSetParts(threadColumns);
+  const sourcePredicates = [];
+  if (hasThreadSource) sourcePredicates.push("thread_source='subagent'");
+  if (hasSource) sourcePredicates.push("source like '%\"parent_thread_id\"%'");
+  const ageCondition = hasUpdatedAt ? `coalesce(updated_at,0)>0 and updated_at<${cutoffSeconds}` : "0";
+  const sql = [
+    "pragma busy_timeout=250;",
+    "create index if not exists idx_thread_spawn_edges_status_child on thread_spawn_edges(status,child_thread_id);",
+    "update threads",
+    `set ${setParts.join(", ")}`,
+    "where coalesce(archived,0)=0",
+    `and (${sourcePredicates.join(" or ")})`,
+    `and ${ageCondition}`,
+    "and not exists (",
+    "select 1 from thread_spawn_edges e",
+    "where e.child_thread_id=threads.id",
+    ");",
+    "select changes() as changed;",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = sqliteChangedCount(stdout);
+    if (changed > 0) {
+      await appendAdvisorLog({
+        event: "native_orphan_visible_thread_archive",
+        changed,
+        cutoff_seconds: cutoffSeconds,
+        retention_hours: Math.floor(orphanVisibleRetentionMs() / (60 * 60 * 1000)),
+      });
+    }
+    return Number.isFinite(changed) ? changed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function repairStaleOpenNativeEdges(parentThreadId, nowMs) {
+  const retentionMs = staleOpenEdgeRetentionMs();
+  const parentId = safeString(parentThreadId).trim();
+  if (!parentId || retentionMs <= 0) return new Set();
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return new Set();
+
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("updated_at")) return new Set();
+  const cutoffSeconds = Math.floor((nowMs - retentionMs) / 1000);
+  const selectSql = [
+    "select e.child_thread_id",
+    "from thread_spawn_edges e",
+    "left join threads t on t.id=e.child_thread_id",
+    "where e.status!='closed'",
+    `and e.parent_thread_id=${sqlString(parentId)}`,
+    "and coalesce(t.updated_at,0)>0",
+    `and t.updated_at<${cutoffSeconds}`,
+    "order by t.updated_at asc",
+    `limit ${NATIVE_EDGE_REPAIR_BATCH};`,
+  ].join(" ");
+
+  try {
+    const { stdout: selectStdout } = await execFileAsync("sqlite3", ["-json", dbPath, selectSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(selectStdout);
+    const ids = new Set(
+      (Array.isArray(rows) ? rows : [])
+        .map((row) => safeString(row?.child_thread_id).trim())
+        .filter(Boolean),
+    );
+    if (ids.size === 0) return ids;
+
+    const sql = [
+      "pragma busy_timeout=250;",
+      "update thread_spawn_edges",
+      "set status='closed'",
+      "where status!='closed'",
+      `and parent_thread_id=${sqlString(parentId)}`,
+      `and child_thread_id in (${[...ids].map(sqlString).join(",")});`,
+      "select changes() as changed;",
+    ].join(" ");
+    const { stdout } = await execFileAsync("sqlite3", ["-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = sqliteChangedCount(stdout);
+    if (changed <= 0) return new Set();
+    await archiveNativeChildThreadIds(ids, "stale_open_edge_repair");
+    await appendAdvisorLog({
+      event: "native_stale_open_edge_repair",
+      parent_thread_id: parentId,
+      changed,
+      cutoff_seconds: cutoffSeconds,
+      retention_hours: Math.floor(retentionMs / (60 * 60 * 1000)),
+    });
+    return ids;
+  } catch {
+    return new Set();
+  }
 }
 
 async function discoverNativeThreadEdges(parentThreadId) {
@@ -1199,6 +1986,10 @@ async function discoverNativeThreadEdges(parentThreadId) {
     edges.failed = true;
     return edges;
   }
+
+  const staleOpenRepaired = await repairStaleOpenNativeEdges(parentThreadId, Date.now());
+  edges.repaired += staleOpenRepaired.size;
+  await unarchiveOpenNativeEdgeThreads(parentThreadId);
 
   const sql = [
     "select e.child_thread_id,e.status,t.rollout_path,t.title,t.agent_role,t.model,t.reasoning_effort,t.agent_nickname,t.cwd,t.updated_at",
@@ -1217,18 +2008,15 @@ async function discoverNativeThreadEdges(parentThreadId) {
     if (!Array.isArray(rows)) return edges;
 
     edges.checked = true;
-    const terminalRepairCandidates = [];
     for (const row of rows) {
       const childId = safeString(row?.child_thread_id).trim();
       if (!childId) continue;
       edges.lanes.set(childId, {
         id: childId,
         parent_thread_id: parentThreadId,
-        title: compactOneLine(row?.title, 72),
         role: compactOneLine(row?.agent_role, 32),
         model: compactOneLine(row?.model, 48),
         reasoning_effort: compactOneLine(row?.reasoning_effort, 16),
-        nickname: compactOneLine(row?.agent_nickname, 32),
         cwd: compactOneLine(row?.cwd, 72),
         updated_at: row?.updated_at,
       });
@@ -1237,28 +2025,306 @@ async function discoverNativeThreadEdges(parentThreadId) {
         edges.closed.add(childId);
       } else {
         if (await transcriptHasTaskComplete(safeString(row?.rollout_path).trim())) {
-          terminalRepairCandidates.push(childId);
+          edges.terminal.add(childId);
         } else {
           edges.active.add(childId);
         }
       }
     }
-    if (terminalRepairCandidates.length > 0) {
-      const repairedIds = await repairClosedNativeEdgeIds(parentThreadId, terminalRepairCandidates);
-      edges.repaired = repairedIds.size;
-      for (const childId of terminalRepairCandidates) {
-        if (repairedIds.has(childId)) {
-          edges.closed.add(childId);
-        } else {
-          edges.terminal.add(childId);
-        }
-      }
+    if (edges.closed.size > 0) {
+      edges.visible_archived += await archiveNativeChildThreadIds(edges.closed, "closed_edge_current_parent_sample");
     }
+    await discoverVisibleNativeChildThreads(parentThreadId, edges);
   } catch {
     edges.failed = true;
   }
 
   return edges;
+}
+
+async function nonOpenCurrentParentChildIds(parentThreadId) {
+  return new Set((await nonOpenCurrentParentChildRefs(parentThreadId)).map((ref) => ref.id).filter(Boolean));
+}
+
+async function nonOpenCurrentParentChildRefs(parentThreadId) {
+  const parentId = safeString(parentThreadId).trim();
+  if (!parentId) return [];
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return [];
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  const archivedExpr = threadColumns.has("archived") ? "coalesce(t.archived,0)" : "0";
+  const titleExpr = threadColumns.has("title") ? "t.title" : "null";
+  const nicknameExpr = threadColumns.has("agent_nickname") ? "t.agent_nickname" : "null";
+  const sourceTitleExpr = threadColumns.has("title") ? "title" : "null";
+  const sourceNicknameExpr = threadColumns.has("agent_nickname") ? "agent_nickname" : "null";
+  const edgeSql = [
+    `select e.child_thread_id,${titleExpr} as title,${nicknameExpr} as nickname`,
+    "from thread_spawn_edges e",
+    "left join threads t on t.id=e.child_thread_id",
+    `where e.parent_thread_id=${sqlString(parentId)}`,
+    `and (e.status!='open' or ${archivedExpr}=1)`,
+    `limit ${NATIVE_EDGE_REPAIR_BATCH};`,
+  ].join(" ");
+  const sourceSql = threadColumns.has("source") && threadColumns.has("archived")
+    ? [
+      `select id,source,${sourceTitleExpr} as title,${sourceNicknameExpr} as nickname`,
+      "from threads",
+      "where coalesce(archived,0)=1",
+      "and source like '%\"parent_thread_id\"%'",
+      `and source like ${sqlString(`%${parentId}%`)}`,
+      `limit ${NATIVE_EDGE_REPAIR_BATCH};`,
+    ].join(" ")
+    : "";
+
+  const refs = new Map();
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, edgeSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const edgeRows = parseSqliteJsonOutput(stdout);
+    for (const row of Array.isArray(edgeRows) ? edgeRows : []) {
+      const id = safeString(row?.child_thread_id).trim();
+      if (!id) continue;
+      refs.set(id, {
+        id,
+        title: safeString(row?.title).trim(),
+        nickname: safeString(row?.nickname).trim(),
+      });
+    }
+  } catch {
+    // Keep archived-source fallback available when edge sampling is temporarily unavailable.
+  }
+
+  if (sourceSql) {
+    try {
+      const { stdout: sourceStdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sourceSql], {
+        timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+        maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+      });
+      const sourceRows = parseSqliteJsonOutput(sourceStdout);
+      for (const row of Array.isArray(sourceRows) ? sourceRows : []) {
+        if (parentThreadIdFromSourceText(row?.source) !== parentId) continue;
+        const id = safeString(row?.id).trim();
+        if (!id) continue;
+        refs.set(id, {
+          id,
+          title: safeString(row?.title).trim(),
+          nickname: safeString(row?.nickname).trim(),
+        });
+      }
+    } catch {
+      // Edge rows, if present, are still useful.
+    }
+  }
+  return [...refs.values()];
+}
+
+async function nonOpenVisibleChildRefs(limit = 500) {
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return [];
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("id")) return [];
+  const archivedExpr = threadColumns.has("archived") ? "coalesce(t.archived,0)" : "0";
+  const titleExpr = threadColumns.has("title") ? "t.title" : "null";
+  const nicknameExpr = threadColumns.has("agent_nickname") ? "t.agent_nickname" : "null";
+  const sql = [
+    `select t.id,${titleExpr} as title,${nicknameExpr} as nickname`,
+    "from threads t",
+    "left join thread_spawn_edges e on e.child_thread_id=t.id",
+    `where (${archivedExpr}=1 or e.status='closed')`,
+    "order by coalesce(t.updated_at,0) desc",
+    `limit ${Math.max(1, Math.min(1000, Math.floor(Number(limit) || 500)))};`,
+  ].join(" ");
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(stdout);
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) => ({
+        id: safeString(row?.id).trim(),
+        title: safeString(row?.title).trim(),
+        nickname: safeString(row?.nickname).trim(),
+      }))
+      .filter((ref) => ref.id);
+  } catch {
+    return [];
+  }
+}
+
+function transcriptMentionedChildIdPrefixes(text) {
+  const source = safeString(text);
+  const values = new Set();
+  for (const match of source.matchAll(/\b019[0-9a-f]{5}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi)) {
+    values.add(match[0]);
+  }
+  for (const match of source.matchAll(/\b019[0-9a-f]{5}\b/gi)) {
+    values.add(`${match[0]}%`);
+  }
+  return [...values].slice(0, TRANSCRIPT_MENTIONED_CHILD_REF_QUERY_LIMIT);
+}
+
+async function nonOpenMentionedChildRefs(text) {
+  const idPatterns = transcriptMentionedChildIdPrefixes(text);
+  if (idPatterns.length === 0) return [];
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return [];
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("id")) return [];
+  const archivedExpr = threadColumns.has("archived") ? "coalesce(t.archived,0)" : "0";
+  const titleExpr = threadColumns.has("title") ? "t.title" : "null";
+  const nicknameExpr = threadColumns.has("agent_nickname") ? "t.agent_nickname" : "null";
+  const predicates = idPatterns.map((value) => value.endsWith("%")
+    ? `t.id like ${sqlString(value)}`
+    : `t.id=${sqlString(value)}`);
+  const sql = [
+    `select t.id,${titleExpr} as title,${nicknameExpr} as nickname,${archivedExpr} as archived,coalesce(e.status,'') as edge_status`,
+    "from threads t",
+    "left join thread_spawn_edges e on e.child_thread_id=t.id",
+    `where (${predicates.join(" or ")})`,
+    `and (${archivedExpr}=1 or e.status='closed')`,
+    `limit ${NATIVE_EDGE_REPAIR_BATCH};`,
+  ].join(" ");
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(stdout);
+    return (Array.isArray(rows) ? rows : [])
+      .map((row) => ({
+        id: safeString(row?.id).trim(),
+        title: safeString(row?.title).trim(),
+        nickname: safeString(row?.nickname).trim(),
+      }))
+      .filter((ref) => ref.id);
+  } catch {
+    return [];
+  }
+}
+
+function mergeChildRefs(...groups) {
+  const refs = new Map();
+  for (const group of groups) {
+    for (const ref of Array.isArray(group) ? group : []) {
+      const id = safeString(ref?.id).trim();
+      if (!id || refs.has(id)) continue;
+      refs.set(id, {
+        id,
+        title: safeString(ref?.title).trim(),
+        nickname: safeString(ref?.nickname).trim(),
+      });
+    }
+  }
+  return [...refs.values()];
+}
+
+async function sanitizeTranscriptSubagentContext(transcript, parentThreadId, reason = "maintenance") {
+  const path = safeString(transcript).trim();
+  if (!path || !safeString(parentThreadId).trim()) return 0;
+
+  try {
+    const stats = await stat(path);
+    if (stats.size > TRANSCRIPT_SUBAGENT_CONTEXT_SANITIZE_MAX_BYTES) {
+      await appendAdvisorLog({
+        event: "transcript_subagent_context_sanitize_skipped",
+        reason: "file_too_large",
+        transcript: path,
+        size: stats.size,
+      });
+      return 0;
+    }
+
+    let text = await readFile(path, "utf-8");
+    let removed = 0;
+    const displayScrub = scrubNativeDisplayNameContextText(text);
+    text = displayScrub.text;
+    removed += displayScrub.removed;
+    const historicalIdScrub = scrubHistoricalNativeAgentIdContextText(text);
+    text = historicalIdScrub.text;
+    removed += historicalIdScrub.removed;
+    const staleRefs = mergeChildRefs(
+      await nonOpenCurrentParentChildRefs(parentThreadId),
+      await nonOpenMentionedChildRefs(text),
+    );
+    for (const ref of staleRefs) {
+      const lineResult = removeSubagentContextLine(text, ref.id);
+      text = lineResult.text;
+      removed += lineResult.removed;
+      const scrubResult = scrubNonOpenChildReferenceText(text, ref);
+      text = scrubResult.text;
+      removed += scrubResult.removed;
+    }
+    if (removed <= 0) return 0;
+    await writeFile(path, text, "utf-8");
+    await appendAdvisorLog({
+      event: "transcript_subagent_context_sanitize",
+      reason,
+      parent_thread_id: parentThreadId,
+      removed,
+    });
+    return removed;
+  } catch {
+    return 0;
+  }
+}
+
+function shouldSanitizeTranscriptSubagentContext(eventName, session, nowMs) {
+  if (eventName === "PostCompact") return true;
+  if (eventName !== "SessionStart" && eventName !== "UserPromptSubmit") return false;
+  const lastMs = msFromIso(session?.last_subagent_context_sanitize_at);
+  return !lastMs || nowMs - lastMs >= TRANSCRIPT_SUBAGENT_CONTEXT_SANITIZE_TTL_MS;
+}
+
+async function discoverVisibleNativeChildThreads(parentThreadId, edges) {
+  const parentId = safeString(parentThreadId).trim();
+  if (!parentId) return 0;
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return 0;
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("source") || !threadColumns.has("archived")) return 0;
+
+  const sql = [
+    "select id,title,agent_role,model,reasoning_effort,agent_nickname,cwd,updated_at,source",
+    "from threads",
+    "where coalesce(archived,0)=0",
+    "and source like '%\"parent_thread_id\"%'",
+    `and source like ${sqlString(`%${parentId}%`)}`,
+    "order by coalesce(updated_at,0) desc",
+    "limit 200;",
+  ].join(" ");
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(stdout);
+    edges.visible_checked = true;
+    if (!Array.isArray(rows)) return 0;
+    for (const row of rows) {
+      if (parentThreadIdFromSourceText(row?.source) !== parentId) continue;
+      const childId = safeString(row?.id).trim();
+      if (!childId) continue;
+      edges.visible.add(childId);
+      if (!edges.lanes.has(childId)) {
+        edges.lanes.set(childId, {
+          id: childId,
+          parent_thread_id: parentId,
+          role: compactOneLine(row?.agent_role, 32),
+          model: compactOneLine(row?.model, 48),
+          reasoning_effort: compactOneLine(row?.reasoning_effort, 16),
+          cwd: compactOneLine(row?.cwd, 72),
+          updated_at: row?.updated_at,
+        });
+      }
+    }
+    return edges.visible.size;
+  } catch {
+    return 0;
+  }
 }
 
 async function findRecentTranscriptByThreadId(threadId, nowMs, preferredPath = "") {
@@ -1296,6 +2362,459 @@ async function findRecentTranscriptByThreadId(threadId, nowMs, preferredPath = "
   return "";
 }
 
+function mentionedThreadIds(text, limit = 16) {
+  const raw = safeString(text);
+  if (!raw) return [];
+  const ids = [];
+  const seen = new Set();
+  const regex = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+  for (const match of raw.matchAll(regex)) {
+    const id = safeString(match[0]).trim();
+    const normalized = id.toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    ids.push(id);
+    if (ids.length >= limit) break;
+  }
+  return ids;
+}
+
+async function lookupMentionedThreadIds(ids, currentParentId = "") {
+  const targets = [...(ids ?? [])].map((id) => safeString(id).trim()).filter(Boolean).slice(0, 16);
+  if (targets.length === 0) return [];
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) {
+    return targets.map((id) => ({ id, found: false, status: "db_unavailable" }));
+  }
+  const parentId = safeString(currentParentId).trim();
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  const archivedExpr = threadColumns.has("archived") ? "coalesce(t.archived,0) as archived" : "0 as archived";
+  const sql = [
+    `select t.id,t.agent_role,t.model,${archivedExpr},e.parent_thread_id as edge_parent_thread_id,e.status as edge_status`,
+    "from threads t",
+    "left join thread_spawn_edges e on e.child_thread_id=t.id",
+    `where t.id in (${targets.map(sqlString).join(",")})`,
+    "order by t.updated_at desc,edge_status desc;",
+  ].join(" ");
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(stdout);
+    const byId = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const id = safeString(row?.id).trim();
+      if (!id) continue;
+      const item = {
+        id,
+        found: true,
+        parent_thread_id: safeString(row?.edge_parent_thread_id ?? row?.parent_thread_id).trim(),
+        status: safeString(row?.edge_status ?? row?.status).trim().toLowerCase() || "no_edge",
+        archived: Number(row?.archived ?? 0) === 1,
+        role: compactOneLine(row?.agent_role, 24),
+        model: compactOneLine(row?.model, 36),
+      };
+      const current = byId.get(id);
+      const itemIsCurrentOpen = parentId && item.parent_thread_id === parentId && item.status === "open" && !item.archived;
+      const currentIsCurrentOpen = current
+        && parentId
+        && current.parent_thread_id === parentId
+        && current.status === "open"
+        && !current.archived;
+      if (!current || (itemIsCurrentOpen && !currentIsCurrentOpen)) byId.set(id, item);
+    }
+    return targets.map((id) => byId.get(id) ?? { id, found: false, status: "unknown" });
+  } catch {
+    return targets.map((id) => ({ id, found: false, status: "db_query_failed" }));
+  }
+}
+
+function buildMentionedThreadIdAudit(rows, currentParentId) {
+  const parentId = safeString(currentParentId).trim();
+  const warnings = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const id = safeString(row?.id).trim();
+    if (!id) continue;
+    const status = safeString(row?.status).trim().toLowerCase();
+    const parent = safeString(row?.parent_thread_id).trim();
+    const archived = Boolean(row?.archived);
+    const found = Boolean(row?.found);
+    const wrongParent = Boolean(parentId && parent && parent !== parentId);
+    const notCurrentOpen = !found || archived || status !== "open" || wrongParent;
+    if (!notCurrentOpen) continue;
+    const details = [
+      "id=[not-current-agent-id]",
+      `status=${status || "unknown"}`,
+      `archived=${archived ? "1" : "0"}`,
+    ];
+    if (parent) details.push(`parent=${wrongParent ? "[different-parent]" : "[current-parent]"}`);
+    if (row?.role) details.push(`role=${compactOneLine(row.role, 24)}`);
+    if (row?.model) details.push(`model=${compactOneLine(row.model, 36)}`);
+    warnings.push(details.join(" "));
+  }
+  if (warnings.length === 0) return "";
+  return [
+    `MENTIONED_AGENT_ID_STATUS_AUDIT=${warnings.length}.`,
+    warnings.map((item) => `MENTIONED_AGENT_ID_NOT_CURRENT(${item})`).join(" | "),
+    "Do not close, reuse, or count these mentioned ids as current open lanes unless a fresh runtime close/list result proves they are active. Use the current parent/session capacity snapshot and LANES_OPEN inventory instead.",
+  ].join(" ");
+}
+
+function promptLooksLikeQuotedCloseStatus(prompt) {
+  const text = safeString(prompt);
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  const hasCloseStatusVerb = /正在关闭|无法关闭|被关闭|关闭中|closing|being closed|close in progress/.test(normalized);
+  if (!hasCloseStatusVerb) return false;
+  const hasNativeAgentSurface = /智能体|agent|subagent|close_agent|spawn_agent|wait_agent/.test(normalized);
+  const hasRoleLabel = /\((?:explore|debugger|verifier|test-engineer|critic|code-reviewer|architect|researcher|executor|dependency-expert|default)\)/i.test(text);
+  const hasUiProgressCount = /正在关闭\s*\d+\s*个智能体/.test(text);
+  return hasNativeAgentSurface || hasRoleLabel || hasUiProgressCount;
+}
+
+function removedNativeDisplayLabel() {
+  return "[removed" + "-native-display-label]";
+}
+
+function scrubRemovedNativeDisplayLabelText(text) {
+  const source = safeString(text);
+  const needle = removedNativeDisplayLabel();
+  const replacement = "[removed native close-status display label]";
+  let current = source;
+  let removed = 0;
+  current = current.replace(/\\+\[removed native close-status display label\]/g, () => {
+    removed += 1;
+    return replacement;
+  });
+  current = current.replace(/\\+\[removed-native-display-label\]/g, () => {
+    removed += 1;
+    return replacement;
+  });
+  if (!current.includes(needle)) return { text: current, removed };
+  const needleCount = current.split(needle).length - 1;
+  return {
+    text: current.split(needle).join(replacement),
+    removed: removed + needleCount,
+  };
+}
+
+function buildQuotedCloseStatusGuard(prompt, summary) {
+  if (!promptLooksLikeQuotedCloseStatus(prompt)) return "";
+  const candidates = closeCandidateTargets(summary);
+  const candidateText = candidates.length > 0
+    ? `CURRENT_PARENT_CLOSE_CANDIDATES=${candidates.join(",")}.`
+    : "CURRENT_PARENT_CLOSE_CANDIDATES=none.";
+  return [
+    "QUOTED_CLOSE_STATUS_IS_NOT_AGENT_INVENTORY=true.",
+    "The user prompt appears to quote or report a native close-status UI line; do not treat any quoted status text as current subagent inventory.",
+    "Never derive a close_agent target from a quoted display name, nickname, title, role, or parenthesized label.",
+    "Only an exact current-parent open thread id from fresh runtime/DB inventory is a valid close_agent target.",
+    candidateText,
+    candidates.length > 0
+      ? "If capacity recovery is actually needed, close only listed current-parent completed_not_closed candidates by id, then resample."
+      : "No current-parent completed_not_closed close candidate is listed; do not close anything based on the quoted status text.",
+  ].join(" ");
+}
+
+async function sanitizeTranscriptRemovedNativeDisplayLabel(transcript, reason = "prompt_context") {
+  const path = safeString(transcript).trim();
+  if (!path) return 0;
+  try {
+    const stats = await stat(path);
+    if (stats.size > TRANSCRIPT_SUBAGENT_CONTEXT_SANITIZE_MAX_BYTES) {
+      return await sanitizeLargeNativeDisplayContextFile(path, stats, reason);
+    }
+    let text = await readFile(path, "utf-8");
+    const scrub = scrubNativeDisplayContextText(text);
+    text = scrub.text;
+    const removed = scrub.removed;
+    if (removed <= 0) return 0;
+    await writeFile(path, text, "utf-8");
+    await appendAdvisorLog({
+      event: "removed_native_display_label_transcript_sanitize",
+      reason,
+      transcript: path,
+      removed,
+    });
+    return removed;
+  } catch {
+    return 0;
+  }
+}
+
+async function sanitizeLargeNativeDisplayContextFile(path, stats, reason = "prompt_context") {
+  if (!path || !stats || stats.size > TRANSCRIPT_SUBAGENT_CONTEXT_STREAM_MAX_BYTES) return 0;
+  if (!shouldStreamLargeTranscriptSanitize()) {
+    await appendAdvisorLog({
+      event: "large_transcript_native_display_sanitize_skipped",
+      reason,
+      transcript: path,
+      bytes: stats.size,
+      requires_env: "NATIVE_AGENT_POOL_FORCE_LARGE_TRANSCRIPT_SANITIZE=1",
+    });
+    return 0;
+  }
+  let tail = "";
+  try {
+    tail = await readFileTail(path, Math.min(TRANSCRIPT_TAIL_BYTES, stats.size));
+  } catch {
+    return 0;
+  }
+  if (scrubNativeDisplayContextText(tail).removed <= 0) return 0;
+
+  const tmp = `${path}.native-display-sanitize.${process.pid}.${Date.now()}.tmp`;
+  let removed = 0;
+  let carry = "";
+  const input = createReadStream(path, {
+    encoding: "utf-8",
+    highWaterMark: TRANSCRIPT_SANITIZE_STREAM_CHUNK_BYTES,
+  });
+  const output = createWriteStream(tmp, { encoding: "utf-8" });
+  try {
+    for await (const chunk of input) {
+      const combined = `${carry}${chunk}`;
+      const emitLength = Math.max(0, combined.length - TRANSCRIPT_SANITIZE_STREAM_OVERLAP_CHARS);
+      const emit = combined.slice(0, emitLength);
+      carry = combined.slice(emitLength);
+      if (emit) {
+        const scrub = scrubNativeDisplayContextText(emit);
+        removed += scrub.removed;
+        if (!output.write(scrub.text)) {
+          await new Promise((resolve) => output.once("drain", resolve));
+        }
+      }
+    }
+    const finalScrub = scrubNativeDisplayContextText(carry);
+    removed += finalScrub.removed;
+    output.end(finalScrub.text);
+    await finished(output);
+    if (removed <= 0) {
+      await rm(tmp, { force: true });
+      return 0;
+    }
+    await rename(tmp, path);
+    await appendAdvisorLog({
+      event: "large_transcript_native_display_sanitize",
+      reason,
+      transcript: path,
+      removed,
+      bytes: stats.size,
+    });
+    return removed;
+  } catch {
+    try {
+      output.destroy();
+    } catch {
+      // best effort
+    }
+    await rm(tmp, { force: true }).catch(() => {});
+    return 0;
+  }
+}
+
+async function sanitizeCodexGlobalStateNativeDisplayContext(parentThreadId = "", reason = "prompt_context") {
+  const path = codexGlobalStatePath();
+  try {
+    if (!existsSync(path)) return 0;
+    const stats = await stat(path);
+    if (stats.size > GLOBAL_STATE_CONTEXT_SANITIZE_MAX_BYTES) return 0;
+    let text = await readFile(path, "utf-8");
+    let removed = 0;
+    try {
+      const parsed = JSON.parse(text);
+      const nativeStatusScrub = scrubCodexGlobalStateNativeStatusObject(parsed);
+      if (nativeStatusScrub.removed > 0) {
+        text = JSON.stringify(nativeStatusScrub.value);
+        removed += nativeStatusScrub.removed;
+      }
+    } catch {
+      // Fall back to text scrubbing below for partially written state files.
+    }
+    const contextScrub = scrubNativeDisplayContextText(text);
+    text = contextScrub.text;
+    removed += contextScrub.removed;
+    const staleRefs = mergeChildRefs(
+      await nonOpenCurrentParentChildRefs(parentThreadId),
+      await nonOpenVisibleChildRefs(),
+    );
+    for (const ref of staleRefs) {
+      const lineResult = removeSubagentContextLine(text, ref.id);
+      text = lineResult.text;
+      removed += lineResult.removed;
+      const scrubResult = scrubNonOpenChildReferenceText(text, ref);
+      text = scrubResult.text;
+      removed += scrubResult.removed;
+    }
+    if (removed <= 0) return 0;
+    await writeFile(path, text, "utf-8");
+    await appendAdvisorLog({
+      event: "codex_global_state_native_display_sanitize",
+      reason,
+      removed,
+    });
+    return removed;
+  } catch {
+    return 0;
+  }
+}
+
+async function sanitizeQuotedCloseStatusThreadTitle(threadId, reason = "quoted_close_status") {
+  const id = safeString(threadId).trim();
+  if (!id) return 0;
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) return 0;
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("id") || !threadColumns.has("title")) return 0;
+  const selectSql = `select title from threads where id=${sqlString(id)} limit 1;`;
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, selectSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const title = safeString(parseSqliteJsonOutput(stdout)?.[0]?.title);
+    if (!promptLooksLikeQuotedCloseStatus(title)) return 0;
+    const safeTitle = "Native subagent close-status contamination repair";
+    const updateSql = [
+      "pragma busy_timeout=250;",
+      "update threads",
+      `set title=${sqlString(safeTitle)}`,
+      `where id=${sqlString(id)}`,
+      "and title is not null;",
+      "select changes() as changed;",
+    ].join(" ");
+    const { stdout: updateStdout } = await execFileAsync("sqlite3", ["-json", dbPath, updateSql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const changed = sqliteChangedCount(updateStdout);
+    if (changed > 0) {
+      await appendAdvisorLog({
+        event: "quoted_close_status_thread_title_sanitize",
+        reason,
+        thread_id: id,
+        changed,
+      });
+    }
+    return Number.isFinite(changed) ? changed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function lookupCloseTargetRefs(refs, currentParentId) {
+  const targets = [...(refs ?? [])]
+    .map((ref) => safeString(ref).trim())
+    .filter(Boolean)
+    .slice(0, 16);
+  if (targets.length === 0) return [];
+  const parentId = safeString(currentParentId).trim();
+  const dbPath = stateDbPath();
+  if (!existsSync(dbPath)) {
+    return targets.map((ref) => ({ ref, allowed: false, reason: "db_unavailable" }));
+  }
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  const archivedExpr = threadColumns.has("archived") ? "coalesce(t.archived,0) as archived" : "0 as archived";
+  const targetSql = targets.map(sqlString).join(",");
+  const sql = [
+    `select t.id,t.agent_nickname,t.title,t.agent_role,t.model,${archivedExpr},e.parent_thread_id as edge_parent_thread_id,e.status as edge_status`,
+    "from threads t",
+    "left join thread_spawn_edges e on e.child_thread_id=t.id",
+    `where t.id in (${targetSql}) or t.agent_nickname in (${targetSql}) or t.title in (${targetSql})`,
+    "order by t.updated_at desc,edge_status desc;",
+  ].join(" ");
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-readonly", "-json", dbPath, sql], {
+      timeout: NATIVE_EDGE_QUERY_TIMEOUT_MS,
+      maxBuffer: NATIVE_EDGE_QUERY_MAX_BUFFER,
+    });
+    const rows = parseSqliteJsonOutput(stdout);
+    return targets.map((ref) => {
+      const text = safeString(ref).trim();
+      const matches = (Array.isArray(rows) ? rows : []).filter((row) => {
+        return text === safeString(row?.id).trim()
+          || text === safeString(row?.agent_nickname).trim()
+          || text === safeString(row?.title).trim();
+      });
+      const currentOpen = matches.find((row) => {
+        return safeString(row?.edge_parent_thread_id).trim() === parentId
+          && safeString(row?.edge_status).trim().toLowerCase() === "open"
+          && Number(row?.archived ?? 0) !== 1;
+      });
+      const exactIdMatch = Boolean(currentOpen && text === safeString(currentOpen?.id).trim());
+      if (exactIdMatch) {
+        return {
+          ref,
+          allowed: true,
+          id: safeString(currentOpen?.id).trim(),
+          role: compactOneLine(currentOpen?.agent_role, 24),
+          model: compactOneLine(currentOpen?.model, 36),
+        };
+      }
+      const row = matches[0];
+      if (!row) return { ref, allowed: false, reason: "unknown" };
+      return {
+        ref,
+        allowed: false,
+        reason: currentOpen ? "display_ref_not_agent_id" : "not_current_open",
+        id: safeString(row?.id).trim(),
+        parent_thread_id: safeString(row?.edge_parent_thread_id).trim(),
+        status: safeString(row?.edge_status).trim().toLowerCase() || "no_edge",
+        archived: Number(row?.archived ?? 0) === 1,
+        role: compactOneLine(row?.agent_role, 24),
+        model: compactOneLine(row?.model, 36),
+      };
+    });
+  } catch {
+    return targets.map((ref) => ({ ref, allowed: false, reason: "db_query_failed" }));
+  }
+}
+
+function refForCloseGuard(ref) {
+  const text = safeString(ref).trim();
+  if (!text) return "ref=empty";
+  if (mentionedThreadIds(text, 1).length > 0) return `id=${compactOneLine(text, 42)}`;
+  return "ref_type=name";
+}
+
+function buildCloseTargetGuard(eventName, rows, summary) {
+  if (eventName !== "PreToolUse") return null;
+  const violations = (Array.isArray(rows) ? rows : []).filter((row) => !row?.allowed);
+  if (violations.length === 0) return null;
+  const blocked = violations.map((row) => {
+    const details = [
+      refForCloseGuard(row?.ref),
+      `reason=${safeString(row?.reason).trim() || "not_current_open"}`,
+    ];
+    if (row?.id) details.push(`matched_id=${compactOneLine(row.id, 42)}`);
+    if (row?.status) details.push(`status=${safeString(row.status).trim()}`);
+    if (row?.archived !== undefined) details.push(`archived=${row.archived ? "1" : "0"}`);
+    if (row?.parent_thread_id) details.push(`parent=${compactOneLine(row.parent_thread_id, 42)}`);
+    if (row?.role) details.push(`role=${compactOneLine(row.role, 24)}`);
+    if (row?.model) details.push(`model=${compactOneLine(row.model, 36)}`);
+    return `BLOCKED_CLOSE_TARGET(${details.join(" ")})`;
+  });
+  const candidates = closeCandidateTargets(summary);
+  const candidateText = candidates.length > 0
+    ? `CURRENT_PARENT_CLOSE_CANDIDATES=${candidates.join(",")}.`
+    : "CURRENT_PARENT_CLOSE_CANDIDATES=none.";
+  const context = [
+    "Native agent close guard: close_agent target is not a current-parent open lane.",
+    blocked.join(" | "),
+    candidateText,
+    "If a BLOCKED_CLOSE_TARGET includes matched_id, the only admissible retry target is that exact matched_id value, never the display name, nickname, title, role, or any parenthesized label.",
+    "Do not retry this close target. Close only listed current-parent completed_not_closed candidates when capacity recovery is actually needed; otherwise keep useful active lanes and spawn within observed_free.",
+  ].join(" ");
+  return {
+    decision: "block",
+    reason: context,
+    hookSpecificOutput: {
+      hookEventName: eventName,
+      additionalContext: context,
+    },
+  };
+}
+
 function nativePoolResetMs(state, poolThreadId = "") {
   const globalResetMs = msFromIso(state?.last_native_pool_reset_at);
   const threadResetMs = poolThreadId
@@ -1323,6 +2842,7 @@ async function collectPoolEvidence(identity, nowMs, resetAtMs = 0, cap = DEFAULT
     discoverNativeThreadEdges(poolThreadId),
   ]);
   await applyMissingCloseEvidence(poolThreadId, transcriptPool, nativeThreadEdges);
+  await applyStaleCloseRequestEvidence(poolThreadId, transcriptPool, nativeThreadEdges, nowMs);
   return { transcriptPool, childSessionIds, nativeThreadEdges, poolThreadId };
 }
 
@@ -1367,16 +2887,11 @@ function pruneStaleRunningAgents(session, nowMs) {
 }
 
 function pruneSpawnReservations(session, nowMs) {
-  for (const [key, reservation] of Object.entries(session.spawn_reservations ?? {})) {
-    if (!reservation || typeof reservation !== "object") {
-      delete session.spawn_reservations[key];
-      continue;
-    }
-    const expiresAt = Date.parse(safeString(reservation.expires_at));
-    if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) {
-      delete session.spawn_reservations[key];
-    }
-  }
+  // Native spawn does not reliably emit a correlated PostToolUse event. A
+  // PreToolUse reservation therefore cannot outlive that one callback safely.
+  // Keep the field only to migrate older state files; never admit against it.
+  void nowMs;
+  session.spawn_reservations = {};
 }
 
 function pruneAdvisorSessions(state, nowMs) {
@@ -1385,6 +2900,9 @@ function pruneAdvisorSessions(state, nowMs) {
       delete state.sessions[key];
       continue;
     }
+    // Migrate every historical session at once so an old reservation cannot
+    // become admission input again if that session is resumed later.
+    session.spawn_reservations = {};
     const hasAgents = Object.keys(session.agents ?? {}).length > 0;
     const hasReservations = Object.keys(session.spawn_reservations ?? {}).length > 0;
     if (hasAgents || hasReservations) continue;
@@ -1436,10 +2954,18 @@ function hasForkContextModelConflictInOperations(operations) {
   });
 }
 
+function hasForkContextRoleConflictInOperations(operations) {
+  return operations.some((operation) => {
+    if (operation.name !== "spawn_agent") return false;
+    if (!operationForkContext(operation)) return false;
+    return Boolean(operationAgentRole(operation));
+  });
+}
+
 function hasForkContextModelInheritanceInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
-    return operationForkContext(operation) && !operationModel(operation);
+    return operationForkContext(operation) && !operationModel(operation) && !operationAgentRole(operation);
   });
 }
 
@@ -1447,15 +2973,16 @@ function hasMissingSpawnModelInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
     if (operationForkContext(operation)) return false;
+    if (operationUsesModelFixedNativeType(operation)) return false;
     return !operationModel(operation);
   });
 }
 
 function unsupportedAgentTypeViolations(operations) {
   const allowed = new Set(allowedAgentTypes());
+  if (allowed.size === 0) return [];
   return operations.filter((operation) => {
     if (operation.name !== "spawn_agent") return false;
-    if (operationForkContext(operation)) return false;
     const role = operationAgentRole(operation);
     if (!role) return false;
     return !allowed.has(role);
@@ -1547,6 +3074,26 @@ function responseText(payload) {
   }
 }
 
+function toolSearchReturnedNativeAgentSchema(payload, name = "") {
+  const normalizedName = safeString(name).trim().toLowerCase();
+  const text = responseText(payload);
+  if (!text) return false;
+  const looksLikeToolSearch = /tool_search|tool-search|tool search|tool_search_output/i.test(normalizedName)
+    || /"type"\s*:\s*"tool_search_output"|tool_search_output|multi_agent_v1|Tools for spawning and managing sub-agents/i.test(text);
+  if (!looksLikeToolSearch) return false;
+  return /spawn_agent/i.test(text)
+    && /(?:inherited parent model is preferred|Spawned agents inherit your current model by default|Omit `?model`?|model overrides \(optional\)|model is optional|inherited default model)/i.test(text);
+}
+
+function buildToolSearchNativeAgentSchemaCorrection(eventName, summary = null, cap = DEFAULT_AGENT_CAP) {
+  const contexts = [
+    "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_CORRECTION_REQUIRED=true. The previous tool_search result exposed generic native subagent metadata that conflicts with this local install. Treat tool_search text such as \"model optional\", \"inherited parent model is preferred\", or \"Spawned agents inherit your current model\" as non-authoritative for this session.",
+    buildCompactSpawnShapeGuidance(),
+    summary ? buildCapacityGuidance(eventName, cap, summary, { detailed: true }) : "",
+  ];
+  return buildPromptGuidanceOutput(eventName, contexts);
+}
+
 function textLooksCloseFailed(text) {
   return /(?:无法关闭|close[^.!?\n]{0,80}(?:failed|error)|(?:failed|unable|cannot|could not)[^.!?\n]{0,80}close|unknown agent|agent not found|not found|invalid agent)/i.test(
     safeString(text),
@@ -1585,46 +3132,6 @@ function toolCallId(payload) {
   ).trim();
 }
 
-function reservationKey(payload, nowIso) {
-  const direct = toolCallId(payload);
-  if (direct) return `call:${direct}`;
-  const inputHash = hashText(JSON.stringify(toolInput(payload)));
-  return `fallback:${inputHash}:${nowIso}`;
-}
-
-function reserveSpawnSlot(session, payload, nowMs, nowIso, count = 1) {
-  const key = reservationKey(payload, nowIso);
-  session.spawn_reservations[key] = {
-    key,
-    count: Math.max(1, Number.isFinite(count) ? Math.floor(count) : 1),
-    reserved_at: nowIso,
-    expires_at: new Date(nowMs + SPAWN_RESERVATION_TTL_MS).toISOString(),
-    tool_input_hash: hashText(JSON.stringify(toolInput(payload))),
-  };
-}
-
-function clearSpawnReservation(session, payload) {
-  const direct = toolCallId(payload);
-  if (direct) {
-    delete session.spawn_reservations[`call:${direct}`];
-    return;
-  }
-  const inputHash = hashText(JSON.stringify(toolInput(payload)));
-  for (const [key, reservation] of Object.entries(session.spawn_reservations ?? {})) {
-    if (reservation?.tool_input_hash === inputHash) {
-      delete session.spawn_reservations[key];
-      return;
-    }
-  }
-}
-
-function spawnReservationCount(session) {
-  return Object.values(session.spawn_reservations ?? {}).reduce((total, reservation) => {
-    const count = Number(reservation?.count ?? 1);
-    return total + (Number.isFinite(count) && count > 0 ? Math.floor(count) : 1);
-  }, 0);
-}
-
 function collectAgentIdsFromValue(value, ids = new Set(), keyHint = "") {
   if (typeof value === "string") {
     const text = value.trim();
@@ -1647,6 +3154,22 @@ function collectAgentIdsFromValue(value, ids = new Set(), keyHint = "") {
   return ids;
 }
 
+function collectCloseTargetRefsFromValue(value, refs = new Set()) {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (text && text.length <= 220 && !/[\r\n]/.test(text)) refs.add(text);
+    return refs;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectCloseTargetRefsFromValue(item, refs);
+    return refs;
+  }
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) collectCloseTargetRefsFromValue(child, refs);
+  }
+  return refs;
+}
+
 function looksLikeAgentId(value) {
   if (!value || value.length < 6 || value.length > 160) return false;
   if (/\s/.test(value)) return false;
@@ -1666,6 +3189,24 @@ function collectCloseTargetIds(payload) {
   collectAgentIdsFromValue(input.target, ids, "target");
   collectAgentIdsFromValue(input.targets, ids, "targets");
   return [...ids];
+}
+
+function collectCloseTargetRefs(payload) {
+  const input = toolInput(payload);
+  const refs = new Set();
+  collectCloseTargetRefsFromValue(input.target, refs);
+  collectCloseTargetRefsFromValue(input.targets, refs);
+  return [...refs];
+}
+
+function closeTargetRefsFromOperations(operations) {
+  const refs = new Set();
+  for (const operation of Array.isArray(operations) ? operations : []) {
+    if (operation?.name !== "close_agent") continue;
+    collectCloseTargetRefsFromValue(operation?.input?.target, refs);
+    collectCloseTargetRefsFromValue(operation?.input?.targets, refs);
+  }
+  return [...refs];
 }
 
 function collectWaitTargetIds(payload) {
@@ -1738,11 +3279,49 @@ function looksLikeNegativeSpawnIntentPrompt(prompt) {
 function looksLikeNarrowSpawnIntentPrompt(prompt) {
   if (looksLikeNegativeSpawnIntentPrompt(prompt)) return false;
   const normalized = safeString(prompt).toLowerCase();
-  return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bspawn\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\bstart\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\blaunch\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\bcreate\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\b(?:new|another|one\s+more)\s+(?:explorer|reviewer|verifier|researcher|critic)\b|\btry\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:explorer|reviewer|verifier|researcher|critic)\b|生成.{0,12}(?:子代理|智能体|代理)|启动.{0,12}(?:子代理|智能体|代理)|创建.{0,12}(?:子代理|智能体|代理)|派发.{0,12}(?:子代理|智能体|代理))/i.test(normalized);
+  return /(?:\bspawn_agent\b|\bnative\s+(?:sub)?agents?\b|\bsubagents?\b|\bchild\s+agents?\b|\bspawn\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\bstart\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\blaunch\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\bcreate\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:native\s+)?(?:sub)?agents?\b|\b(?:open|run|dispatch)\s+(?:one|two|three|four|five|six|[1-6])\s+(?:bounded\s+|read-only\s+)?(?:native\s+)?(?:sub)?agents?\b|\b(?:new|another|one\s+more)\s+(?:explorer|reviewer|verifier|researcher|critic)\b|\btry\s+(?:a\s+|one\s+|new\s+|another\s+)?(?:explorer|reviewer|verifier|researcher|critic)\b|生成.{0,12}(?:子代理|智能体|代理|子任务|任务线|诊断线)|启动.{0,12}(?:子代理|智能体|代理|子任务|任务线|诊断线)|创建.{0,12}(?:子代理|智能体|代理|子任务|任务线|诊断线)|派发.{0,12}(?:子代理|智能体|代理|子任务|任务线|诊断线)|开.{0,12}(?:子代理|智能体|代理|子任务|任务线|诊断线|条线|条 lane|lane)|并行.{0,24}(?:子代理|智能体|代理|子任务|任务线|诊断线|条线|lane)|(?:两|二|三|四|五|六|2|3|4|5|6).{0,8}(?:条|个).{0,12}(?:子任务|任务线|诊断线|lane|线))/i.test(normalized);
 }
 
 function looksLikeSpawnIntentPrompt(prompt) {
   return looksLikeNarrowSpawnIntentPrompt(prompt);
+}
+
+function spawnCountFromToken(token) {
+  const normalized = safeString(token).trim().toLowerCase();
+  if (!normalized) return 0;
+  const counts = new Map([
+    ["1", 1], ["one", 1], ["a", 1], ["an", 1], ["一", 1], ["一个", 1], ["一条", 1],
+    ["2", 2], ["two", 2], ["两", 2], ["两个", 2], ["两条", 2], ["二", 2], ["双", 2],
+    ["3", 3], ["three", 3], ["三", 3], ["三个", 3], ["三条", 3],
+    ["4", 4], ["four", 4], ["四", 4], ["四个", 4], ["四条", 4],
+    ["5", 5], ["five", 5], ["五", 5], ["五个", 5], ["五条", 5],
+    ["6", 6], ["six", 6], ["六", 6], ["六个", 6], ["六条", 6],
+  ]);
+  return counts.get(normalized) ?? 0;
+}
+
+function inferRequestedSpawnsFromPrompt(prompt) {
+  const text = safeString(prompt);
+  if (!looksLikeNarrowSpawnIntentPrompt(text)) return 0;
+  const compact = text
+    .replace(/\s+/g, " ")
+    .replace(/\b(?:one|two|three|four|five|six|[1-6])\s+(?:existing|current)\s+(?:native\s+)?(?:sub)?agents?\b/giu, "existing agents");
+  const countToken = String.raw`(?<count>一个|一条|1|one|一|两个|两条|2|two|两|二|双|三个|三条|3|three|三|四个|四条|4|four|四|五个|五条|5|five|五|六个|六条|6|six|六)`;
+  const target = String.raw`(?:(?:native\s+)?(?:sub)?agents?|child\s+agents?|subtasks?|child\s+tasks?|lanes?|scouts?|reviewers?|verifiers?|critics?|explorers?|子代理|智能体|代理|子任务|任务线|诊断线|条线|线|lane)`;
+  const patterns = [
+    new RegExp(`${countToken}.{0,24}${target}`, "iu"),
+    new RegExp(`(?:spawn|start|launch|create|open|run|dispatch|并行|生成|启动|创建|派发|开).{0,24}${countToken}.{0,24}${target}`, "iu"),
+    new RegExp(`${countToken}.{0,16}(?:read-only|bounded|只读|并行).{0,24}${target}`, "iu"),
+  ];
+  for (const pattern of patterns) {
+    const match = compact.match(pattern);
+    const count = spawnCountFromToken(match?.groups?.count);
+    if (count > 0) return Math.min(count, DEFAULT_AGENT_CAP);
+  }
+  if (/(?:\banother\b|\bone\s+more\b|\bnew\s+(?:explorer|reviewer|verifier|researcher|critic|agent|subagent|lane)\b|再开|再启|再派|另开|一个|一条).{0,24}(?:agent|subagent|child|lane|子代理|智能体|代理|子任务|任务线|诊断线|线)?/iu.test(compact)) {
+    return 1;
+  }
+  return 0;
 }
 
 function hasRecentCapacityPressure(session, nowMs) {
@@ -1752,7 +3331,6 @@ function hasRecentCapacityPressure(session, nowMs) {
   return (
     (lastCapHit > 0 && nowMs - lastCapHit < recentMs)
     || (lastCloseFailed > 0 && nowMs - lastCloseFailed < recentMs)
-    || spawnReservationCount(session) > 0
   );
 }
 
@@ -1763,7 +3341,6 @@ function hasPromptCapacityPressure(summary) {
         summary.occupied > 0
         || summary.cap_hit_blocks_spawn
         || summary.failed_closes > 0
-        || summary.pending_spawn_reservations > 0
       ),
   );
 }
@@ -1776,7 +3353,6 @@ function hasCriticalPromptCapacityPressure(summary, cap) {
         || summary.native_edge_failed
         || summary.cap_hit_blocks_spawn
         || summary.failed_closes > 0
-        || summary.pending_spawn_reservations > 0
         || (summary.native_edge_overflow ?? 0) > 0
       ),
   );
@@ -1796,6 +3372,7 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
   const narrowSpawnIntent = looksLikeNarrowSpawnIntentPrompt(prompt);
   const promptPressure = hasPromptCapacityPressure(promptSummary);
   const criticalPressure = hasCriticalPromptCapacityPressure(promptSummary, cap);
+  if (criticalPressure) return true;
   if (negativeSpawnIntent && !promptPressure && !criticalPressure) return false;
   if (
     !looksLikeDelegationPrompt(prompt)
@@ -1803,7 +3380,6 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
     && !promptPressure
   ) return false;
 
-  if (criticalPressure) return true;
   if (narrowSpawnIntent) return true;
   if (hasLaneInventory(promptSummary)) return true;
 
@@ -1814,6 +3390,20 @@ function shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, isChildSe
   return true;
 }
 
+function shouldEmitPostToolCapacityRefresh(eventName, session, nowMs, isChildSession, summary = null, cap = DEFAULT_AGENT_CAP) {
+  if (isChildSession) return false;
+  if (eventName !== "PostToolUse") return false;
+  if (!summary) return false;
+  const hasPressure = Boolean(
+    hasCriticalPromptCapacityPressure(summary, cap)
+      || hasLaneInventory(summary)
+      || (summary.native_edge_terminal_debt ?? summary.terminal ?? 0) > 0
+  );
+  if (!hasPressure) return false;
+  const last = msFromIso(session.last_capacity_post_tool_guidance_at);
+  return !last || nowMs - last > POST_TOOL_CAPACITY_GUIDANCE_TTL_MS;
+}
+
 function markCapacityGuidanceEmitted(eventName, prompt, session, nowIso) {
   if (eventName === "SessionStart") {
     session.last_capacity_session_guidance_at = nowIso;
@@ -1822,6 +3412,10 @@ function markCapacityGuidanceEmitted(eventName, prompt, session, nowIso) {
   if (eventName === "UserPromptSubmit") {
     session.last_capacity_prompt_guidance_at = nowIso;
     session.last_capacity_prompt_signature = hashText(prompt.trim().toLowerCase());
+    return;
+  }
+  if (eventName === "PostToolUse") {
+    session.last_capacity_post_tool_guidance_at = nowIso;
   }
 }
 
@@ -1855,10 +3449,14 @@ function capacitySnapshot(summary, cap, requestedSpawns = 0) {
     requested_spawns: requested,
     close_needed_for_request: Math.max(0, requested - observedFree),
     close_needed_for_one: observedFree > 0 ? 0 : 1,
+    close_needed_for_two: Math.max(0, 2 - observedFree),
+    close_needed_for_three: Math.max(0, 3 - observedFree),
     runtime_reservation: false,
     batch_guarantee: false,
     guarantee_level: capacityGuaranteeLevel(summary),
-    recommended_protocol: requested > 1 ? "single_spawn_then_resample" : "single_spawn_or_reuse_then_resample",
+    recommended_protocol: requested > 1
+      ? (requested <= observedFree ? "bounded_batch_precheck_then_resample" : "reduce_batch_or_close_then_resample")
+      : (observedFree > 0 ? "reuse_or_spawn_when_subagent_value_then_resample" : "reuse_close_or_local_until_capacity_refresh"),
   };
 }
 
@@ -1871,6 +3469,8 @@ function formatCapacitySnapshot(snapshot) {
     `requested_spawns=${snapshot.requested_spawns}`,
     `close_needed_for_request=${snapshot.close_needed_for_request}`,
     `close_needed_for_one=${snapshot.close_needed_for_one}`,
+    `close_needed_for_two=${snapshot.close_needed_for_two}`,
+    `close_needed_for_three=${snapshot.close_needed_for_three}`,
     `guarantee_level=${snapshot.guarantee_level}`,
     `runtime_reservation=${snapshot.runtime_reservation ? "true" : "false"}`,
     `batch_guarantee=${snapshot.batch_guarantee ? "true" : "false"}`,
@@ -1882,24 +3482,20 @@ function nativeEdgeSummary(summary) {
   if (summary?.native_edge_failed) return "unavailable";
   if (summary?.native_edge_checked) {
     const authority = summary.native_edge_authoritative ? "authoritative" : "fallback";
-    return `slot_open=${summary.native_edge_active ?? 0}, slot_terminal=${summary.native_edge_terminal ?? 0}, slot_estimate=${summary.native_edge_slot_occupied ?? summary.occupied}/${summary.native_edge_cap ?? "?"}, ledger_lag=${summary.native_edge_ledger_lag ?? 0}, db_open_edge_debt=${summary.native_edge_debt ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
+    return `slot_open=${summary.native_edge_active ?? 0}, slot_terminal=${summary.native_edge_terminal ?? 0}, slot_estimate=${summary.native_edge_slot_occupied ?? summary.occupied}/${summary.native_edge_cap ?? "?"}, visible_unarchived=${summary.native_visible_unarchived ?? 0}, ledger_lag=${summary.native_edge_ledger_lag ?? 0}, db_open_edge_debt=${summary.native_edge_debt ?? 0}, open_edge_overflow=${summary.native_edge_overflow ?? 0}, authority=${authority}`;
   }
   return "not_checked";
 }
 
 function formatLaneSummary(lane) {
   const id = compactOneLine(lane?.id, 42) || "unknown";
-  const parts = [id];
-  const nickname = compactOneLine(lane?.nickname, 24);
+  const parts = [`agent_id=${id}`];
   const role = compactOneLine(lane?.role, 24);
   const model = compactOneLine(lane?.model, 36);
   const effort = compactOneLine(lane?.reasoning_effort, 12);
-  const title = compactOneLine(lane?.title, 64);
-  if (nickname) parts.push(`nick=${nickname}`);
   if (role) parts.push(`role=${role}`);
   if (model) parts.push(`model=${model}`);
   if (effort) parts.push(`effort=${effort}`);
-  if (title) parts.push(`title="${title}"`);
   return parts.join(" ");
 }
 
@@ -1914,7 +3510,7 @@ function formatLaneInventoryItem(lane, status) {
   const updated = formatLaneUpdatedAt(lane);
   if (status) details.push(`status=${status}`);
   if (updated) details.push(`updated_at=${updated}`);
-  details.push(`target=${compactOneLine(lane?.id, 42) || "unknown"}`);
+  details.push(`close_target_id=${compactOneLine(lane?.id, 42) || "unknown"}`);
   return `${base} (${details.join(", ")})`;
 }
 
@@ -1941,7 +3537,7 @@ function laneInventoryGuidance(summary) {
   const overflowText = (summary?.native_edge_overflow ?? 0) > 0
     ? `Native DB open-edge debt exceeds the ${summary.native_edge_cap ?? "configured"}-slot runtime cap: db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}. Overflow rows are repair debt, not additional live agents.`
     : "";
-  const reuseText = "LANE_REUSE_CHECK_REQUIRED=true. Compare the intended task contract against this current-parent lane inventory before spawning. If a same-topic/same-domain lane has compatible model and context, use send_input to reuse it. Completed lanes are reusable context lanes; close only when stale, wrong-topic/model, cap-needed, or the active task window is done.";
+  const reuseText = "LANE_REUSE_CHECK_REQUIRED=true. Compare the intended task contract against this current-parent lane inventory before spawning. If a same-topic/same-domain active lane has compatible model and context, use send_input to reuse it. Positive observed_free means do not close a still-running, task-critical lane merely to make room; spawn within free capacity and resample. Completed_not_closed lanes are already finished but still consume native slots; when zero-budget/cap-pressure exists, close listed completed_not_closed lanes before retrying spawn.";
   return `${activeText} ${terminalText} ${reuseText} ${overflowText}`.trim();
 }
 
@@ -1950,28 +3546,75 @@ function zeroBudgetRecoveryGuidance(summary) {
   const terminalLanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
   const hasListedLane = activeLanes.length > 0 || terminalLanes.length > 0;
   const candidateText = terminalLanes.length > 0
-    ? "Prefer completed-not-closed candidates first."
+    ? "Close listed completed_not_closed lane(s) first before any new spawn; task_complete did not release their native slot, and these lanes are already complete."
     : activeLanes.length > 0
-    ? "Only close an active lane when the leader knows it is no longer needed; otherwise reuse it, wait for it, or continue locally."
+    ? "Only close an active lane when the leader knows it is no longer needed; otherwise reuse it or wait for it. Do not switch to local execution solely because the pool is full."
     : "No current-parent close target is listed; treat this as a state mismatch and verify hook/native DB state instead of retrying spawn.";
   return [
     "ZERO_BUDGET_RECOVERY_REQUIRED=true.",
     "Do not stop at saying the subagent pool is full.",
-    "Before any new spawn, choose one recovery action: reuse a compatible current-parent lane with send_input, close listed current-parent lane(s) that are no longer needed, wait for an active lane if its result is needed, or continue locally.",
+    terminalLanes.length > 0
+      ? "Before any new spawn, close enough listed completed_not_closed current-parent lane(s) to satisfy close_needed_for_request/close_needed_for_one/two/three for the intended batch, then resample capacity. Completed_not_closed lanes are not unknown active work; they are completed safe close candidates."
+      : "Before any new spawn, choose one recovery action: reuse a compatible current-parent lane with send_input, close listed current-parent lane(s) that are no longer needed, or wait for an active lane if its result is needed. Do not convert pool-full into a silent local-only plan.",
     candidateText,
     hasListedLane
-      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and use the refreshed observed_free snapshot; without runtime reservation, launch at most one child before sampling again."
+      ? "After a successful close_agent or runtime not-found close repair, re-check capacity and use the refreshed observed_free snapshot before any new spawn batch."
       : "If live state says fewer lanes exist than the hook snapshot, run a fresh hook/live check and use the newer scoped budget."
   ].join(" ");
 }
 
-function buildTurnBudgetGuidance(summary, cap, detailed = false) {
+function closeCandidateTargets(summary) {
+  const terminalLanes = Array.isArray(summary?.native_terminal_lanes) ? summary.native_terminal_lanes : [];
+  const unreachable = new Set(Array.isArray(summary?.unreachable_close_targets) ? summary.unreachable_close_targets : []);
+  return terminalLanes
+    .filter((lane) => {
+      const id = safeString(lane?.id).trim();
+      return !unreachable.has(id);
+    })
+    .map((lane) => safeString(lane?.target ?? lane?.id).trim())
+    .filter(Boolean)
+    .sort();
+}
+
+function buildSpawnCapacityFailureRecovery(eventName, summary, cap) {
+  const targets = closeCandidateTargets(summary);
+  const targetText = targets.length > 0
+    ? `CLOSE_CANDIDATES=${targets.join(",")}.`
+    : "CLOSE_CANDIDATES=none_listed.";
+  const actionText = targets.length > 0
+    ? "Next action: close one or more listed completed_not_closed current-parent lane(s), then wait for the next hook capacity snapshot before retrying spawn_agent."
+    : "Next action: no completed_not_closed close target was listed; reuse an existing lane or inspect current-parent native DB/runtime state before retrying spawn_agent.";
+  const context = [
+    "SPAWN_AGENT_FAILED_POOL_FULL_RECOVERY_REQUIRED=true.",
+    `The last spawn_agent call hit the native thread limit for this parent/session; do not retry spawn_agent from the failed prompt.`,
+    `current_parent_occupied=${summary.occupied}/${cap}.`,
+    `completed_not_closed=${summary.native_edge_terminal_debt ?? summary.terminal}.`,
+    `open_active=${summary.native_edge_active_debt ?? summary.running}.`,
+    targetText,
+    actionText,
+    "Do not switch to local-only execution solely because the pool is full; recover capacity or reuse a compatible current-parent lane.",
+    "task_complete does not free a slot; only successful close_agent or verified runtime not-found close repair does.",
+  ].join(" ");
+  return {
+    hookSpecificOutput: {
+      hookEventName: eventName,
+      additionalContext: context,
+    },
+  };
+}
+
+function buildTurnBudgetGuidance(summary, cap, detailed = false, requestedSpawns = 0) {
   if (!summary) return "";
-  const snapshot = capacitySnapshot(summary, cap, 0);
+  const snapshot = capacitySnapshot(summary, cap, requestedSpawns);
+  const zeroBudgetCloseTargets = closeCandidateTargets(summary);
+  const zeroBudgetCloseText = zeroBudgetCloseTargets.length > 0
+    ? `CLOSE_BEFORE_SPAWN_REQUIRED=true. COMPLETED_NOT_CLOSED_ARE_CLOSE_CANDIDATES=true. CLOSE_CANDIDATES=${zeroBudgetCloseTargets.join(",")}. Close enough listed completed_not_closed current-parent lane(s) before any spawn_agent call, then resample capacity. Do not call these lanes unknown; they have task_complete evidence and are the preferred safe close targets.`
+    : "CLOSE_BEFORE_SPAWN_REQUIRED=false. CLOSE_CANDIDATES=none_listed. No completed_not_closed current-parent lane is listed; reuse a compatible lane, wait for needed active lane(s), or inspect current-parent native state before retrying spawn_agent.";
   const hardDirective = snapshot.observed_free === 0
-    ? "SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget observed snapshot). observed_free=0, remaining_spawn_budget=0: do not call spawn_agent from this capacity snapshot. First reuse or close known no-longer-needed current-parent lane(s), or continue locally. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state."
-    : `SPAWN_AGENT_OBSERVED_FREE=${snapshot.observed_free}. BATCH_SPAWN_GUARANTEE=false. This is an observed snapshot, not an atomic runtime reservation; launch at most one new child, then re-check capacity before another spawn.`;
-  const snapshotLine = `Current parent/session native subagent capacity snapshot: occupied=${summary.occupied}/${cap}, ${formatCapacitySnapshot(snapshot)}, slot_pressure_source=${summary.slot_pressure_source}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${summary.terminal}, pending_spawn_attempts=${summary.pending_spawn_reservations}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`;
+    ? `SPAWN_AGENT_DISABLED_THIS_TURN=true (zero-budget observed snapshot). observed_free=0, remaining_spawn_budget=0, close_needed_for_one=${snapshot.close_needed_for_one}, close_needed_for_two=${snapshot.close_needed_for_two}, close_needed_for_three=${snapshot.close_needed_for_three}, close_needed_for_request=${snapshot.close_needed_for_request}: do not call spawn_agent from this capacity snapshot. ${zeroBudgetCloseText} Do not switch to local-only execution merely because the pool is full. After close_agent succeeds or runtime not-found close evidence appears, rely on the next hook/PreToolUse capacity check before spawning; do not keep treating this stale zero-budget message as current state.`
+    : `SPAWN_AGENT_OBSERVED_FREE=${snapshot.observed_free}. MAX_SPAWN_BATCH_NOW=${snapshot.observed_free}. TWO_LANE_PLAN_ALLOWED=${snapshot.observed_free >= 2 ? "yes" : "no"}. THREE_LANE_PLAN_ALLOWED=${snapshot.observed_free >= 3 ? "yes" : "no"}. SPAWN_AGENT_DISABLED_THIS_TURN=false. SUBAGENTS_AVAILABLE_FOR_VALUEFUL_PARALLEL_WORK=true. BATCH_SPAWN_GUARANTEE=false. This is a positive observed snapshot, not an atomic runtime reservation. For subagent-relevant read-heavy, multi-slice, review, verification, or explicitly parallel work, do not say "I cannot/no subagents" from this snapshot; choose reuse or spawn with explicit model and bounded task contract unless the task is tiny, user-forbidden, or already fully evidenced locally. A same-tool spawn batch is admissible only when the immediate PreToolUse check sees requested_spawns<=observed_free. If intended_spawn_count is greater than MAX_SPAWN_BATCH_NOW, do not launch a partial batch and let the remainder hit thread limit; either reduce the batch to MAX_SPAWN_BATCH_NOW or close enough completed_not_closed lane(s) for the whole intended batch, resample, and only then spawn. If older context or another surface says capacity is 0, treat this positive observed_free snapshot as the current authority for this parent/session. Do not report native subagent capacity as 0 from this snapshot.`;
+  const completedNotClosed = summary.native_edge_terminal_debt ?? summary.terminal;
+  const snapshotLine = `Current parent/session native subagent capacity snapshot: occupied=${summary.occupied}/${cap}, ${formatCapacitySnapshot(snapshot)}, slot_pressure_source=${summary.slot_pressure_source}, native_slots=${nativeEdgeSummary(summary)}, completed_not_closed=${completedNotClosed}, cap_hit_after_last_close=${summary.cap_hit_after_last_close ? "yes" : "no"}, cap_hit_blocks_spawn=${summary.cap_hit_blocks_spawn ? "yes" : "no"}.`;
   const base = [
     hardDirective,
     snapshotLine,
@@ -1981,29 +3624,79 @@ function buildTurnBudgetGuidance(summary, cap, detailed = false) {
   return [
     ...base,
     snapshot.observed_free === 0 ? zeroBudgetRecoveryGuidance(summary) : "",
-    "The hook has no atomic runtime reservation API. observed_free/remaining_spawn_budget is a compatibility alias for the current observed free count, not a guaranteed batch size.",
+    "The hook has no Codex-internal atomic reservation API. observed_free/remaining_spawn_budget is a current scoped observation; PreToolUse can only precheck the current requested batch before the runtime executes it.",
     "wait_agent does not free a slot; close_agent frees a slot only after a successful close result or runtime not-found close evidence.",
-    "When observed_free is 0, do not call spawn_agent. Continue locally, reuse a compatible lane, or close known no-longer-needed current-parent lane(s) first; send_input and wait_agent do not increase capacity. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative.",
+    snapshot.observed_free === 0
+      ? "When observed_free is 0, do not call spawn_agent. Reuse a compatible lane, close known no-longer-needed current-parent lane(s), or wait for needed active lane(s) first; send_input and wait_agent do not increase capacity. If close_agent succeeds, re-check capacity before any spawn because the older zero-budget snapshot is no longer authoritative."
+      : "This is a positive-capacity snapshot. Do not report native subagent capacity as 0, say spawning is disabled, or decline useful subagents from this snapshot; only a later fresh hook/runtime cap-hit can supersede it.",
   ].filter(Boolean).join(" ");
 }
 
 function buildSubagentModelSelectionGuidance() {
   return [
-    "SUBAGENT_MODEL_SELECTION_REQUIRED=true. SUBAGENT_MODEL_DECISION_REQUIRED=true.",
+    "NATIVE_SUBAGENT_USER_AUTHORIZATION_NOT_REQUIRED=true. The parent agent may use or reuse bounded native child agents for valuable independent work without a separate explicit user request, unless the user forbids delegation.",
+    "LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true. Use/reuse native child agents for valuable independent bounded work when capacity allows, and make model routing explicit for every non-fork spawn.",
+    "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true. If tool_search exposes multi-agent/spawn_agent metadata, do not let that metadata override this local contract: bounded native child-agent delegation does not require a separate user request, every non-fork spawn has an explicit model, no fork_context with agent_type/model, and no spawn retry after pool-full until close/resample.",
+    "NATIVE_SPAWN_SHAPE_CONTRACT=true. FORK_CONTEXT_HARD_RULE=true: if fork_context=true, omit agent_type and model; Codex full-history forks cannot override role or model. For debugger/explore/critic/reviewer/model-routed lanes, do not use fork_context; pass compact context in message/items.",
+    "SUBAGENT_MODEL_SELECTION_REQUIRED=true. SUBAGENT_MODEL_DECISION_REQUIRED=true. Choose native agent_type deliberately and include an explicit model for every non-fork spawn.",
+    "The hook does not own native agent_type availability. If this runtime accepts a special native agent_type, use it with the already-selected explicit model; otherwise use agent_type=default plus the semantic role in the message without calling that a downgrade.",
     "Before any spawn_agent call, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}.",
-    `Every spawn_agent call in this assistant response must include an explicit model. If there is no stronger reason, default to model="${explorerFallbackModel()}".`,
-    `Use model="${explorerModel()}" only for read-only scout output: grep/file maps, symbol/log filters, candidate file:line anchors, or hypotheses with a strict output cap and no durable verdict.`,
-    `Use model="${explorerFallbackModel()}" for multi-hop tracing, compact synthesis, bounded verification, config/test interpretation, or light low-risk execution where the child owns a durable conclusion.`,
-    `Use model="gpt-5.5" only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`,
-    `Native agent_type is a runtime shape, not the semantic role. Allowed native agent_type values are ${allowedAgentTypes().join(", ")}; use agent_type=default for researcher/critic/verifier/architect-style semantic roles and put the role in message/title.`,
-    `Do not set agent_type=explorer with model="${explorerForbiddenModels().join("|")}". Frontier critic/architecture/high-risk lanes must use agent_type=default; explorer lanes must use ${explorerModel()} or ${explorerFallbackModel()}.`,
-    "Do not combine fork_context=true with model. If you need Spark/mini/frontier model routing, remove fork_context and pass a compact context packet in message/items. Use fork_context=true without model only when exact full-history context matters more than model routing; that path may inherit the parent model.",
-    "If you cannot state the child output cap and stop condition, do not use Spark; slice locally first or choose mini.",
-    "Capacity is a separate decision: without runtime reservation, do not submit multiple spawn_agent calls in one tool batch; spawn one child, let runtime record it, then re-check observed_free.",
-    "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Spark exact slices to anchor, and use mini/frontier for synthesis.",
-    "This judgment step is mandatory; never omit model, because omitted model inherits the parent frontier model.",
-    "This is a spawn-shape guard, not a recommendation to create a subagent.",
+    `Every non-fork spawn_agent call must include an explicit gpt-5.6 model. If there is no stronger reason, default to model="${explorerFallbackModel()}" with reasoning_effort="medium".`,
+    `Use model="${explorerModel()}" with reasoning_effort="low" only for bounded locating: exact file/symbol maps, grep anchors, log filters, DB row anchors, and candidate file:line evidence. Luna must not own durable conclusions or broad synthesis.`,
+    `Luna search contract: require exact paths, rg --max-count/--max-filesize, head/tail, SQLite LIMIT, output<=80 lines, and a stop condition. Escalate multi-hop reasoning to ${explorerFallbackModel()}.`,
+    `Use model="${explorerFallbackModel()}" with reasoning_effort="medium" for tracing, diagnosis, synthesis, bounded verification, config/test interpretation, and normal implementation.`,
+    "Use model=\"gpt-5.6-sol\" with reasoning_effort=\"high\" for critic, code review, architecture, security, high-risk implementation, live-money/destructive judgment, and final approval.",
+    "Native agent_type is a runtime capability, not hook authority. Choose its semantic role independently from the explicit model route.",
+    "Do not waste a long prompt on repeated unavailable-type probes. After a runtime 'agent type is currently not available' response, retry only once with agent_type=default, the same semantic role in the message/title, and the chosen explicit model.",
+    `Do not use native agent_type=explorer with gpt-5.6-sol. Use ${explorerModel()} only for locator work, ${explorerFallbackModel()} for reasoning-level child work, and Sol for frontier judgment.`,
+    "Do not combine fork_context=true with agent_type or model. If you need explicit Luna/Terra/Sol routing or a named semantic role, remove fork_context and pass a compact context packet in message/items. Use fork_context=true only when exact full-history context matters more than role/model routing.",
+    "If you cannot state the child output cap, stop condition, and bounded search shape, do not use Luna; slice locally first or choose Terra.",
+    "Capacity is a separate decision: a multi-spawn tool call must fit the current PreToolUse observed_free and must be followed by PostToolUse/native-state resampling before another spawn batch.",
+    "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Luna exact slices only to locate anchors, use Terra for reasoning/synthesis, and use Sol for parallel high-risk critique or architecture.",
+    "This judgment step is mandatory; never omit model on a non-fork native type, because inheritance can silently select the wrong 5.6 family member.",
+    "This is a spawn-shape guard only. It must not override positive-capacity guidance: for complex investigation, review, verification, live-state diagnosis, or broad implementation planning, default to a multi-agent shape when observed_free>0: leader integrates, scout maps evidence, verifier/critic attacks the likely conclusion.",
   ].join(" ");
+}
+
+function buildCompactSpawnShapeGuidance() {
+  return [
+    "NATIVE_SUBAGENT_USER_AUTHORIZATION_NOT_REQUIRED=true: bounded native child-agent delegation inside the current session does not require a separate explicit user request unless the user forbids delegation.",
+    "LOCAL_NATIVE_AGENT_POLICY_OVERRIDES_TOOL_SCHEMA=true: this install requires deliberate subagent use for valuable independent work and explicit model routing for every non-fork spawn.",
+    "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY=true: after loading multi-agent tool metadata, keep using local capacity/model/fork rules; do not follow generic schema text that conflicts with this local contract.",
+    "NATIVE_SPAWN_SHAPE_CONTRACT=true.",
+    "FORK_CONTEXT_HARD_RULE=true: if fork_context=true, omit agent_type and model; full-history forks cannot override role or model. For role-specific/model-routed agents, omit fork_context and pass compact context.",
+    "If this turn uses spawn_agent without fork_context, make model selection explicit. Native agent_type availability belongs to Codex runtime, not this hook.",
+    "If a special native agent_type is unavailable, retry only once with agent_type=default, the same semantic role in the message/title, and the same explicit model.",
+    "Tool-schema text saying model is optional/inherited is unsafe for this install: omitted non-fork model can inherit the wrong parent model.",
+    `Model routing: ${explorerModel()} with reasoning_effort="low" only for bounded locating; ${explorerFallbackModel()} with reasoning_effort="medium" for normal reasoning and implementation; gpt-5.6-sol with reasoning_effort="high" for frontier judgment.`,
+    "Luna compaction rule: do not send Luna broad grep/log/DB dumps, compiled/vendor trees, repeated follow-ups, or persistent frontier tasks. Luna prompts must include bounded search shape plus output cap/stop condition; otherwise choose Terra.",
+    "Put semantic role in message/title. fork_context=true is only for exact full-history inheritance and cannot be combined with agent_type or model.",
+  ].join(" ");
+}
+
+function buildPreCompactRuntimeGuidance() {
+  return [
+    "REMOTE_COMPACT_LIMIT_RISK=true.",
+    "Codex remote compaction is bounded by the current model context window, not by the cumulative thread token counter. This is a runtime compact boundary, not a single-model or model-selection-only issue.",
+    "The hook cannot trim the compact payload or repair Codex's internal remote compact algorithm. It can only warn before/after compact so the leader does not append another long prompt, broad tool dump, or repeated failed compact retry.",
+    `Current local model catalog shape: ${explorerModel()} is the bounded locator lane; ${explorerFallbackModel()} is the standard worker; gpt-5.6-sol is the frontier judgment lane. All can compact when system/developer/AGENTS/tool-schema/tool-output reserve is too large.`,
+    "If compact fails with context-window exhaustion, stop adding context in this thread. Create a short handoff/new thread with current goal, authoritative files, exact blockers, and pending verification; do not keep spawning or sending follow-ups inside the overfull thread.",
+    "Model routing still matters for future child lanes, but it is not the root cause of a remote compact overflow once any model reaches its own compact boundary.",
+  ].join(" ");
+}
+
+function shouldEmitSpawnShapeReminder(eventName, prompt, session, nowMs, emittedCapacityGuidance, isChildSession = false) {
+  if (isChildSession) return false;
+  if (eventName === "PostCompact") return true;
+  if (eventName !== "UserPromptSubmit") return false;
+  if (emittedCapacityGuidance) return false;
+  if (looksLikeNegativeSpawnIntentPrompt(prompt)) return false;
+  const last = msFromIso(session.last_spawn_shape_reminder_at);
+  return !last || nowMs - last > SPAWN_SHAPE_REMINDER_TTL_MS;
+}
+
+function markSpawnShapeReminderEmitted(session, nowIso) {
+  session.last_spawn_shape_reminder_at = nowIso;
 }
 
 function needsDetailedCapacityGuidance(summary, cap, options = {}) {
@@ -2015,7 +3708,6 @@ function needsDetailedCapacityGuidance(summary, cap, options = {}) {
       || summary.native_edge_failed
       || summary.cap_hit_blocks_spawn
       || summary.failed_closes > 0
-      || summary.pending_spawn_reservations > 0
       || (summary.native_edge_overflow ?? 0) > 0
       || hasLaneInventory(summary),
   );
@@ -2035,23 +3727,26 @@ function shouldIncludeModelGuidance(summary, cap, options = {}) {
 
 function buildCapacityGuidance(eventName, cap, summary = null, options = {}) {
   const detailed = needsDetailedCapacityGuidance(summary, cap, options);
+  const includeModelGuidance = shouldIncludeModelGuidance(summary, cap, options);
+  const requestedSpawns = Math.max(0, Math.floor(Number(options.requestedSpawns) || 0));
   return [
-    buildTurnBudgetGuidance(summary, cap, detailed),
-    shouldIncludeModelGuidance(summary, cap, options) ? buildSubagentModelSelectionGuidance() : "",
+    buildTurnBudgetGuidance(summary, cap, detailed, requestedSpawns),
+    includeModelGuidance ? buildSubagentModelSelectionGuidance() : buildCompactSpawnShapeGuidance(),
     `Native subagent capacity protocol (launch sequencing only): this Codex parent/session has a child-agent cap of ${cap}. Capacity accounting is per parent/session; rows from other parent sessions must not change this turn's admission decision.`,
-    detailed ? "Without a Codex runtime reservation primitive, this hook cannot guarantee atomic multi-spawn success. Prefer single-spawn-then-resample sequencing; if any spawn returns a capacity failure, stop spawning until a later close, repair, or explicit reset refreshes observed capacity." : "",
-    detailed ? "Open children without task_complete evidence can consume slots until close succeeds; stale open edges with task_complete evidence are repaired to closed and excluded from current occupancy." : "",
-    detailed ? "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, or explicit reset refreshes budget. If cap_hit_after_last_close=yes but cap_hit_blocks_spawn=no, trust the current authoritative native slot count instead of the stale cap-hit." : "",
+    detailed ? "Without a Codex-internal reservation primitive, this hook cannot guarantee future capacity beyond the current tool call. A multi-spawn call is allowed only when the immediate PreToolUse snapshot shows requested_spawns<=observed_free. The hook never carries a local reservation into a later turn; native DB edges are the capacity authority." : "",
+    detailed ? "Open children consume slots until close_agent succeeds or runtime not-found close repair verifies release. task_complete only makes a lane completed_not_closed and a close candidate; it does not free capacity by itself. Do not describe listed completed_not_closed close candidates as unknown agents; close those before closing any active lane." : "",
+    detailed ? "If cap_hit_blocks_spawn=yes, do not call spawn_agent again until a later close, repair, explicit reset, or later successful runtime spawn refreshes budget. If current authoritative native edges show positive observed_free, an older cap-hit is diagnostic only and must not be restated as zero capacity." : "",
     detailed ? "Do not restate/retry long child prompts after a capacity failure." : "",
-    detailed ? "This protocol does not recommend delegation, reuse, or messaging a child lane; it only prevents wasteful native pool collisions." : "",
+    detailed ? "This protocol is an admission and sequencing guard, not a no-delegation instruction. When observed_free>0 and the work benefits from independent context, use or reuse native subagents deliberately; when observed_free=0, recover by reuse/close/wait and refresh capacity rather than colliding with the cap or silently moving all work local." : "",
   ].filter(Boolean).join(" ");
 }
 
 function buildPromptGuidanceOutput(eventName, contexts) {
+  const context = scrubNativeDisplayNameContextText(contexts.filter(Boolean).join(" ")).text;
   return {
     hookSpecificOutput: {
       hookEventName: eventName,
-      additionalContext: contexts.filter(Boolean).join(" "),
+      additionalContext: context,
     },
   };
 }
@@ -2063,22 +3758,38 @@ function summarize(session) {
   const running = agents.filter((agent) => agent.status === "running").length;
   const terminal = agents.filter((agent) => agent.status === "terminal_not_closed").length;
   const trackedAgentIds = agents.map((agent) => safeString(agent.id).trim()).filter(Boolean);
-  const pendingSpawnReservations = spawnReservationCount(session);
   const trackedOccupied = running + terminal;
+  const unreachableCloseTargets = Object.keys(session.unreachable_close_targets ?? {})
+    .map((target) => safeString(target).trim())
+    .filter(Boolean);
   return {
     running,
     terminal,
     tracked_agent_ids: trackedAgentIds,
-    pending_spawn_reservations: pendingSpawnReservations,
+    unreachable_close_targets: unreachableCloseTargets,
     tracked_occupied: trackedOccupied,
-    occupied: trackedOccupied + pendingSpawnReservations,
+    occupied: trackedOccupied,
   };
 }
 
-function applyNativeThreadEdgesToSession(session, nativeThreadEdges) {
+function applyNativeThreadEdgesToSession(session, nativeThreadEdges, nowMs = Date.now()) {
   if (!nativeThreadEdges?.checked) return;
   for (const id of nativeThreadEdges.closed ?? []) {
     delete session.agents?.[id];
+  }
+  if (nativeThreadEdges.failed) return;
+  const nativeKnown = new Set([
+    ...(nativeThreadEdges.active ?? []),
+    ...(nativeThreadEdges.terminal ?? []),
+    ...(nativeThreadEdges.visible ?? []),
+    ...(nativeThreadEdges.closed ?? []),
+  ]);
+  for (const [id, agent] of Object.entries(session.agents ?? {})) {
+    if (nativeKnown.has(id)) continue;
+    const lastSeen = msFromIso(agent?.last_seen_at) || msFromIso(agent?.spawned_at);
+    if (Number.isFinite(lastSeen) && lastSeen > 0 && nowMs - lastSeen > NATIVE_LEDGER_LAG_TTL_MS) {
+      delete session.agents[id];
+    }
   }
 }
 
@@ -2104,6 +3815,7 @@ function mergeSummary(
   const nativeClosed = new Set(nativeThreadEdges?.closed ?? []);
   const nativeActive = new Set(nativeThreadEdges?.active ?? []);
   const nativeTerminal = new Set(nativeThreadEdges?.terminal ?? []);
+  const nativeVisible = new Set(nativeThreadEdges?.visible ?? []);
   const nativeLanes = nativeThreadEdges?.lanes instanceof Map ? nativeThreadEdges.lanes : new Map();
   const nativeChecked = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
   const nativeAuthoritative = nativeChecked;
@@ -2126,10 +3838,19 @@ function mergeSummary(
     capValue,
   );
   const transcriptSlotReliable = transcriptEstimateCanOverrideFallback;
-  const nativeUnresolved = nativeActive.size + nativeTerminal.size;
-  const nativeSlotActive = clampSlotCount(nativeActive.size, capValue);
+  const nativeRuntimeTerminal = new Set([...nativeTerminal]);
+  const nativeRuntimeActive = new Set([...nativeActive, ...nativeVisible]);
+  for (const id of nativeClosed) {
+    nativeRuntimeActive.delete(id);
+  }
+  for (const id of nativeRuntimeTerminal) {
+    nativeRuntimeActive.delete(id);
+  }
+  const nativeRuntimeUnresolved = new Set([...nativeRuntimeActive, ...nativeRuntimeTerminal]);
+  const nativeUnresolved = nativeRuntimeUnresolved.size;
+  const nativeSlotActive = clampSlotCount(nativeRuntimeActive.size, capValue);
   const nativeSlotTerminal = clampSlotCount(
-    Math.min(nativeTerminal.size, Math.max(0, capValue - nativeSlotActive)),
+    Math.min(nativeRuntimeTerminal.size, Math.max(0, capValue - nativeSlotActive)),
     capValue,
   );
   const nativeSlotOccupied = clampSlotCount(nativeSlotActive + nativeSlotTerminal, capValue);
@@ -2138,10 +3859,9 @@ function mergeSummary(
   const trackedOccupied = clampSlotCount(trackedUnresolved, capValue);
   const trackedAgentIds = new Set(sessionSummary.tracked_agent_ids ?? []);
   const nativeLedgerLagIds = nativeAuthoritative
-    ? [...trackedAgentIds].filter((id) => !nativeActive.has(id) && !nativeTerminal.has(id) && !nativeClosed.has(id))
+    ? [...trackedAgentIds].filter((id) => !nativeActive.has(id) && !nativeTerminal.has(id) && !nativeVisible.has(id) && !nativeClosed.has(id))
     : [];
   const nativeLedgerLag = nativeLedgerLagIds.length;
-  const pendingSpawnReservations = sessionSummary.pending_spawn_reservations ?? 0;
   const rawLastCapHitMs = Math.max(
     transcriptPool.capHitAtMs || 0,
     msFromIso(session.last_cap_hit_at),
@@ -2150,15 +3870,24 @@ function mergeSummary(
     transcriptPool.lastCloseAtMs || 0,
     msFromIso(session.last_close_at),
   );
+  const rawLastSpawnSuccessMs = Math.max(
+    transcriptPool.lastSpawnSuccessAtMs || 0,
+    msFromIso(session.last_spawn_success_at),
+  );
   const lastCapHitMs = rawLastCapHitMs > resetAtMs ? rawLastCapHitMs : 0;
   const lastCloseMs = Math.max(rawLastCloseMs, resetAtMs);
-  const capHitAfterLastClose = lastCapHitMs > 0 && lastCapHitMs > lastCloseMs;
-  const capHitBlocksSpawn = Boolean(capHitAfterLastClose && !nativeAuthoritative);
+  const lastCapacityRefreshMs = Math.max(rawLastCloseMs, rawLastSpawnSuccessMs, resetAtMs);
+  const capHitAfterLastClose = lastCapHitMs > 0 && lastCapHitMs >= lastCapacityRefreshMs;
+  const nativeEvidenceAtCap = nativeAuthoritative
+    && (nativeUnresolved + nativeLedgerLag >= capValue);
+  const capHitBlocksSpawn = capHitAfterLastClose && (!nativeAuthoritative || nativeEvidenceAtCap);
   let evidenceOccupied = transcriptSlotOccupied;
   let slotPressureSource = "transcript_fallback";
   if (nativeAuthoritative) {
     evidenceOccupied = clampSlotCount(nativeUnresolved + nativeLedgerLag, capValue);
-    slotPressureSource = nativeUnresolved > capValue
+    slotPressureSource = capHitBlocksSpawn
+      ? "runtime_cap_hit_overrides_native_edges"
+      : nativeUnresolved > capValue
       ? "native_open_edges_saturated"
       : nativeLedgerLag > 0
       ? "native_open_edges_plus_ledger"
@@ -2170,7 +3899,7 @@ function mergeSummary(
   const trackedAdmission = nativeAuthoritative ? 0 : trackedOccupied;
   const effectiveOccupied = capHitBlocksSpawn
     ? capValue
-    : clampSlotCount(Math.max(trackedAdmission, evidenceOccupied) + pendingSpawnReservations, capValue);
+    : clampSlotCount(Math.max(trackedAdmission, evidenceOccupied), capValue);
 
   return {
     ...sessionSummary,
@@ -2181,7 +3910,6 @@ function mergeSummary(
     transcript_unresolved: transcriptUnresolved,
     transcript_slot_reliable: transcriptSlotReliable,
     transcript_slot_events: transcriptPool.slotEstimateEvents ?? 0,
-    pending_spawn_reservations: pendingSpawnReservations,
     transcript_scanned: Boolean(transcriptPool.scanned),
     transcript_truncated: Boolean(transcriptPool.truncated),
     discovered_child_sessions: childSessionIds?.size ?? 0,
@@ -2189,10 +3917,12 @@ function mergeSummary(
     native_edge_authoritative: nativeAuthoritative,
     native_edge_failed: Boolean(nativeThreadEdges?.failed),
     native_edge_active: nativeSlotActive,
-    native_edge_active_debt: nativeActive.size,
+    native_edge_active_debt: nativeRuntimeActive.size,
     native_edge_closed: nativeClosed.size,
     native_edge_terminal: nativeSlotTerminal,
-    native_edge_terminal_debt: nativeTerminal.size,
+    native_edge_terminal_debt: nativeRuntimeTerminal.size,
+    native_visible_unarchived: nativeVisible.size,
+    native_visible_checked: Boolean(nativeThreadEdges?.visible_checked),
     native_edge_slot_occupied: nativeSlotOccupied,
     native_edge_debt: nativeUnresolved,
     native_edge_unresolved: nativeUnresolved,
@@ -2201,18 +3931,19 @@ function mergeSummary(
     native_edge_overflow: nativeEdgeOverflow,
     native_edge_cap: capValue,
     slot_pressure_source: slotPressureSource,
-    native_terminal_ids: [...nativeTerminal].slice(0, nativeSlotTerminal),
-    native_terminal_lanes: [...nativeTerminal]
-      .slice(0, nativeSlotTerminal)
+    native_terminal_ids: [...nativeRuntimeTerminal].slice(0, NATIVE_EDGE_REPAIR_BATCH),
+    native_terminal_lanes: [...nativeRuntimeTerminal]
+      .slice(0, NATIVE_EDGE_REPAIR_BATCH)
       .map((id) => nativeLanes.get(id) ?? { id }),
-    native_active_lanes: [...nativeActive]
+    native_active_lanes: [...nativeRuntimeActive]
       .slice(0, nativeSlotActive)
       .map((id) => nativeLanes.get(id) ?? { id }),
     native_edge_repaired: nativeThreadEdges?.repaired ?? 0,
     failed_spawns: transcriptPool.failedSpawns ?? 0,
     failed_closes: (transcriptPool.failedCloses ?? 0) + (msFromIso(session.last_close_failed_at) > lastCloseMs ? 1 : 0),
     last_cap_hit_at: isoFromMs(lastCapHitMs),
-    last_close_at: isoFromMs(lastCloseMs),
+    last_close_at: isoFromMs(Math.max(rawLastCloseMs, resetAtMs)),
+    last_spawn_success_at: isoFromMs(rawLastSpawnSuccessMs),
     native_pool_reset_at: isoFromMs(resetAtMs),
     cap_hit_after_last_close: capHitAfterLastClose,
     cap_hit_blocks_spawn: capHitBlocksSpawn,
@@ -2225,13 +3956,11 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   const requestedSpawns = spawnOperationCount(ops);
   if (requestedSpawns === 0) return false;
   if (isChildSession) return true;
+  if (hasForkContextRoleConflictInOperations(ops)) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
-  if (hasUnsupportedAgentTypeInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
   if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.native_edge_failed) return true;
-  if ((summary.pending_spawn_reservations ?? 0) > 0) return true;
-  if (requestedSpawns > 1) return true;
   if (summary.occupied + requestedSpawns > cap) return true;
   if (!summary.native_edge_authoritative && summary.tracked_occupied + requestedSpawns > cap) return true;
   if (
@@ -2248,6 +3977,7 @@ function shouldEmitAdvisory(eventName, name, summary, cap, operations = null) {
   const ops = operations ?? agentOperations({}, name);
   if (ops.length === 0) return false;
   if (hasUnsupportedAgentTypeInOperations(ops)) return true;
+  if (hasForkContextRoleConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
   if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.terminal > 0) return true;
@@ -2261,6 +3991,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const ops = operations ?? agentOperations(payload ?? {}, "");
   const checkSpawnShape = !isChildSession;
   const missingSpawnModel = checkSpawnShape && hasMissingSpawnModelInOperations(ops);
+  const forkContextRoleConflict = checkSpawnShape && hasForkContextRoleConflictInOperations(ops);
   const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
   const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
   const unsupportedAgentTypes = checkSpawnShape ? unsupportedAgentTypeViolations(ops) : [];
@@ -2268,7 +3999,7 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const explorerForbiddenModel = checkSpawnShape && hasExplorerForbiddenModelInOperations(ops);
   const requestedSpawns = spawnOperationCount(ops);
   const snapshot = capacitySnapshot(summary, cap, requestedSpawns);
-  const multiSpawnWithoutReservation = requestedSpawns > 1 && !snapshot.runtime_reservation;
+  const multiSpawnOverBudget = requestedSpawns > 1 && requestedSpawns > snapshot.observed_free;
   const parts = [
     `${blockSpawn ? "Native agent pool guard" : "Native agent pool advisory"}: ${summary.occupied}/${cap} estimated slots occupied`,
     formatCapacitySnapshot(snapshot),
@@ -2278,7 +4009,6 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     `transcript_slot=${summary.transcript_occupied}`,
     `transcript_unresolved=${summary.transcript_unresolved}`,
     `native_slots=${nativeEdgeSummary(summary)}`,
-    `pending_spawn_attempts=${summary.pending_spawn_reservations}`,
     `running=${summary.running}`,
     `completed_not_closed=${summary.terminal}`,
     `failed_closes=${summary.failed_closes}`,
@@ -2288,29 +4018,34 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
 
   const context = [
     parts.join(", ") + ".",
+    laneInventoryGuidance(summary),
+    blockSpawn && snapshot.observed_free === 0 ? zeroBudgetRecoveryGuidance(summary) : null,
+    forkContextRoleConflict
+      ? "Subagent spawn is blocked because fork_context=true cannot be combined with agent_type/role/type in this runtime. Full-history forks cannot override role. If role/model routing matters, remove fork_context and pass compact context in message/items. If exact full-history fork matters more, omit agent_type and model."
+      : null,
     forkContextModelConflict
       ? "Subagent spawn is blocked because fork_context=true cannot be combined with an explicit model in this runtime shape. This is a tool-shape failure, not native-pool exhaustion. If model routing matters, remove fork_context and include the necessary compact context in message/items, then retry one corrected spawn only after a refreshed observed_free snapshot is positive. If exact full-history fork matters more, omit model intentionally and accept inherited parent model."
       : null,
     unsupportedAgentType
       ? (blockSpawn
-        ? `Unsupported native agent_type: ${unsupportedAgentTypes.map((operation) => operationAgentRole(operation)).join(", ")}. Native agent_type is a runtime shape, not a semantic role prompt. Use agent_type=default for researcher/critic/verifier/architect-style semantic roles and put the role in the message/title with explicit model="${explorerFallbackModel()}" or model="gpt-5.5" as appropriate. Allowed native agent_type values: ${allowedAgentTypes().join(", ")}.`
-        : `Unsupported native agent_type observed after tool execution: ${unsupportedAgentTypes.map((operation) => operationAgentRole(operation)).join(", ")}. Future semantic roles such as researcher/critic/verifier must use native agent_type=default plus an explicit model and role text in the message/title.`)
+        ? `Configured native agent_type audit would reject: ${unsupportedAgentTypes.map((operation) => operationAgentRole(operation)).join(", ")}. Native agent_type availability belongs to Codex runtime; this hook should block only for capacity/collision safety. Configured audit baseline: ${allowedAgentTypes().join(", ")}.`
+        : `Configured native agent_type audit observed: ${unsupportedAgentTypes.map((operation) => operationAgentRole(operation)).join(", ")}. If runtime accepts it, the special native type is valid; if runtime rejects it, retry once with agent_type=default plus the same semantic role and explicit model.`)
       : null,
     missingSpawnModel
       ? (blockSpawn
-        ? `Subagent spawn is blocked until tool input includes an explicit model. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} when the task does not require a specialist model; use ${explorerModel()} only for capped scout/anchor work and gpt-5.5 only for critic, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
-        : `Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision unless fork_context=true was intentionally used for exact full-history inheritance. Future non-fork spawns must include the model field in the tool input.`)
+        ? `Subagent spawn is blocked until non-fork tool input includes an explicit model from the gpt-5.6 family. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} for reasoning-level child work; use ${explorerModel()} only for bounded locating; use gpt-5.6-sol for critic, code-review, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+        : "Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision unless fork_context=true was intentionally used for exact full-history inheritance. Future non-fork spawns must include the model field in the tool input.")
       : null,
     explorerForbiddenModel
       ? (blockSpawn
-        ? `Explorer/frontier route violation: native agent_type=explorer cannot use model="${explorerForbiddenModels().join("|")}". Explorer lanes are for scout/anchor work and should use ${explorerModel()} or ${explorerFallbackModel()}; if this is truly critic, architecture, security, high-risk, live-money judgment, or final approval, change the native role to agent_type=default and keep the explicit frontier model.`
-        : `Explorer/frontier route violation observed after tool execution: a spawn_agent call used native agent_type=explorer with a forbidden frontier model. Future frontier critic/architecture lanes must use agent_type=default; future explorer lanes must use ${explorerModel()} or ${explorerFallbackModel()}.`)
+        ? `Explorer/frontier route violation: native agent_type=explorer cannot use model="${explorerForbiddenModels().join("|")}". Do not use native explorer unless explicitly configured from proven runtime evidence. If this is locator work, use agent_type=default with ${explorerModel()}; if this is reasoning-level child work, use ${explorerFallbackModel()}; if this is critic, architecture, security, high-risk, live-money judgment, or final approval, use agent_type=default with the explicit frontier model.`
+        : `Explorer/frontier route violation observed after tool execution: a spawn_agent call used native agent_type=explorer with a forbidden frontier model. Future frontier critic/architecture lanes must use agent_type=default; future locator semantics should use ${explorerModel()}, and reasoning-level explorer/diagnosis should use ${explorerFallbackModel()}.`)
       : null,
     forkContextModelInheritance
-      ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for explorer/scout/mini routing, remove fork_context and pass compact context instead."
+      ? "Fork-context model inheritance exception: fork_context=true without model is allowed only because full-history fork may not support explicit model routing. Use it sparingly; for Luna/Terra/Sol routing, remove fork_context and pass compact context instead."
       : null,
-    multiSpawnWithoutReservation
-      ? "Multiple spawn_agent calls in one tool operation are blocked because observed_free is not an atomic runtime reservation. Split the batch: launch one child, let PostToolUse/native state record the result, then re-check observed_free before the next child."
+    multiSpawnOverBudget
+      ? "Multiple spawn_agent calls in one tool operation are blocked because requested_spawns exceeds the current observed_free snapshot. Reduce the batch size, close no-longer-needed current-parent lane(s), or resample after capacity changes."
       : null,
     blockSpawn && isChildSession
       ? "Nested native spawn is blocked: child sessions cannot create subagents; the parent leader owns delegation."
@@ -2318,20 +4053,22 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
     blockSpawn
       ? (forkContextModelConflict
         ? "Correct the spawn shape and retry only one corrected spawn call after the refreshed observed_free check; do not treat this as a consumed native slot or as proof the pool is full."
+        : forkContextRoleConflict
+        ? "Correct the spawn shape: fork_context=true means no agent_type and no model. For debugger/explore/critic/reviewer lanes, omit fork_context and pass compact task context."
         : unsupportedAgentType
-        ? "Retry only after converting semantic role names into a supported native runtime shape: usually agent_type=default with an explicit model and compact role contract in the message. Do not first try unsupported native roles and then fall back."
+        ? "Retry only after refreshing capacity; agent_type policy is advisory here and must not preempt Codex runtime availability."
         : missingSpawnModel
         ? "Retry only after making model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and the corrected call must still fit observed_free."
         : explorerForbiddenModel
-        ? "Retry only after correcting the role/model shape: explorer with Spark/mini for scout work, or default with explicit frontier model for critic/architecture/high-risk judgment. Do not re-label a frontier critic lane as explorer."
-        : multiSpawnWithoutReservation
-        ? "Retry as a single spawn call, then resample capacity before launching another child; do not restate every child prompt after a batch block."
+        ? "Retry only after correcting the role/model shape: Luna only for locating anchors, Terra for reasoning-level child work, or default with explicit Sol for critic/architecture/high-risk judgment. Do not re-label a frontier critic lane as explorer."
+        : multiSpawnOverBudget
+        ? "Retry only with requested_spawns<=observed_free, or close/resample first; do not restate every child prompt after a batch block."
         : isChildSession
         ? "Nested spawn denied; no child-side delegation guidance is emitted."
         : (summary.cap_hit_blocks_spawn
-          ? "This thread already saw a native pool-exhaustion failure after the last confirmed close/repair/reset; do not retry spawn_agent until a later close/repair/reset succeeds and a newer hook/PreToolUse capacity check reports budget."
-          : "This spawn is likely to fail or race another observed pending spawn attempt; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, wait for a needed active lane, or continue locally; then resample capacity and retry only within a fresh positive observed_free snapshot."))
-      : "Completed subagents are reusable context lanes and still consume native slots until closed; observed pending spawn attempts also count until the spawn succeeds, fails, or expires.",
+        ? "This thread has blocking native pool-exhaustion evidence; do not retry spawn_agent until a later close/repair/reset succeeds and a newer hook/PreToolUse capacity check reports budget. A stale cap-hit alone must not override a current authoritative positive-capacity native edge snapshot."
+        : "This spawn is likely to fail from current native capacity evidence; do not restate the long spawn prompt in commentary and do not stop at saying the pool is full. Reuse a compatible lane, close listed no-longer-needed current-parent lane(s) when the leader knows they are obsolete, or wait for a needed active lane; then resample capacity and retry only within a fresh positive observed_free snapshot. Do not convert pool-full into a silent local-only plan unless the user forbids delegation or the task no longer benefits from independent context."))
+      : "Completed subagents are reusable context lanes and still consume native slots until closed.",
     (summary.native_edge_overflow ?? 0) > 0
       ? `Native DB open-edge debt exceeds the runtime cap; occupied is intentionally saturated at the cap, and overflow rows are repair debt rather than additional live agents. db_open_edge_debt=${summary.native_edge_debt}, open_edge_overflow=${summary.native_edge_overflow}.`
       : null,
@@ -2402,6 +4139,10 @@ function applyTranscriptEvidenceToSession(session, transcriptPool) {
       transcriptPool.lastCloseAtMs,
       msFromIso(session.last_close_at),
     ));
+    session.last_spawn_success_at = isoFromMs(Math.max(
+      transcriptPool.lastSpawnSuccessAtMs,
+      msFromIso(session.last_spawn_success_at),
+    ));
     return;
   }
   if (transcriptPool.capHitAtMs > msFromIso(session.last_cap_hit_at)) {
@@ -2409,6 +4150,9 @@ function applyTranscriptEvidenceToSession(session, transcriptPool) {
   }
   if (transcriptPool.lastCloseAtMs > msFromIso(session.last_close_at)) {
     session.last_close_at = isoFromMs(transcriptPool.lastCloseAtMs);
+  }
+  if (transcriptPool.lastSpawnSuccessAtMs > msFromIso(session.last_spawn_success_at)) {
+    session.last_spawn_success_at = isoFromMs(transcriptPool.lastSpawnSuccessAtMs);
   }
 }
 
@@ -2418,6 +4162,11 @@ async function main() {
     const eventName = hookEventName(payload);
     const name = toolName(payload);
     if (!eventName) return;
+    const execGuard = externalCodexExecGuard(eventName, payload, name);
+    if (execGuard) {
+      process.stdout.write(`${JSON.stringify(execGuard)}\n`);
+      return;
+    }
     await loadRuntimeOptions();
     const operations = agentOperations(payload, name);
     if (safeString(process.env.NATIVE_AGENT_POOL_ADVISOR_DEBUG).trim() === "1") {
@@ -2428,13 +4177,15 @@ async function main() {
         operations,
       });
     }
-    if (isToolHookEvent(eventName) && operations.length === 0) return;
-
     const cap = await readAgentCap();
     const now = new Date();
     const nowMs = now.getTime();
     const nowIso = now.toISOString();
     const identity = await sessionIdentity(payload);
+    if (eventName === "PreCompact") {
+      process.stdout.write(`${JSON.stringify(buildPromptGuidanceOutput(eventName, [buildPreCompactRuntimeGuidance()]))}\n`);
+      return;
+    }
     if (eventName === "PreToolUse" && hasSpawnOperation(operations) && identity.unscoped) {
       const context = `Native agent pool guard: blocking spawn_agent because this hook payload has no session_id, thread_id, transcript_path session_meta, or parent_thread_id. Capacity is scoped per parent/session; an unscoped payload must not fall back to a shared cwd bucket. Retry only after Codex provides a scoped parent/session identity.`;
       process.stdout.write(`${JSON.stringify({
@@ -2450,6 +4201,7 @@ async function main() {
 
     const lockResult = await withStateLock(async () => {
       const state = await readState();
+      await sanitizeCodexGlobalStateNativeDisplayContext(identity.poolThreadId || identity.threadId, eventName);
       await maintainNativePoolStorage(state, nowMs, nowIso);
       pruneAdvisorSessions(state, nowMs);
       const session = normalizeSession(state, identity.key);
@@ -2457,60 +4209,122 @@ async function main() {
       pruneSpawnReservations(session, nowMs);
 
       const prompt = promptText(payload);
-      if (eventName === "SessionStart" || eventName === "UserPromptSubmit") {
-        let promptSummary = null;
-        if (eventName === "SessionStart" || eventName === "UserPromptSubmit") {
-          const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
-          const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
-          applyTranscriptEvidenceToSession(session, transcriptPool);
-          applyNativeThreadEdgesToSession(session, nativeThreadEdges);
-          promptSummary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
-        }
-        const emitCapacity = shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, identity.isChildSession, promptSummary, cap);
-        if (emitCapacity) markCapacityGuidanceEmitted(eventName, prompt, session, nowIso);
+      if (isToolHookEvent(eventName) && operations.length === 0 && eventName !== "PostToolUse") {
+        await sanitizeTranscriptRemovedNativeDisplayLabel(identity.transcript, eventName);
         session.updated_at = nowIso;
         state.updated_at = nowIso;
         await writeState(state);
-        if (emitCapacity) {
+        return;
+      }
+      if (eventName === "SessionStart" || eventName === "UserPromptSubmit" || eventName === "PostCompact") {
+        let promptSummary = null;
+        await sanitizeTranscriptRemovedNativeDisplayLabel(identity.transcript, eventName);
+        await sanitizeQuotedCloseStatusThreadTitle(identity.threadId, eventName);
+        const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
+        const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
+        if (shouldSanitizeTranscriptSubagentContext(eventName, session, nowMs)) {
+          const sanitized = await sanitizeTranscriptSubagentContext(
+            identity.transcript,
+            identity.poolThreadId || identity.threadId,
+            eventName,
+          );
+          if (sanitized > 0) session.last_subagent_context_sanitize_at = nowIso;
+        }
+        applyTranscriptEvidenceToSession(session, transcriptPool);
+        applyNativeThreadEdgesToSession(session, nativeThreadEdges, nowMs);
+        promptSummary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+        const emitCapacity = shouldEmitCapacityGuidance(eventName, prompt, session, nowMs, identity.isChildSession, promptSummary, cap);
+        const emitSpawnShape = shouldEmitSpawnShapeReminder(eventName, prompt, session, nowMs, emitCapacity, identity.isChildSession);
+        const mentionedAgentIdAudit = eventName === "UserPromptSubmit"
+          ? buildMentionedThreadIdAudit(
+            await lookupMentionedThreadIds(mentionedThreadIds(prompt), identity.poolThreadId || identity.threadId),
+            identity.poolThreadId || identity.threadId,
+          )
+          : "";
+        const quotedCloseStatusGuard = eventName === "UserPromptSubmit"
+          ? buildQuotedCloseStatusGuard(prompt, promptSummary)
+          : "";
+        if (emitCapacity) markCapacityGuidanceEmitted(eventName, prompt, session, nowIso);
+        if (emitSpawnShape) markSpawnShapeReminderEmitted(session, nowIso);
+        session.updated_at = nowIso;
+        state.updated_at = nowIso;
+        await writeState(state);
+        if (emitCapacity || emitSpawnShape || mentionedAgentIdAudit || quotedCloseStatusGuard) {
           const narrowSpawnIntent = eventName === "UserPromptSubmit"
             ? looksLikeNarrowSpawnIntentPrompt(prompt)
             : false;
+          const requestedSpawns = eventName === "UserPromptSubmit"
+            ? inferRequestedSpawnsFromPrompt(prompt)
+            : 0;
           const contexts = [
-            emitCapacity ? buildCapacityGuidance(eventName, cap, promptSummary, { narrowSpawnIntent }) : "",
+            emitCapacity ? buildCapacityGuidance(eventName, cap, promptSummary, { narrowSpawnIntent, requestedSpawns }) : "",
+            emitSpawnShape ? buildCompactSpawnShapeGuidance() : "",
+            mentionedAgentIdAudit,
+            quotedCloseStatusGuard,
           ];
           process.stdout.write(`${JSON.stringify(buildPromptGuidanceOutput(eventName, contexts))}\n`);
         }
         return;
       }
 
-      if (operations.length === 0) return;
-
       const resetAtMs = nativePoolResetMs(state, identity.poolThreadId || identity.threadId);
       const { transcriptPool, childSessionIds, nativeThreadEdges } = await collectPoolEvidence(identity, nowMs, resetAtMs, cap);
-      applyNativeThreadEdgesToSession(session, nativeThreadEdges);
+      applyNativeThreadEdgesToSession(session, nativeThreadEdges, nowMs);
+
+      if (operations.length === 0) {
+        const summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+        await sanitizeTranscriptRemovedNativeDisplayLabel(identity.transcript, eventName);
+        const emitCapacity = shouldEmitPostToolCapacityRefresh(eventName, session, nowMs, identity.isChildSession, summary, cap);
+        const emitToolSearchCorrection = eventName === "PostToolUse"
+          && !identity.isChildSession
+          && toolSearchReturnedNativeAgentSchema(payload, name);
+        if (emitCapacity) {
+          markCapacityGuidanceEmitted(eventName, prompt, session, nowIso);
+        }
+        if (emitToolSearchCorrection) {
+          markSpawnShapeReminderEmitted(session, nowIso);
+        }
+        session.updated_at = nowIso;
+        state.updated_at = nowIso;
+        await writeState(state);
+        if (emitToolSearchCorrection) {
+          process.stdout.write(`${JSON.stringify(buildToolSearchNativeAgentSchemaCorrection(eventName, summary, cap))}\n`);
+          return;
+        }
+        if (emitCapacity) {
+          process.stdout.write(`${JSON.stringify(buildPromptGuidanceOutput(eventName, [buildCapacityGuidance(eventName, cap, summary)]))}\n`);
+        }
+        return;
+      }
 
       const isPreSpawn = eventName === "PreToolUse" && hasSpawnOperation(operations);
       let summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
-      let blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
-
-      if (isPreSpawn && !blockSpawn) {
-        reserveSpawnSlot(session, payload, nowMs, nowIso, spawnOperationCount(operations));
-        summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
+      const closeGuard = buildCloseTargetGuard(
+        eventName,
+        await lookupCloseTargetRefs(closeTargetRefsFromOperations(operations), identity.poolThreadId),
+        summary,
+      );
+      if (closeGuard) {
+        session.updated_at = nowIso;
+        state.updated_at = nowIso;
+        await writeState(state);
+        process.stdout.write(`${JSON.stringify(closeGuard)}\n`);
+        return;
       }
+      let blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
+      let spawnCapacityFailureObserved = false;
 
       if (eventName === "PostToolUse") {
-        let clearedSpawnReservation = false;
         for (const operation of operations) {
           const operationPayload = payloadForOperation(payload, operation);
           if (operation.name === "spawn_agent") {
-            if (!clearedSpawnReservation) {
-              clearSpawnReservation(session, payload);
-              clearedSpawnReservation = true;
-            }
             markSpawned(session, operationPayload, nowIso);
-            for (const id of collectSpawnedAgentIds(operationPayload)) transcriptPool.active.add(id);
+            const spawnedIds = collectSpawnedAgentIds(operationPayload);
+            if (spawnedIds.length > 0) session.last_spawn_success_at = nowIso;
+            for (const id of spawnedIds) transcriptPool.active.add(id);
             if (textLooksSpawnCapacityFailure(responseText(operationPayload))) {
               session.last_cap_hit_at = nowIso;
+              spawnCapacityFailureObserved = true;
             }
             continue;
           }
@@ -2523,9 +4337,14 @@ async function main() {
           const missingCloseIds = closeLooksTargetMissing(operationPayload)
             ? collectCloseTargetIds(operationPayload)
             : [];
-          if (missingCloseIds.length > 0) {
+          const missingCloseRefs = closeLooksTargetMissing(operationPayload)
+            ? collectCloseTargetRefs(operationPayload)
+            : [];
+          if (missingCloseIds.length > 0 || missingCloseRefs.length > 0) {
             const repairedIds = await repairClosedNativeEdgeIds(identity.poolThreadId, missingCloseIds);
-            const unrepairedMissingIds = missingCloseIds.filter((id) => !repairedIds.has(id));
+            const refRepairedIds = await repairClosedNativeEdgeRefs(identity.poolThreadId, missingCloseRefs);
+            const parentScopedRepairedIds = new Set([...repairedIds, ...refRepairedIds]);
+            const unrepairedMissingIds = missingCloseIds.filter((id) => !parentScopedRepairedIds.has(id));
             const uniqueRepairedParents = await repairUniqueMissingNativeEdgeIds(unrepairedMissingIds);
             const nativeAuthoritative = Boolean(nativeThreadEdges?.checked && !nativeThreadEdges?.failed);
             const currentParentUniqueIds = new Set(
@@ -2533,7 +4352,7 @@ async function main() {
                 .filter(([, parentId]) => parentId === identity.poolThreadId)
                 .map(([id]) => id),
             );
-            const currentParentRepairedIds = new Set([...repairedIds, ...currentParentUniqueIds]);
+            const currentParentRepairedIds = new Set([...parentScopedRepairedIds, ...currentParentUniqueIds]);
             const verifiedFallbackMissingIds = missingCloseIds.filter((id) => {
               return Boolean(session.agents?.[id]) || transcriptPool.active.has(id) || transcriptPool.spawned.has(id);
             });
@@ -2548,6 +4367,31 @@ async function main() {
               transcriptPool.active.delete(id);
               transcriptPool.closed.add(id);
               transcriptPool.missingClosed.add(id);
+            }
+            const unrepairedRefs = missingCloseRefs.filter((ref) => {
+              const text = safeString(ref).trim();
+              if (!text || effectiveIds.has(text)) return false;
+              for (const id of effectiveIds) {
+                const lane = nativeThreadEdges?.lanes?.get(id);
+                if (text === safeString(lane?.nickname).trim() || text === safeString(lane?.title).trim()) return false;
+              }
+              return true;
+            });
+            if (unrepairedRefs.length > 0) {
+              if (!session.unreachable_close_targets || typeof session.unreachable_close_targets !== "object") {
+                session.unreachable_close_targets = {};
+              }
+              for (const ref of unrepairedRefs.slice(0, NATIVE_EDGE_REPAIR_BATCH)) {
+                const key = safeString(ref).trim();
+                if (!key) continue;
+                const previous = safeObject(session.unreachable_close_targets[key]) ?? {};
+                session.unreachable_close_targets[key] = {
+                  target: key,
+                  first_seen_at: safeString(previous.first_seen_at) || nowIso,
+                  last_seen_at: nowIso,
+                  count: Math.max(0, Number(previous.count) || 0) + 1,
+                };
+              }
             }
             if (effectiveIds.size > 0) session.last_close_at = nowIso;
             continue;
@@ -2589,6 +4433,10 @@ async function main() {
 
       summary = mergeSummary(summarize(session), transcriptPool, childSessionIds, nativeThreadEdges, session, resetAtMs, cap);
       if (!isPreSpawn) blockSpawn = shouldBlockSpawn(eventName, name, summary, cap, identity.isChildSession, payload, operations);
+      if (eventName === "PostToolUse" && spawnCapacityFailureObserved) {
+        process.stdout.write(`${JSON.stringify(buildSpawnCapacityFailureRecovery(eventName, summary, cap))}\n`);
+        return;
+      }
       if (blockSpawn || shouldEmitAdvisory(eventName, name, summary, cap, operations)) {
         process.stdout.write(`${JSON.stringify(buildAdvisory(eventName, summary, cap, blockSpawn, identity.isChildSession, payload, operations))}\n`);
       }

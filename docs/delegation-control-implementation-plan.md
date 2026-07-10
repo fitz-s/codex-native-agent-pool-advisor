@@ -6,7 +6,7 @@ Turn the native-agent guardrail from a collision-prevention hook into a small de
 
 - Preserve the leader agent's context by using subagents as reusable context lanes.
 - Prevent six-slot native pool collisions before the leader spends a long child prompt.
-- Prevent accidental frontier-model waste, especially explorer lanes using `gpt-5.5`.
+- Prevent accidental frontier-model waste, especially explorer lanes using `gpt-5.6-sol`.
 - Prevent the opposite failure where the leader avoids useful subagents because the safety guidance feels too risky or noisy.
 
 This plan does not make the hook decide whether delegation is semantically needed. It separates safety enforcement, delegation policy, lane lifecycle, and live audit into different artifacts.
@@ -34,8 +34,8 @@ These are not three independent bugs. They are symptoms of mixing four responsib
 
 - Native subagent capacity is per parent/session, with a six-slot default cap.
 - A completed child can still occupy a slot until `close_agent` succeeds or verified stale/not-found repair closes the current-parent edge.
-- There is no atomic runtime reservation API for multi-spawn batches.
-- `observed_free` is a current snapshot, not permission to batch-spawn that many children.
+- There is no Codex-internal reservation API for future multi-spawn batches.
+- `observed_free` is a current snapshot; only the immediate PreToolUse hook can locally admit a same-tool batch whose requested count fits it.
 - `wait_agent` and `send_input` do not free capacity.
 - Current Codex hook surfaces may not hard-block every native `spawn_agent` path with `PreToolUse`.
 - `fork_context=true` may require omitted `model`, so it is an explicit full-history inheritance exception.
@@ -54,12 +54,11 @@ Responsibilities:
 - Block or warn on observable hard errors:
   - child-session recursive spawn;
   - unscoped spawn hook payload;
-  - missing non-fork `model`;
+  - missing non-fork `model` on any native role;
   - `fork_context=true` plus explicit `model`;
-  - unsupported native `agent_type` values, because OMX/prompt semantic roles such as `researcher` should be message/title text on `agent_type=default` unless this exact runtime has successful live spawn evidence for them;
+  - optional native `agent_type` audit warnings when an install explicitly configures an allow-list; default live admission must let Codex runtime own special-type availability;
   - `agent_type=explorer` plus forbidden frontier model;
-  - observed pending same-turn spawn attempt debt with TTL, using the existing `SPAWN_RESERVATION_TTL_MS` default unless renamed during implementation;
-  - multi-spawn batch without runtime reservation;
+  - multi-spawn batch whose requested count exceeds the current observed free capacity;
   - zero free slots or unreadable native edge state.
 - Keep ordinary positive-budget guidance short.
 
@@ -80,7 +79,7 @@ Responsibilities:
   1. Delegate only when the subtask is independent, bounded, and reduces main-context load or runs in parallel without blocking the next local step.
   2. Reuse a same-topic compatible lane before spawning.
   3. Choose model from output contract, risk, state depth, and edit permission.
-  4. Launch at most one child, then resample capacity before launching another.
+  4. Launch only a batch that fits the immediate observed-free count, then resample capacity before launching another batch.
 - Make "no subagent" an explicit decision for subagent-relevant work:
   - Explicit user instructions such as "do not spawn agents" always win.
   - If the task is read-heavy, multi-slice, or explicitly asks for parallel work, the leader should either spawn/reuse or briefly state why it stays local.
@@ -171,7 +170,7 @@ Changes:
   - `delegate?`
   - `reuse?`
   - `model/role?`
-  - `spawn one and resample?`
+  - `spawn up to observed-free in this tool call, then resample?`
   - `retain or close lane?`
 - Remove wording that makes completion sound like a reason to close.
 - Add a "no silent under-delegation" clause only for subagent-relevant work.
@@ -183,7 +182,7 @@ Tests:
   - `completed lane is reusable`;
   - `close only when stale/wrong/cap-needed`;
   - `agent_type=default` for frontier critic lanes;
-  - `Spark/mini` for explorer lanes.
+  - Luna for locator lanes only; Terra for reasoning-level explorer/diagnosis/verification lanes.
 - Local deployment check, outside package tests:
   - root `~/.codex/AGENTS.md` contains the same compact protocol;
   - no `/Users/AGENTS.md` or `/Users/leofitz/AGENTS.md` is created.
@@ -198,14 +197,14 @@ Changes:
   - `LANES_OPEN=<n>`;
   - `LANES_COMPLETED_NOT_CLOSED=<n>`;
   - `LANE_REUSE_CHECK_REQUIRED=true` only when there is at least one current-parent lane.
-- For each lane, show:
+- For each lane in runtime hook guidance, show:
   - child id prefix;
   - nickname;
   - role;
   - model;
-  - title preview;
   - status.
   - `updated_at` or compact age.
+- Keep title/task prompt previews out of runtime hook guidance. They may remain in offline `live-check` JSON only.
 - Remove "close candidates" framing from positive-budget prompts.
 - Keep "close completed-not-closed candidates first" only in zero-budget recovery.
 
@@ -222,8 +221,9 @@ Problem: explicit wrong model selection is different from omitted model inherita
 
 Already implemented baseline:
 
-- Block non-fork missing `model`.
-- Block `agent_type=explorer` plus `gpt-5.5`.
+- Block non-fork missing `model` for every native role; semantic role never
+  substitutes for an explicit 5.6 model route.
+- Block `agent_type=explorer` plus `gpt-5.6-sol`.
 - Allow frontier lanes as `agent_type=default`.
 - Detect bypasses in `live-check`.
 
@@ -232,13 +232,13 @@ Additional changes:
 - Move forbidden explorer models into a documented config surface.
 - Add doc examples for correct frontier critic spawn shape.
 - Add a live-check option:
-  - `--forbid-explorer-model <model>` repeatable, defaulting to `gpt-5.5`.
+  - `--forbid-explorer-model <model>` repeatable, defaulting to `gpt-5.6-sol`.
 
 Tests:
 
 - Explorer plus forbidden model fails.
 - Default plus frontier model passes.
-- Spark/mini explorer passes.
+- Luna locator and Terra reasoning-level explorer passes.
 - Missing native edge does not report model mismatch.
 
 ### Phase E: Live Runtime Verification Harness
@@ -273,7 +273,8 @@ Tests:
 
 1. Over-delegation is reduced:
    - Positive-budget hook output no longer feels like a broad command to spawn.
-   - Multi-spawn remains blocked unless Codex gains atomic reservation semantics.
+   - Same-call multi-spawn is allowed only when `requested_spawns <= observed_free`;
+     after the tool result, the parent resamples before another batch.
    - Frontier model cannot be hidden under `agent_type=explorer`.
 
 2. Disposable lane churn is reduced:
@@ -290,7 +291,7 @@ Tests:
 - Do not mutate Codex runtime internals beyond current SQLite repair rules.
 - Do not infer task semantics from long prose inside the hook.
 - Do not force subagent use for every analysis task.
-- Do not make `agent_type` the semantic model router; only enforce invalid native role/model shapes and unsupported native runtime types.
+- Do not make `agent_type` the semantic model router; only enforce invalid model/fork shapes, explorer/frontier shape, and capacity collisions. Native type availability is runtime-owned.
 - Do not ask child agents to manage slots or spawn recursively.
 
 ## Open Risks
@@ -302,7 +303,7 @@ Tests:
 
 ## Success Criteria
 
-- `live-check` reports `native_explorer_frontier_model_violation` for historical `agent_type=explorer` plus `gpt-5.5` transcripts, reports unsupported semantic native `agent_type` usage, and shows no such violation in a new controlled compliant transcript window.
+- `live-check` reports `native_explorer_frontier_model_violation` for `agent_type=explorer` plus `gpt-5.6-sol`, reports unavailable native `agent_type` attempts as runtime spawn failures, rejects a successful non-fork missing-model spawn regardless of role, and shows no such violation in a new controlled compliant transcript window.
 - Positive-budget prompt guidance is materially shorter than zero-budget recovery guidance.
 - Hook output includes a compact lane digest with role/model/status/age when current-parent lanes exist.
 - Docs state completed lanes are reusable and should close only when stale, wrong-model/topic, cap-needed, or task-window complete.

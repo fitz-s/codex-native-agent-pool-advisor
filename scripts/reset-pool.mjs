@@ -129,6 +129,64 @@ async function sqliteJson(dbPath, sql) {
   }
 }
 
+async function sqliteTableColumns(dbPath, tableName) {
+  try {
+    const rows = await sqliteJson(dbPath, `pragma table_info(${tableName});`);
+    return new Set((Array.isArray(rows) ? rows : []).map((row) => String(row?.name ?? "").trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+async function visibleSubagentCount(dbPath, parent) {
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("archived")) return null;
+  const predicates = [];
+  if (threadColumns.has("thread_source")) predicates.push("thread_source='subagent'");
+  if (threadColumns.has("source")) predicates.push("source like '%\"parent_thread_id\"%'");
+  if (predicates.length === 0) return null;
+  const parentPredicate = parent && threadColumns.has("source")
+    ? `and source like ${sqlString(`%${parent}%`)}`
+    : "";
+  const sql = [
+    "select count(*) as count",
+    "from threads",
+    "where coalesce(archived,0)=0",
+    `and (${predicates.join(" or ")})`,
+    parentPredicate,
+  ].join(" ");
+  const rows = await sqliteJson(dbPath, sql);
+  return Number(rows?.[0]?.count ?? 0);
+}
+
+async function archiveVisibleSubagents(dbPath, parent) {
+  const threadColumns = await sqliteTableColumns(dbPath, "threads");
+  if (!threadColumns.has("archived")) return 0;
+  const predicates = [];
+  if (parent) {
+    predicates.push(`id in (select child_thread_id from thread_spawn_edges where parent_thread_id=${sqlString(parent)})`);
+    if (threadColumns.has("source")) predicates.push(`source like ${sqlString(`%${parent}%`)}`);
+  } else {
+    if (threadColumns.has("thread_source")) predicates.push("thread_source='subagent'");
+    if (threadColumns.has("source")) predicates.push("source like '%\"parent_thread_id\"%'");
+  }
+  if (predicates.length === 0) return 0;
+  const setParts = ["archived=1"];
+  if (threadColumns.has("archived_at")) {
+    setParts.push("archived_at=coalesce(archived_at, cast(strftime('%s','now') as integer))");
+  }
+  const sql = [
+    "pragma busy_timeout=1000;",
+    "update threads",
+    `set ${setParts.join(", ")}`,
+    "where coalesce(archived,0)=0",
+    `and (${predicates.join(" or ")});`,
+    "select changes() as changed;",
+  ].join(" ");
+  const rows = await sqliteJson(dbPath, sql);
+  return Number(rows?.[0]?.changed ?? 0);
+}
+
 async function markReset(home, parent, resetAt) {
   const path = join(home, "state", "native-agent-pool-advisor.json");
   const state = await readJsonOrDefault(path, {
@@ -176,6 +234,7 @@ async function main() {
 
   const where = args.parent ? `where parent_thread_id=${sqlString(args.parent)}` : "";
   const before = await sqliteJson(dbPath, `select status,count(*) as count from thread_spawn_edges ${where} group by status order by status;`);
+  const visibleBefore = await visibleSubagentCount(dbPath, args.parent);
   const scope = args.global ? "global" : "parent";
   const token = forceToken(scope, args.parent, before);
   if (args.dryRun) {
@@ -184,6 +243,7 @@ async function main() {
       scope,
       parent: args.parent || null,
       before,
+      visible_subagents_before: visibleBefore,
       force_token: token,
     }, null, 2)}\n`);
     return;
@@ -202,6 +262,7 @@ async function main() {
   const backupPath = `${dbPath}.backup-native-agent-pool-reset-${resetAt.replace(/[-:.]/g, "").replace("T", "T").replace("Z", "Z")}`;
   await copyFile(dbPath, backupPath);
 
+  const archivedVisibleSubagents = await archiveVisibleSubagents(dbPath, args.parent);
   const deleteSql = [
     "pragma busy_timeout=1000;",
     "create index if not exists idx_thread_spawn_edges_parent_status on thread_spawn_edges(parent_thread_id,status);",
@@ -216,10 +277,19 @@ async function main() {
     backup: backupPath,
     before,
     changed: Number(changedRows?.[0]?.changed ?? 0),
+    archived_visible_subagents: archivedVisibleSubagents,
     reset_at: resetAt,
   });
 
-  process.stdout.write(`${JSON.stringify({ reset_at: resetAt, backup: backupPath, parent: args.parent || null, before, changed: Number(changedRows?.[0]?.changed ?? 0) }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({
+    reset_at: resetAt,
+    backup: backupPath,
+    parent: args.parent || null,
+    before,
+    visible_subagents_before: visibleBefore,
+    changed: Number(changedRows?.[0]?.changed ?? 0),
+    archived_visible_subagents: archivedVisibleSubagents,
+  }, null, 2)}\n`);
 }
 
 main().catch((error) => {

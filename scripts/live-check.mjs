@@ -9,6 +9,9 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const GUIDANCE_MARKERS = [
   "SUBAGENT_MODEL_SELECTION_REQUIRED",
+  "NATIVE_SPAWN_SHAPE_CONTRACT",
+  "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_CORRECTION_REQUIRED",
+  "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY",
   "SPAWN_AGENT_OBSERVED_FREE",
   "SPAWN_AGENT_LOCAL_COUNTER_START",
   "SPAWN_AGENT_DISABLED_THIS_TURN",
@@ -19,6 +22,7 @@ const FAILURE_PATTERNS = [
   /unable to spawn/i,
   /cannot spawn/i,
   /failed to spawn/i,
+  /agent type is currently not available/i,
   /Full-history forked agents inherit/i,
   /agent.*limit/i,
   /pool.*full/i,
@@ -45,8 +49,8 @@ const CLOSE_RELEASE_NOT_FOUND_PATTERNS = [
   /no such agent/i,
   /invalid agent(?: id)?/i,
 ];
-const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.5"];
-const DEFAULT_ALLOWED_AGENT_TYPES = ["default", "explorer", "explore"];
+const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.6-sol"];
+const DEFAULT_ALLOWED_AGENT_TYPES = [];
 
 function usage() {
   return [
@@ -57,8 +61,8 @@ function usage() {
     "  --parent <thread_id>          Parent thread id; defaults to transcript session_meta id.",
     "  --since-line <n>              Scan transcript records starting at this 1-based line.",
     "  --expect-model <model>        Require a successful spawn whose tool input and native DB edge both use this model. Repeatable.",
-    "  --forbid-explorer-model <m>   Fail non-fork explorer spawns using this model. Repeatable; defaults include gpt-5.5.",
-    "  --allow-agent-type <type>      Permit a native spawn agent_type. Repeatable; defaults: default, explorer, explore.",
+    "  --forbid-explorer-model <m>   Fail non-fork explorer spawns using this model. Repeatable; defaults include gpt-5.6-sol.",
+    "  --allow-agent-type <type>      Enable optional native agent_type audit allowlist. Repeatable; defaults: no agent_type restriction.",
     "  --expect-current-open <n>     Require this parent/session to have exactly n open native edges after the scanned window.",
     "  --expect-all-closed           Require every successful spawn in the scanned window to have closed DB edge plus close success or verified not-found release evidence.",
     "  --require-guidance            Fail if no advisor guidance marker appears before the first scanned spawn.",
@@ -161,6 +165,22 @@ function preview(value, length = 140) {
   return text.length > length ? `${text.slice(0, length - 3)}...` : text;
 }
 
+function stableText(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function toolSearchOutputLooksLikeUnsafeNativeAgentSchema(payload) {
+  const text = stableText(payload);
+  return /tool_search_output|multi_agent_v1|Tools for spawning and managing sub-agents/i.test(text)
+    && /spawn_agent/i.test(text)
+    && /(?:inherited parent model is preferred|Spawned agents inherit your current model by default|Omit `?model`?|model overrides \(optional\)|model is optional|inherited default model)/i.test(text);
+}
+
 function explicitString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -191,6 +211,13 @@ function allowedAgentTypes(extraTypes = []) {
   ].map((role) => normalizeRole(role)).filter(Boolean));
 }
 
+function agentTypeAuditEnabled(args) {
+  const raw = typeof process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES === "string"
+    ? process.env.NATIVE_AGENT_POOL_ALLOWED_AGENT_TYPES.trim()
+    : "";
+  return raw.length > 0 || (Array.isArray(args.allowAgentTypes) && args.allowAgentTypes.length > 0);
+}
+
 function isExplorerRole(value) {
   const role = normalizeRole(value);
   return role === "explorer" || role === "explore";
@@ -202,6 +229,12 @@ function hasExplicitString(value) {
 
 function hasBooleanForkContext(args) {
   return (args?.fork_context ?? args?.forkContext) === true;
+}
+
+function hasForkContextRoleConflict(call) {
+  if (!call?.fork_context) return false;
+  const role = normalizeRole(call.agent_type);
+  return Boolean(role && role !== "default");
 }
 
 function parseOutputAgentId(value) {
@@ -305,6 +338,7 @@ function collectNestedAgentOperations(value, operations = []) {
 function readTranscript(text, sinceLine) {
   const markers = [];
   const calls = [];
+  const badNativeToolSearchSchemas = [];
   const spawnBatches = [];
   const outputsByCallId = new Map();
   const nestedCallIdsByWrapper = new Map();
@@ -336,7 +370,12 @@ function readTranscript(text, sinceLine) {
       }
     }
 
-    if (record.type === "response_item" && payload.type === "function_call") {
+    if (record.type === "response_item" && payload.type === "tool_search_output") {
+      if (toolSearchOutputLooksLikeUnsafeNativeAgentSchema(payload)) {
+        badNativeToolSearchSchemas.push({ line: lineNumber });
+      }
+      flushSpawnBatch();
+    } else if (record.type === "response_item" && payload.type === "function_call") {
       const name = normalizeAgentToolName(payload.name);
       if (name) {
         const args = parseCallArguments(payload.arguments);
@@ -414,6 +453,7 @@ function readTranscript(text, sinceLine) {
   return {
     sessionId,
     markers,
+    badNativeToolSearchSchemas,
     spawnBatches,
     calls: calls.map((call) => {
       const output = outputsByCallId.get(call.call_id) ?? null;
@@ -489,9 +529,16 @@ async function main() {
   const spawnBatches = transcript.spawnBatches ?? [];
   const failedSpawnCalls = spawnCalls.filter((call) => call.output?.failed);
   const spawnCallsMissingOutput = spawnCalls.filter((call) => !call.output);
-  const missingModelSpawns = spawnCalls.filter((call) => !call.fork_context && !call.has_model);
+  const missingModelSpawns = spawnCalls.filter((call) => {
+    if (call.fork_context) return false;
+    return !call.has_model;
+  });
   const missingModelCreated = missingModelSpawns.filter((call) => call.output?.agent_id && !call.output.failed);
+  const forkContextRoleConflictCreated = spawnCalls.filter((call) => {
+    return hasForkContextRoleConflict(call) && call.output?.agent_id && !call.output.failed;
+  });
   const explorerForbidden = forbiddenExplorerModels(args.forbidExplorerModels ?? []);
+  const auditAgentTypes = agentTypeAuditEnabled(args);
   const allowedAgentTypeSet = allowedAgentTypes(args.allowAgentTypes ?? []);
   const earliestSpawnLine = spawnCalls.reduce((line, call) => Math.min(line, call.line), Number.POSITIVE_INFINITY);
   const guidanceBeforeFirstSpawn = transcript.markers.some((marker) => marker.line < earliestSpawnLine);
@@ -527,16 +574,27 @@ async function main() {
     return isExplorerRole(report.call.agent_type) && explorerForbidden.has(toolModel);
   });
   const unsupportedAgentTypeAttempts = spawnCalls.filter((call) => {
-    if (call.fork_context) return false;
+    if (!auditAgentTypes) return false;
     const role = normalizeRole(call.agent_type);
     return role && !allowedAgentTypeSet.has(role);
   });
   const unsupportedAgentTypeReports = successfulSpawns.filter((call) => {
-    if (call.fork_context) return false;
+    if (!auditAgentTypes) return false;
     const role = normalizeRole(call.agent_type);
     return role && !allowedAgentTypeSet.has(role);
   });
   const expectedModels = Array.isArray(args.expectModels) ? args.expectModels.filter(Boolean) : [];
+  const badToolSearchSchemasBeforeSpawn = transcript.badNativeToolSearchSchemas.filter((entry) => entry.line < earliestSpawnLine);
+  const badToolSearchSchemasWithoutCorrection = badToolSearchSchemasBeforeSpawn.filter((entry) => {
+    return !transcript.markers.some((marker) => {
+      return marker.line > entry.line
+        && marker.line < earliestSpawnLine
+        && (
+          marker.marker === "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_CORRECTION_REQUIRED"
+          || marker.marker === "TOOL_SEARCH_NATIVE_AGENT_SCHEMA_IS_NOT_AUTHORITY"
+        );
+    });
+  });
   const checks = [
     buildCheck(
       "native_db_available",
@@ -549,6 +607,13 @@ async function main() {
       missingModelCreated.length === 0
         ? "no missing-model spawn created a child"
         : missingModelCreated.map((call) => `line ${call.line} -> ${call.output?.agent_id}`).join(", "),
+    ),
+    buildCheck(
+      "no_fork_context_role_spawn_created",
+      forkContextRoleConflictCreated.length === 0,
+      forkContextRoleConflictCreated.length === 0
+        ? "no fork_context=true spawn created a role/model-routed child"
+        : forkContextRoleConflictCreated.map((call) => `line ${call.line}:tool_role=${call.agent_type || "?"}, child=${call.output?.agent_id}`).join(", "),
     ),
     buildCheck(
       "tool_model_matches_native",
@@ -583,7 +648,7 @@ async function main() {
       "no_unsupported_native_agent_type_attempted",
       unsupportedAgentTypeAttempts.length === 0,
       unsupportedAgentTypeAttempts.length === 0
-        ? "no spawn attempted an unsupported native agent_type"
+        ? (auditAgentTypes ? "no spawn attempted an unsupported native agent_type" : "native agent_type audit disabled; runtime owns availability")
         : unsupportedAgentTypeAttempts.map((call) => {
           return `line ${call.line}:tool_role=${call.agent_type || "?"}, model=${call.model || "?"}, output=${call.output?.agent_id ? call.output.agent_id : call.output?.line ?? "missing"}, allowed=${[...allowedAgentTypeSet].join("|")}`;
         }).join(", "),
@@ -601,6 +666,15 @@ async function main() {
       failedSpawnCalls.length === 0
         ? "no spawn_agent calls returned runtime/tool failure"
         : failedSpawnCalls.map((call) => `line ${call.line} -> output line ${call.output?.line ?? "?"}`).join(", "),
+    ),
+    buildCheck(
+      "unsafe_tool_search_schema_corrected_before_spawn",
+      badToolSearchSchemasWithoutCorrection.length === 0,
+      badToolSearchSchemasBeforeSpawn.length === 0
+        ? "no unsafe native-agent tool_search schema appeared before a scanned spawn"
+        : badToolSearchSchemasWithoutCorrection.length === 0
+        ? "unsafe native-agent tool_search schema was followed by local correction before spawn"
+        : badToolSearchSchemasWithoutCorrection.map((entry) => `line ${entry.line} -> first spawn line ${earliestSpawnLine}`).join(", "),
     ),
     buildCheck(
       "guidance_before_first_spawn",
@@ -644,6 +718,8 @@ async function main() {
     ok: checkStatus !== "failed",
     verdict: checkStatus === "failed" && explorerFrontierReports.length > 0
       ? "native_explorer_frontier_model_violation"
+      : checkStatus === "failed" && forkContextRoleConflictCreated.length > 0
+      ? "native_fork_context_role_conflict_bypassed_advisor"
       : checkStatus === "failed" && unsupportedAgentTypeAttempts.length > 0
       ? "native_unsupported_agent_type_attempted"
       : checkStatus === "failed" && modelMismatchReports.length > 0
@@ -688,6 +764,7 @@ async function main() {
       model: call.model || null,
       reasoning_effort: call.reasoning_effort || null,
       fork_context: call.fork_context,
+      fork_context_role_conflict: hasForkContextRoleConflict(call),
       has_model: call.has_model,
       output_line: call.output?.line ?? null,
       created_agent_id: call.output?.agent_id || null,
