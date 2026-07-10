@@ -341,7 +341,7 @@ async function main() {
     if (decision) process.stdout.write(`${JSON.stringify(decision)}\n`);
     return;
   }
-  if (eventName === "SessionStart" || eventName === "UserPromptSubmit" || eventName === "PostCompact") {
+  if (eventName === "SessionStart" || eventName === "UserPromptSubmit" || eventName === "PostCompact" || eventName === "SubagentStop") {
     await sanitizeTranscript(safeString(payload.transcript_path ?? payload.transcriptPath).trim());
     await sanitizeGlobalState(home);
   }

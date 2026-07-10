@@ -44,10 +44,27 @@ The installer registers the hook only for:
 - `UserPromptSubmit`
 - `PreToolUse`
 - `PostCompact`
+- `SubagentStop`
 
 It retires the former global-state watcher: a launchd process that fabricated `PreToolUse` every 500ms. Retired watcher files and plist are renamed with `.disabled-...`; they are not deleted.
 
-`SessionStart`, prompt submission, and compaction only remove assistant-origin legacy status records such as failed `followup_task` lanes and `live agent path ... not found`. They emit no capacity narrative. This keeps a failed dispatch from becoming fresh parent context while preserving user text and normal evidence.
+`SessionStart`, prompt submission, compaction, and `SubagentStop` only remove assistant-origin legacy status records such as failed `followup_task` lanes and `live agent path ... not found`. They emit no capacity narrative. This keeps a failed dispatch from becoming fresh parent context while preserving user text and normal evidence.
+
+## Releasing Completed Subagents
+
+Completion is not release. `wait_agent` or a returned result only means the
+work is available to summarize. When the result has been integrated and the
+thread will receive no more follow-up, ask Codex to close the completed
+subagent thread. [Codex documents this as an orchestration responsibility](https://learn.chatgpt.com/docs/agent-configuration/subagents#orchestration-and-thread-controls); the
+guard does not reimplement it. Codex owns that action and emits the lifecycle result; the
+guard only permits a `close_agent` call that names an exact current-parent open
+child ID.
+
+Do not close by nickname, title, quoted status text, inferred path, or a stale
+transcript ID. A `not found` result is not release evidence: do not retry,
+spawn a replacement, or mutate SQLite. Inspect the subagent activity and let
+Codex reconcile its own thread state. `SubagentStop` is used only to sanitize
+completed-thread residue after the runtime reports the stop.
 
 ## Runtime Limits
 

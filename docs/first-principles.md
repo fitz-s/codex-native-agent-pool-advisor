@@ -25,6 +25,20 @@ When, and only when, the runtime emits `PreToolUse` for native `spawn_agent`, th
 
 The check is parent-scoped. Rows belonging to another parent do not consume this parent's budget.
 
+## Release
+
+Codex owns release. A parent first waits for or receives the child's result,
+integrates it, then asks Codex to close that completed thread when no follow-up
+is needed. Completion, `wait_agent`, and a missing target are not interchangeable
+with release.
+
+If the runtime presents `close_agent`, the guard accepts only an exact
+current-parent open child ID. It never derives a target from a nickname, title,
+quoted status, path, or transcript history. `not found` is a runtime discrepancy
+to inspect in Codex, never permission to retry, free capacity, or change SQLite.
+`SubagentStop` is a runtime event for hygiene and audit, not an instruction to
+close another thread.
+
 ## Routing
 
 The parent chooses model and effort independently for each task. Roles describe responsibility only.

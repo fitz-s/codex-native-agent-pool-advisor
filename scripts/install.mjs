@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceHook = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
-const ACTIVE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostCompact"];
+const ACTIVE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostCompact", "SubagentStop"];
 const RETIRED_EVENTS = ["PostToolUse", "PreCompact"];
 const WATCHER_LABEL = "com.fitz.codex-native-agent-pool-global-state-watch";
 

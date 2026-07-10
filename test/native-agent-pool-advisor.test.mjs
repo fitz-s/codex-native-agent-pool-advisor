@@ -157,6 +157,17 @@ test("close requires exact current-parent child id and never mutates native DB",
   });
 });
 
+test("SubagentStop is hygiene only and never releases a native edge", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+    const transcript = join(home, "stopped-child.jsonl");
+    await writeFile(transcript, JSON.stringify({ type: "session_meta", payload: { id: "parent1" } }));
+    assert.equal(await runHook(home, { hook_event_name: "SubagentStop", session_id: "parent1", transcript_path: transcript }), null);
+    assert.equal(await sqliteReadonly(home, "select status from thread_spawn_edges where child_thread_id='child1';"), "open");
+  });
+});
+
 test("unreadable native state blocks instead of transcript or local-state fallback", async () => {
   await withHome(async (home) => {
     const output = await runHook(home, spawnPayload());
@@ -183,7 +194,7 @@ test("transcript hygiene removes failed legacy agent operations but preserves us
       JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "call1", output: "live agent path `/root/yes_path_trace` not found" } }),
       JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "保留：我要先看当前证据。" }] } }),
     ].join("\n"));
-    await runHook(home, { hook_event_name: "UserPromptSubmit", session_id: "parent1", transcript_path: transcript, prompt: "continue" });
+    await runHook(home, { hook_event_name: "SubagentStop", session_id: "parent1", transcript_path: transcript });
     const text = await readFile(transcript, "utf-8");
     assert.match(text, /验证保留/);
     assert.match(text, /保留：我要先看当前证据/);
@@ -200,7 +211,7 @@ test("install retires watcher and registers only read-only control points", asyn
     await runScript(installPath, home);
     const doctor = JSON.parse((await runScript(doctorPath, home)).stdout);
     assert.equal(doctor.ok, true);
-    assert.deepEqual(doctor.checks.registrations, { SessionStart: 1, UserPromptSubmit: 1, PreToolUse: 1, PostCompact: 1 });
+    assert.deepEqual(doctor.checks.registrations, { SessionStart: 1, UserPromptSubmit: 1, PreToolUse: 1, PostCompact: 1, SubagentStop: 1 });
     assert.deepEqual(doctor.checks.retired_registrations, { PostToolUse: 0, PreCompact: 0 });
     const hooks = await readFile(join(home, "hooks.json"), "utf-8");
     assert.doesNotMatch(hooks, /PostToolUse|PreCompact/);
