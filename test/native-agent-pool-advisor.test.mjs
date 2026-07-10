@@ -203,6 +203,40 @@ test("transcript hygiene removes failed legacy agent operations but preserves us
   });
 });
 
+test("global state label hygiene preserves JSON and unrelated user history", async () => {
+  await withHome(async (home) => {
+    const state = {
+      "electron-persisted-atom-state": {
+        "prompt-history": {
+          parent1: [
+            "保留：我要先看当前证据。",
+            "[archived-child] native close-status display label]",
+          ],
+        },
+        nested: { status: "[removed native close-status display label]" },
+      },
+    };
+    const path = join(home, ".codex-global-state.json");
+    await writeFile(path, JSON.stringify(state));
+    await runHook(home, { hook_event_name: "UserPromptSubmit" });
+    const repaired = JSON.parse(await readFile(path, "utf-8"));
+    const history = repaired["electron-persisted-atom-state"]["prompt-history"].parent1;
+    assert.equal(history[0], "保留：我要先看当前证据。");
+    assert.equal(history[1], "[removed-native-agent-operation-status]");
+    assert.equal(repaired["electron-persisted-atom-state"].nested.status, "[removed-native-agent-operation-status]");
+  });
+});
+
+test("global state hygiene never rewrites malformed JSON", async () => {
+  await withHome(async (home) => {
+    const path = join(home, ".codex-global-state.json");
+    const malformed = '{"prompt-history":["[archived-child] native close-status display label]"';
+    await writeFile(path, malformed);
+    await runHook(home, { hook_event_name: "UserPromptSubmit" });
+    assert.equal(await readFile(path, "utf-8"), malformed);
+  });
+});
+
 test("install retires watcher and conflicting orchestration hooks", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

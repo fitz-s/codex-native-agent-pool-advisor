@@ -2,8 +2,8 @@
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile, rename, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 const DEFAULT_AGENT_CAP = 6;
@@ -225,6 +225,41 @@ function scrubAssistantOperationNarration(text) {
   return { text: current, removed };
 }
 
+function scrubGlobalStateString(text) {
+  const value = safeString(text);
+  const pattern = /\[(?:archived-child\]\s+|removed\s+)?native close-status display label\]/gi;
+  let removed = 0;
+  const scrubbed = value.replace(pattern, () => {
+    removed += 1;
+    return "[removed-native-agent-operation-status]";
+  });
+  return { text: scrubbed, removed };
+}
+
+function scrubGlobalStateValue(value) {
+  if (typeof value === "string") return scrubGlobalStateString(value).removed;
+  if (Array.isArray(value)) return value.reduce((total, item, index) => {
+    if (typeof item === "string") {
+      const scrub = scrubGlobalStateString(item);
+      if (scrub.removed > 0) value[index] = scrub.text;
+      return total + scrub.removed;
+    }
+    return total + scrubGlobalStateValue(item);
+  }, 0);
+  if (!value || typeof value !== "object") return 0;
+  let removed = 0;
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string") {
+      const scrub = scrubGlobalStateString(item);
+      if (scrub.removed > 0) value[key] = scrub.text;
+      removed += scrub.removed;
+    } else {
+      removed += scrubGlobalStateValue(item);
+    }
+  }
+  return removed;
+}
+
 function scrubAssistantMessageRecord(record) {
   const payload = safeObject(record?.payload);
   if (!payload) return 0;
@@ -316,12 +351,15 @@ async function sanitizeGlobalState(home) {
   try {
     if ((await stat(path)).size > MAX_GLOBAL_STATE_BYTES) return 0;
     const original = await readFile(path, "utf-8");
-    const scrub = scrubAssistantOperationNarration(original);
-    if (scrub.removed <= 0) return 0;
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, scrub.text, "utf-8");
-    return scrub.removed;
+    const state = JSON.parse(original);
+    const removed = scrubGlobalStateValue(state);
+    if (removed <= 0) return 0;
+    const temporary = `${path}.native-agent-pool-advisor.${process.pid}.tmp`;
+    await writeFile(temporary, JSON.stringify(state), "utf-8");
+    await rename(temporary, path);
+    return removed;
   } catch {
+    // A partial or corrupt Electron state file is not hook-owned input.
     return 0;
   }
 }
