@@ -182,7 +182,7 @@ Tests:
   - `completed lane is reusable`;
   - `close only when stale/wrong/cap-needed`;
   - `agent_type=default` for frontier critic lanes;
-  - Luna for locator lanes only; Terra for reasoning-level explorer/diagnosis/verification lanes.
+  - Luna for bounded fast evidence work and mechanical checks; Terra as the daily default for exploration, diagnosis, implementation, and verification; Sol only for highest-risk judgment.
 - Local deployment check, outside package tests:
   - root `~/.codex/AGENTS.md` contains the same compact protocol;
   - no `/Users/AGENTS.md` or `/Users/leofitz/AGENTS.md` is created.

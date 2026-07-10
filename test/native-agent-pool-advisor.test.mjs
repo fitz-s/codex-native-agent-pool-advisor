@@ -211,12 +211,12 @@ test("blocks wrapped spawn_agent when native edge cap is full", async () => {
     await sqlite(
       home,
       "insert into threads values "
-        + "('a1','/tmp/a1.jsonl','Active lane one','debugger','gpt-5.4-mini','high','Boyle','/repo',1779076001),"
-        + "('a2','/tmp/a2.jsonl','Active lane two','code-reviewer','gpt-5.5','high','Avicenna','/repo',1779076002),"
-        + "('a3','/tmp/a3.jsonl','Active lane three','critic','gpt-5.5','high','Pascal','/repo',1779076003),"
-        + "('a4','/tmp/a4.jsonl','Active lane four','debugger','gpt-5.4-mini','high','Dirac','/repo',1779076004),"
-        + "('a5','/tmp/a5.jsonl','Active lane five','debugger','gpt-5.4-mini','high','Linnaeus','/repo',1779076005),"
-        + "('a6','/tmp/a6.jsonl','Active lane six','debugger','gpt-5.4-mini','high','Euler','/repo',1779076006);",
+        + "('a1','/tmp/a1.jsonl','Active lane one','debugger','gpt-5.6-terra','high','Boyle','/repo',1779076001),"
+        + "('a2','/tmp/a2.jsonl','Active lane two','code-reviewer','gpt-5.6-sol','high','Avicenna','/repo',1779076002),"
+        + "('a3','/tmp/a3.jsonl','Active lane three','critic','gpt-5.6-sol','high','Pascal','/repo',1779076003),"
+        + "('a4','/tmp/a4.jsonl','Active lane four','debugger','gpt-5.6-terra','high','Dirac','/repo',1779076004),"
+        + "('a5','/tmp/a5.jsonl','Active lane five','debugger','gpt-5.6-terra','high','Linnaeus','/repo',1779076005),"
+        + "('a6','/tmp/a6.jsonl','Active lane six','debugger','gpt-5.6-terra','high','Euler','/repo',1779076006);",
     );
 
     const output = await runHook(home, {
@@ -229,7 +229,7 @@ test("blocks wrapped spawn_agent when native edge cap is full", async () => {
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map files",
             },
@@ -243,7 +243,7 @@ test("blocks wrapped spawn_agent when native edge cap is full", async () => {
     assert.match(output.reason, /LANES_OPEN=6/);
     assert.match(output.reason, /agent_id=a1/);
     assert.match(output.reason, /role=debugger/);
-    assert.match(output.reason, /model=gpt-5\.4-mini/);
+    assert.match(output.reason, /model=gpt-5\.6-terra/);
     assert.doesNotMatch(output.reason, /nick=Boyle/);
     assert.doesNotMatch(output.reason, /Active lane one/);
     assert.match(output.reason, /close listed current-parent lane/);
@@ -259,7 +259,7 @@ test("missing native edge database blocks spawn conservatively", async () => {
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -279,7 +279,7 @@ test("unscoped spawn hook payload blocks instead of merging cwd state", async ()
       tool_name: "spawn_agent",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -304,7 +304,7 @@ test("unrelated parent native open edges do not block current parent", async () 
       session_id: "empty-parent",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -360,7 +360,7 @@ test("prompt-time guidance requires lane reuse check when current-parent lanes e
     await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
     await sqlite(
       home,
-      "insert into threads values ('child1','/tmp/child1.jsonl','Zeus oracle wiring verifier','explorer','gpt-5.4-mini','medium','Pasteur','/repo',1779076009);",
+      "insert into threads values ('child1','/tmp/child1.jsonl','Zeus oracle wiring verifier','explorer','gpt-5.6-terra','medium','Pasteur','/repo',1779076009);",
     );
 
     const output = await runHook(home, {
@@ -373,7 +373,7 @@ test("prompt-time guidance requires lane reuse check when current-parent lanes e
     assert.match(context, /SPAWN_AGENT_OBSERVED_FREE=5/);
     assert.match(context, /LANE_REUSE_CHECK_REQUIRED=true/);
     assert.match(context, /agent_id=child1/);
-    assert.match(context, /model=gpt-5\.4-mini/);
+    assert.match(context, /model=gpt-5\.6-terra/);
     assert.doesNotMatch(context, /nick=Pasteur/);
     assert.match(context, /LANES_OPEN=1/);
     assert.match(context, /updated_at=/);
@@ -396,8 +396,8 @@ test("prompt-mentioned stale agent ids are not treated as current close targets"
     await sqlite(
       home,
       "insert into threads values "
-        + `('${closedId}','/tmp/closed.jsonl','Plato stale title','explore','gpt-5.3-codex-spark','high','Plato','/repo',1779074000,'{}','{}',1,1779074001),`
-        + `('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.4-mini','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
+        + `('${closedId}','/tmp/closed.jsonl','Plato stale title','explore','gpt-5.6-luna','high','Plato','/repo',1779074000,'{}','{}',1,1779074001),`
+        + `('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.6-terra','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
     );
 
     const output = await runHook(home, {
@@ -432,8 +432,8 @@ test("quoted close-status display names are not treated as current close targets
     await sqlite(
       home,
       "insert into threads values "
-        + `('${staleId}','/tmp/stale.jsonl','Archived display lane','explore','gpt-5.3-codex-spark','high','Plato','/repo',1779074000,'{}','{}',1,1779074001),`
-        + `('${completedId}','${completedTranscript.replace(/'/g, "''")}','Completed verifier','verifier','gpt-5.4-mini','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
+        + `('${staleId}','/tmp/stale.jsonl','Archived display lane','explore','gpt-5.6-luna','high','Plato','/repo',1779074000,'{}','{}',1,1779074001),`
+        + `('${completedId}','${completedTranscript.replace(/'/g, "''")}','Completed verifier','verifier','gpt-5.6-terra','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
     );
 
     const output = await runHook(home, {
@@ -540,7 +540,7 @@ test("global state native display labels are scrubbed before context reuse", asy
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','archived-019f1e1d','code-reviewer','gpt-5.5','high','archived-019f1e1d','/repo',1779076002,'{}','subagent',1,1779076003);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','archived-019f1e1d','code-reviewer','gpt-5.6-sol','high','archived-019f1e1d','/repo',1779076002,'{}','subagent',1,1779076003);",
     );
     const globalState = join(home, ".codex-global-state.json");
     await writeFile(
@@ -637,8 +637,8 @@ test("pre-tool close guard blocks stale archived nickname targets before runtime
     await sqlite(
       home,
       "insert into threads values "
-        + `('${closedId}','/tmp/closed.jsonl','Stale lane','explore','gpt-5.3-codex-spark','high','Plato','/repo',1779074000,'{}','{}',1,1779074001),`
-        + `('${closeCandidateId}','${closeCandidateTranscript.replace(/'/g, "''")}','Completed verifier','verifier','gpt-5.4-mini','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
+        + `('${closedId}','/tmp/closed.jsonl','Stale lane','explore','gpt-5.6-luna','high','Plato','/repo',1779074000,'{}','{}',1,1779074001),`
+        + `('${closeCandidateId}','${closeCandidateTranscript.replace(/'/g, "''")}','Completed verifier','verifier','gpt-5.6-terra','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
     );
 
     const output = await runHook(home, {
@@ -669,7 +669,7 @@ test("pre-tool close guard allows current-parent open id targets", async () => {
     await sqlite(home, `insert into thread_spawn_edges values ('parent1','${openId}','open');`);
     await sqlite(
       home,
-      `insert into threads values ('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.4-mini','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
+      `insert into threads values ('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.6-terra','high','Averroes','/repo',1779076002,'{}','{}',0,0);`,
     );
 
     const output = await runHook(home, {
@@ -693,7 +693,7 @@ test("pre-tool close guard blocks current-parent display-name targets before run
     await sqlite(home, `insert into thread_spawn_edges values ('parent1','${openId}','open');`);
     await sqlite(
       home,
-      `insert into threads values ('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.4-mini','high','Plato','/repo',1779076002,'{}','{}',0,0);`,
+      `insert into threads values ('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.6-terra','high','Plato','/repo',1779076002,'{}','{}',0,0);`,
     );
 
     const output = await runHook(home, {
@@ -723,7 +723,7 @@ test("positive prompt guidance exposes max spawn batch and three-lane admission 
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','/tmp/${id}.jsonl','active ${index}','debugger','gpt-5.4-mini','high','Active ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','/tmp/${id}.jsonl','active ${index}','debugger','gpt-5.6-terra','high','Active ${index}','/tmp',177907500${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -754,7 +754,7 @@ test("two-lane prompt with only one free slot requires reducing batch or closing
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','/tmp/${id}.jsonl','active ${index}','debugger','gpt-5.4-mini','high','Active ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','/tmp/${id}.jsonl','active ${index}','debugger','gpt-5.6-terra','high','Active ${index}','/tmp',177907500${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -786,7 +786,7 @@ test("Chinese parallel child-task prompt bypasses recent prompt guidance TTL for
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','/tmp/${id}.jsonl','active ${index}','debugger','gpt-5.4-mini','high','Active ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','/tmp/${id}.jsonl','active ${index}','debugger','gpt-5.6-terra','high','Active ${index}','/tmp',177907500${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -837,8 +837,7 @@ test("blocks wrapped spawn that would inherit the parent frontier model", async 
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /explicit model/);
-    assert.match(output.reason, /Default to gpt-5\.6-terra/);
+    assert.match(output.reason, /explicitly selects one of/);
     assert.match(output.reason, /gpt-5\.6-luna/);
     assert.match(output.reason, /gpt-5\.6-sol/);
   });
@@ -858,8 +857,8 @@ test("blocks non-explorer spawns that omit explicit model selection", async () =
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /explicit model/);
-    assert.match(output.reason, /Default to gpt-5\.6-terra/);
+    assert.match(output.reason, /explicitly selects one of/);
+    assert.match(output.reason, /gpt-5\.6-terra/);
     assert.match(output.reason, /model-selection judgment/);
   });
 });
@@ -899,7 +898,30 @@ test("blocks special native agent_type without an explicit model", async () => {
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /explicit model from the gpt-5\.6 family/);
+    assert.match(output.reason, /explicitly selects one of gpt-5\.6-luna, gpt-5\.6-terra, gpt-5\.6-sol/);
+  });
+});
+
+test("blocks retired Spark, 5.4, and 5.5 models for non-fork lanes", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    for (const model of ["gpt-5.3-codex-spark", "gpt-5.4-mini", "gpt-5.5"]) {
+      const output = await runHook(home, {
+        hook_event_name: "PreToolUse",
+        tool_name: "spawn_agent",
+        session_id: `parent-${model}`,
+        tool_input: {
+          agent_type: "default",
+          model,
+          reasoning_effort: "medium",
+          message: "Bounded investigation.",
+        },
+      });
+
+      assert.equal(output.decision, "block", model);
+      assert.match(output.reason, /retired for this install/);
+      assert.match(output.reason, /gpt-5\.6-luna, gpt-5\.6-terra, gpt-5\.6-sol/);
+    }
   });
 });
 
@@ -916,7 +938,7 @@ test("does not let special native agent_type bypass capacity limits", async () =
       session_id: "parent1",
       tool_input: {
         agent_type: "code-reviewer",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         reasoning_effort: "high",
         message: "Review the current diff.",
       },
@@ -946,7 +968,7 @@ test("treats null blank and non-string model values as missing model selection",
       });
 
       assert.equal(output.decision, "block");
-      assert.match(output.reason, /explicit model/);
+      assert.match(output.reason, /explicitly selects one of/);
     }
   });
 });
@@ -961,7 +983,7 @@ test("blocks fork_context spawn when it also specifies model", async () => {
       tool_input: {
         agent_type: "default",
         fork_context: true,
-        model: "gpt-5.4-mini",
+        model: "gpt-5.6-terra",
         reasoning_effort: "medium",
         message: "Trace with full context.",
       },
@@ -1015,7 +1037,7 @@ test("does not treat string fork_context as the model-inheritance exception", as
     });
 
     assert.equal(output.decision, "block");
-    assert.match(output.reason, /explicit model/);
+    assert.match(output.reason, /explicitly selects one of/);
   });
 });
 
@@ -1069,7 +1091,7 @@ test("allows explicit frontier model for default critic lanes", async () => {
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         reasoning_effort: "high",
         message: "Review architecture risk.",
       },
@@ -1360,7 +1382,7 @@ test("blocks wrapped multi-spawn when requested spawn count exceeds remaining ca
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map files",
             },
@@ -1369,7 +1391,7 @@ test("blocks wrapped multi-spawn when requested spawn count exceeds remaining ca
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map tests",
             },
@@ -1397,7 +1419,7 @@ test("allows wrapped multi-spawn when requested count fits observed capacity", a
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map files",
             },
@@ -1406,7 +1428,7 @@ test("allows wrapped multi-spawn when requested count fits observed capacity", a
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.4-mini",
+              model: "gpt-5.6-terra",
               reasoning_effort: "medium",
               message: "trace code path",
             },
@@ -1435,7 +1457,7 @@ test("wrapped multi-spawn post responses are matched by same-tool ordinal", asyn
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map files",
             },
@@ -1444,7 +1466,7 @@ test("wrapped multi-spawn post responses are matched by same-tool ordinal", asyn
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map tests",
             },
@@ -1473,7 +1495,7 @@ test("wrapped multi-spawn post responses are matched by same-tool ordinal", asyn
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map more files",
       },
@@ -1498,7 +1520,7 @@ test("wrapped multi-spawn post responses preserve distinct successful agent ids"
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map files",
             },
@@ -1507,7 +1529,7 @@ test("wrapped multi-spawn post responses preserve distinct successful agent ids"
             recipient_name: "functions.spawn_agent",
             parameters: {
               agent_type: "default",
-              model: "gpt-5.3-codex-spark",
+              model: "gpt-5.6-luna",
               reasoning_effort: "low",
               message: "map tests",
             },
@@ -1537,7 +1559,7 @@ test("native-readable empty edges still count successful local spawn ledger unti
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -1550,7 +1572,7 @@ test("native-readable empty edges still count successful local spawn ledger unti
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map another file",
       },
@@ -1573,7 +1595,7 @@ test("stale local spawn ledger lag does not override authoritative native DB", a
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -1592,7 +1614,7 @@ test("stale local spawn ledger lag does not override authoritative native DB", a
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map another file",
       },
@@ -1614,7 +1636,7 @@ test("native open edges with task_complete transcripts remain occupied close can
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',1778920000);`,
+        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.6-luna','low','Agent ${index}','/tmp',1778920000);`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -1643,7 +1665,7 @@ test("native open edges with task_complete transcripts remain occupied close can
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -1666,7 +1688,7 @@ test("overfull native open-edge evidence saturates occupied at the runtime cap",
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',177892000${index});`,
+        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.6-luna','low','Agent ${index}','/tmp',177892000${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -1691,7 +1713,7 @@ test("overfull native open-edge evidence saturates occupied at the runtime cap",
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -1716,9 +1738,9 @@ test("configured stale open edge repair closes only old current-parent lanes", a
       [
         "insert into thread_spawn_edges values ('parent1','old-child','open'),('parent1','fresh-child','open'),('parent2','other-old-child','open');",
         "insert into threads(id,rollout_path,title,agent_role,model,reasoning_effort,agent_nickname,cwd,updated_at,thread_source,archived,archived_at)",
-        `values ('old-child','/tmp/old.jsonl','Old lane','debugger','gpt-5.4-mini','high','Old','/tmp',${oldSeconds},'subagent',0,null),`,
-        `('fresh-child','/tmp/fresh.jsonl','Fresh lane','debugger','gpt-5.4-mini','high','Fresh','/tmp',${freshSeconds},'subagent',0,null),`,
-        `('other-old-child','/tmp/other-old.jsonl','Other old lane','debugger','gpt-5.4-mini','high','OtherOld','/tmp',${oldSeconds},'subagent',0,null);`,
+        `values ('old-child','/tmp/old.jsonl','Old lane','debugger','gpt-5.6-terra','high','Old','/tmp',${oldSeconds},'subagent',0,null),`,
+        `('fresh-child','/tmp/fresh.jsonl','Fresh lane','debugger','gpt-5.6-terra','high','Fresh','/tmp',${freshSeconds},'subagent',0,null),`,
+        `('other-old-child','/tmp/other-old.jsonl','Other old lane','debugger','gpt-5.6-terra','high','OtherOld','/tmp',${oldSeconds},'subagent',0,null);`,
       ].join(" "),
     );
 
@@ -1759,8 +1781,8 @@ test("stale close request repairs current-parent open edge without waiting for r
       [
         "insert into thread_spawn_edges values ('parent1','old-close-child','open'),('parent1','fresh-child','open');",
         "insert into threads(id,rollout_path,title,agent_role,model,reasoning_effort,agent_nickname,cwd,updated_at,thread_source,archived,archived_at)",
-        `values ('old-close-child','/tmp/old.jsonl','Old lane','debugger','gpt-5.4-mini','high','Old','/tmp',${freshSeconds},'subagent',0,null),`,
-        `('fresh-child','/tmp/fresh.jsonl','Fresh lane','debugger','gpt-5.4-mini','high','Fresh','/tmp',${freshSeconds},'subagent',0,null);`,
+        `values ('old-close-child','/tmp/old.jsonl','Old lane','debugger','gpt-5.6-terra','high','Old','/tmp',${freshSeconds},'subagent',0,null),`,
+        `('fresh-child','/tmp/fresh.jsonl','Fresh lane','debugger','gpt-5.6-terra','high','Fresh','/tmp',${freshSeconds},'subagent',0,null);`,
       ].join(" "),
     );
 
@@ -1801,7 +1823,7 @@ test("fresh close request grace period keeps current-parent edge open", async ()
       [
         "insert into thread_spawn_edges values ('parent1','recent-close-child','open');",
         "insert into threads(id,rollout_path,title,agent_role,model,reasoning_effort,agent_nickname,cwd,updated_at,thread_source,archived,archived_at)",
-        `values ('recent-close-child','/tmp/recent.jsonl','Recent lane','debugger','gpt-5.4-mini','high','Recent','/tmp',${freshSeconds},'subagent',0,null);`,
+        `values ('recent-close-child','/tmp/recent.jsonl','Recent lane','debugger','gpt-5.6-terra','high','Recent','/tmp',${freshSeconds},'subagent',0,null);`,
       ].join(" "),
     );
 
@@ -1827,7 +1849,7 @@ test("transcript close after a cap hit does not override current-parent overfull
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',177892000${index});`,
+        `insert into threads values ('${id}','${path}','done ${id}','explorer','gpt-5.6-luna','low','Agent ${index}','/tmp',177892000${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -1868,7 +1890,7 @@ test("transcript close after a cap hit does not override current-parent overfull
       transcript_path: transcript,
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -1910,7 +1932,7 @@ test("failed close after a cap hit does not free runtime capacity", async () => 
       transcript_path: transcript,
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -1996,7 +2018,7 @@ test("task_complete text in non-event transcript records does not mark native ed
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','live ${id}','explorer','gpt-5.3-codex-spark','low','Agent ${index}','/tmp',1778920000);`,
+        `insert into threads values ('${id}','${path}','live ${id}','explorer','gpt-5.6-luna','low','Agent ${index}','/tmp',1778920000);`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -2007,7 +2029,7 @@ test("task_complete text in non-event transcript records does not mark native ed
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2025,7 +2047,7 @@ test("task_complete outside terminal tail still counts as completed_not_closed",
     await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
     await sqlite(
       home,
-      `insert into threads values ('child1','${path}','done child1','explorer','gpt-5.3-codex-spark','low','Agent 1','/tmp',1778920000);`,
+      `insert into threads values ('child1','${path}','done child1','explorer','gpt-5.6-luna','low','Agent 1','/tmp',1778920000);`,
     );
 
     const output = await runHook(home, {
@@ -2064,7 +2086,7 @@ test("native authoritative state ignores stale transcript and never persists a s
       transcript_path: transcript,
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2168,7 +2190,7 @@ test("truncated transcript tail estimates do not undercut discovered child fallb
       transcript_path: transcript,
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2211,7 +2233,7 @@ test("truncated transcript tail close does not erase discovered child fallback",
       transcript_path: transcript,
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2235,7 +2257,7 @@ test("fresh lock contention blocks spawn conservatively", async () => {
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2256,7 +2278,7 @@ test("post-spawn thread-limit failure emits close-candidate recovery directive",
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.4-mini','high','Done ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.6-terra','high','Done ${index}','/tmp',177907500${index});`,
       );
     }
     const activePath = join(home, "active.jsonl");
@@ -2270,7 +2292,7 @@ test("post-spawn thread-limit failure emits close-candidate recovery directive",
     values.push("('parent1','active1','open')");
     await sqlite(
       home,
-      `insert into threads values ('active1','${activePath}','active lane','critic','gpt-5.5','high','Active','/tmp',1779075010);`,
+      `insert into threads values ('active1','${activePath}','active lane','critic','gpt-5.6-sol','high','Active','/tmp',1779075010);`,
     );
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
 
@@ -2280,7 +2302,7 @@ test("post-spawn thread-limit failure emits close-candidate recovery directive",
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.4-mini",
+        model: "gpt-5.6-terra",
         reasoning_effort: "high",
         message: "map FDR path",
       },
@@ -2308,7 +2330,7 @@ test("zero budget guidance lists all completed close candidates even when termin
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.4-mini','high','Done ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.6-terra','high','Done ${index}','/tmp',177907500${index});`,
       );
     }
     const activePath = join(home, "active.jsonl");
@@ -2322,7 +2344,7 @@ test("zero budget guidance lists all completed close candidates even when termin
     values.push("('parent1','active1','open')");
     await sqlite(
       home,
-      `insert into threads values ('active1','${activePath}','active lane','critic','gpt-5.5','high','Active','/tmp',1779075010);`,
+      `insert into threads values ('active1','${activePath}','active lane','critic','gpt-5.6-sol','high','Active','/tmp',1779075010);`,
     );
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
 
@@ -2357,7 +2379,7 @@ test("zero budget two-lane prompt treats completed lanes as close candidates not
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.4-mini','high','Done ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.6-terra','high','Done ${index}','/tmp',177907500${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -2388,7 +2410,7 @@ test("post-spawn pool-full recovery lists all completed close candidates beyond 
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.4-mini','high','Done ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.6-terra','high','Done ${index}','/tmp',177907500${index});`,
       );
     }
     const activePath = join(home, "active.jsonl");
@@ -2402,7 +2424,7 @@ test("post-spawn pool-full recovery lists all completed close candidates beyond 
     values.push("('parent1','active1','open')");
     await sqlite(
       home,
-      `insert into threads values ('active1','${activePath}','active lane','critic','gpt-5.5','high','Active','/tmp',1779075010);`,
+      `insert into threads values ('active1','${activePath}','active lane','critic','gpt-5.6-sol','high','Active','/tmp',1779075010);`,
     );
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
 
@@ -2412,7 +2434,7 @@ test("post-spawn pool-full recovery lists all completed close candidates beyond 
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.4-mini",
+        model: "gpt-5.6-terra",
         reasoning_effort: "high",
         message: "map FDR path",
       },
@@ -2452,7 +2474,7 @@ test("successful close_agent archives closed native child thread rows", async ()
       [
         "insert into thread_spawn_edges values ('parent1','child1','open');",
         "insert into threads(id,rollout_path,title,agent_role,model,reasoning_effort,agent_nickname,cwd,updated_at,thread_source,archived,archived_at)",
-        "values ('child1','/tmp/child1.jsonl','Archive Me','explorer','gpt-5.4-mini','medium','Scout','/tmp',1779074894,'subagent',0,null);",
+        "values ('child1','/tmp/child1.jsonl','Archive Me','explorer','gpt-5.6-terra','medium','Scout','/tmp',1779074894,'subagent',0,null);",
       ].join(" "),
     );
 
@@ -2494,7 +2516,7 @@ test("close_agent not found by short nickname does not repair current-parent lan
       home,
       [
         "insert into thread_spawn_edges values ('parent1','child1','open');",
-        "insert into threads values ('child1','/tmp/child1.jsonl','Trace Day0 forecast pipeline','explore','gpt-5.3-codex-spark','high','LaneAlpha','/tmp',1779074894);",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Trace Day0 forecast pipeline','explore','gpt-5.6-luna','high','LaneAlpha','/tmp',1779074894);",
       ].join(" "),
     );
 
@@ -2519,7 +2541,7 @@ test("close_agent not found for unknown short target records tombstone without f
       home,
       [
         "insert into thread_spawn_edges values ('parent1','child1','open');",
-        "insert into threads values ('child1','/tmp/child1.jsonl','Other lane','debugger','gpt-5.4-mini','high','Other','/tmp',1779074894);",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Other lane','debugger','gpt-5.6-terra','high','Other','/tmp',1779074894);",
       ].join(" "),
     );
 
@@ -2563,7 +2585,7 @@ test("not-found close without native DB requires verified current-lane evidence"
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2608,7 +2630,7 @@ test("close_agent not found for non-owned target does not release current-parent
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2645,7 +2667,7 @@ test("close_agent not found repairs unique native edge even when hook session is
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map one file",
       },
@@ -2694,7 +2716,7 @@ test("stale runtime cap hit does not override authoritative free native edge cou
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2722,7 +2744,7 @@ test("stale runtime cap hit does not override authoritative free native edge cou
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map another file",
       },
@@ -2745,7 +2767,7 @@ test("runtime not-found close after cap hit releases current-parent native slot"
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2775,7 +2797,7 @@ test("runtime not-found close after cap hit releases current-parent native slot"
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map one more file",
       },
@@ -2808,7 +2830,7 @@ test("wait_agent completion does not release a native edge slot", async () => {
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2847,7 +2869,7 @@ test("successful close_agent only repairs native edge for current parent", async
       session_id: "empty-parent",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2894,7 +2916,7 @@ test("max_threads is read from the agents TOML section only", async () => {
       session_id: "parent1",
       tool_input: {
         agent_type: "default",
-        model: "gpt-5.3-codex-spark",
+        model: "gpt-5.6-luna",
         reasoning_effort: "low",
         message: "map files",
       },
@@ -2962,7 +2984,7 @@ test("unarchived current-parent child threads count even when edges are missing"
     for (let index = 1; index <= 6; index += 1) {
       const id = `visible${index}`;
       threadValues.push(
-        `('${id}','/tmp/${id}.jsonl','visible ${index}','default','gpt-5.4-mini','high','Visible ${index}','/tmp',${nowSeconds},'${subagentSource("parent1", `Visible ${index}`)}','subagent',0,null)`,
+        `('${id}','/tmp/${id}.jsonl','visible ${index}','default','gpt-5.6-terra','high','Visible ${index}','/tmp',${nowSeconds},'${subagentSource("parent1", `Visible ${index}`)}','subagent',0,null)`,
       );
     }
     await sqlite(
@@ -2995,7 +3017,7 @@ test("unarchived child threads with closed native edges do not consume current-p
     for (let index = 1; index <= 6; index += 1) {
       const id = `closed_visible${index}`;
       threadValues.push(
-        `('${id}','/tmp/${id}.jsonl','closed visible ${index}','default','gpt-5.4-mini','high','Closed ${index}','/tmp',${nowSeconds},'${subagentSource("parent1", `Closed ${index}`)}','subagent',0,null)`,
+        `('${id}','/tmp/${id}.jsonl','closed visible ${index}','default','gpt-5.6-terra','high','Closed ${index}','/tmp',${nowSeconds},'${subagentSource("parent1", `Closed ${index}`)}','subagent',0,null)`,
       );
       edgeValues.push(`('parent1','${id}','closed')`);
     }
@@ -3033,7 +3055,7 @@ test("stale orphan visible child threads are archived before admission", async (
     for (let index = 1; index <= 19; index += 1) {
       const id = `orphan_visible${index}`;
       threadValues.push(
-        `('${id}','/tmp/${id}.jsonl','orphan visible ${index}','default','gpt-5.4-mini','high','Orphan ${index}','/tmp',${oldSeconds},'${subagentSource("parent1", `Orphan ${index}`)}','subagent',0,null)`,
+        `('${id}','/tmp/${id}.jsonl','orphan visible ${index}','default','gpt-5.6-terra','high','Orphan ${index}','/tmp',${oldSeconds},'${subagentSource("parent1", `Orphan ${index}`)}','subagent',0,null)`,
       );
     }
     await sqlite(home, `insert into threads values ${threadValues.join(",")};`);
@@ -3068,7 +3090,7 @@ test("current-parent closed edges archive visible child threads before admission
       const id = `closed_visible${index}`;
       edgeValues.push(`('parent1','${id}','closed')`);
       threadValues.push(
-        `('${id}','/tmp/${id}.jsonl','closed visible ${index}','default','gpt-5.4-mini','high','Closed ${index}','/tmp',${nowSeconds},'${subagentSource("parent1", `Closed ${index}`)}','subagent',0,null)`,
+        `('${id}','/tmp/${id}.jsonl','closed visible ${index}','default','gpt-5.6-terra','high','Closed ${index}','/tmp',${nowSeconds},'${subagentSource("parent1", `Closed ${index}`)}','subagent',0,null)`,
       );
     }
     await sqlite(
@@ -3112,7 +3134,7 @@ test("current-parent closed edge archiving tolerates missing archived_at column"
       [
         "insert into thread_spawn_edges values ('parent1','closed_visible','closed');",
         "insert into threads values",
-        `('closed_visible','/tmp/closed.jsonl','closed visible','default','gpt-5.4-mini','high','Closed','/tmp',${nowSeconds},'${subagentSource("parent1", "Closed")}','subagent',0);`,
+        `('closed_visible','/tmp/closed.jsonl','closed visible','default','gpt-5.6-terra','high','Closed','/tmp',${nowSeconds},'${subagentSource("parent1", "Closed")}','subagent',0);`,
       ].join(" "),
     );
 
@@ -3183,8 +3205,8 @@ test("post-compact sanitizes closed archived lanes from visible subagents contex
     await sqlite(
       home,
       "insert into threads values "
-        + `('${closedId}','/tmp/closed.jsonl','archived stale child','explore','gpt-5.3-codex-spark','high','archived-019efe2f','/repo',1779074000,'${subagentSource("parent1", "archived-019efe2f")}','subagent',1,1779074001),`
-        + `('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.4-mini','high','Averroes','/repo',1779076002,'${subagentSource("parent1", "Averroes")}','subagent',0,0);`,
+        + `('${closedId}','/tmp/closed.jsonl','archived stale child','explore','gpt-5.6-luna','high','archived-019efe2f','/repo',1779074000,'${subagentSource("parent1", "archived-019efe2f")}','subagent',1,1779074001),`
+        + `('${openId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.6-terra','high','Averroes','/repo',1779076002,'${subagentSource("parent1", "Averroes")}','subagent',0,0);`,
     );
 
     await runHook(home, {
@@ -3240,8 +3262,8 @@ test("post-compact sanitizes mentioned archived child ids from another parent wi
     await sqlite(
       home,
       "insert into threads values "
-        + `('${otherClosedId}','/tmp/closed.jsonl','archived stale child','explore','gpt-5.3-codex-spark','high','archived-019efe2f','/repo',1779074000,'${subagentSource("other-parent", "archived-019efe2f")}','subagent',1,1779074001),`
-        + `('${currentOpenId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.4-mini','high','Averroes','/repo',1779076002,'${subagentSource("current-parent", "Averroes")}','subagent',0,0);`,
+        + `('${otherClosedId}','/tmp/closed.jsonl','archived stale child','explore','gpt-5.6-luna','high','archived-019efe2f','/repo',1779074000,'${subagentSource("other-parent", "archived-019efe2f")}','subagent',1,1779074001),`
+        + `('${currentOpenId}','/tmp/open.jsonl','Current debugger','debugger','gpt-5.6-terra','high','Averroes','/repo',1779076002,'${subagentSource("current-parent", "Averroes")}','subagent',0,0);`,
     );
 
     await runHook(home, {
@@ -3270,8 +3292,8 @@ test("completed visible child lanes are close candidates and not duplicated as o
       [
         "insert into thread_spawn_edges values ('parent1','active1','open'),('parent1','done1','open');",
         "insert into threads values",
-        `('active1','/tmp/active1.jsonl','active lane','default','gpt-5.4-mini','high','Active','/tmp',${nowSeconds},'${subagentSource("parent1", "Active")}','subagent',0,null),`,
-        `('done1','${donePath.replace(/'/g, "''")}','done lane','default','gpt-5.4-mini','high','Done','/tmp',${nowSeconds},'${subagentSource("parent1", "Done")}','subagent',0,null);`,
+        `('active1','/tmp/active1.jsonl','active lane','default','gpt-5.6-terra','high','Active','/tmp',${nowSeconds},'${subagentSource("parent1", "Active")}','subagent',0,null),`,
+        `('done1','${donePath.replace(/'/g, "''")}','done lane','default','gpt-5.6-terra','high','Done','/tmp',${nowSeconds},'${subagentSource("parent1", "Done")}','subagent',0,null);`,
       ].join(" "),
     );
 
@@ -3303,7 +3325,7 @@ test("open native edge unarchives restored child thread before admission", async
       [
         "insert into thread_spawn_edges values ('parent1','restored1','open');",
         "insert into threads values",
-        `('restored1','/tmp/restored1.jsonl','restored lane','default','gpt-5.4-mini','high','Restored','/tmp',${nowSeconds},'${subagentSource("parent1", "Restored")}','subagent',1,${nowSeconds});`,
+        `('restored1','/tmp/restored1.jsonl','restored lane','default','gpt-5.6-terra','high','Restored','/tmp',${nowSeconds},'${subagentSource("parent1", "Restored")}','subagent',1,${nowSeconds});`,
       ].join(" "),
     );
 
@@ -3361,7 +3383,7 @@ test("post-tool non-agent capacity refresh restores close-before-spawn guidance 
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.4-mini','high','Done ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.6-terra','high','Done ${index}','/tmp',177907500${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -3408,7 +3430,7 @@ test("post-tool tool_search native schema output is corrected before spawn", asy
       values.push(`('parent1','${id}','open')`);
       await sqlite(
         home,
-        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.4-mini','high','Done ${index}','/tmp',177907500${index});`,
+        `insert into threads values ('${id}','${path}','completed lane ${index}','debugger','gpt-5.6-terra','high','Done ${index}','/tmp',177907500${index});`,
       );
     }
     await sqlite(home, `insert into thread_spawn_edges values ${values.join(",")};`);
@@ -3459,9 +3481,9 @@ test("periodic maintenance prunes only expired closed native edges", async () =>
         "('parent1','old_open','open'),",
         "('parent1','orphan_closed','closed');",
         "insert into threads values",
-        `('old_closed','/tmp/old.jsonl','old','default','gpt-5.4-mini','high','Old','/tmp',${oldSeconds},'subagent',0,${oldSeconds}),`,
-        `('recent_closed','/tmp/recent.jsonl','recent','default','gpt-5.4-mini','high','Recent','/tmp',${recentSeconds},'subagent',0,${recentSeconds}),`,
-        `('old_open','/tmp/open.jsonl','open','default','gpt-5.4-mini','high','Open','/tmp',${oldSeconds},'subagent',0,null);`,
+        `('old_closed','/tmp/old.jsonl','old','default','gpt-5.6-terra','high','Old','/tmp',${oldSeconds},'subagent',0,${oldSeconds}),`,
+        `('recent_closed','/tmp/recent.jsonl','recent','default','gpt-5.6-terra','high','Recent','/tmp',${recentSeconds},'subagent',0,${recentSeconds}),`,
+        `('old_open','/tmp/open.jsonl','open','default','gpt-5.6-terra','high','Open','/tmp',${oldSeconds},'subagent',0,null);`,
       ].join(" "),
     );
 
@@ -3523,21 +3545,17 @@ test("prompt-time guidance requires explicit model-selection judgment when spawn
     assert.match(context, /full-history forks cannot override role or model/i);
     assert.match(context, /task_contract=\{output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition\}/);
     assert.match(context, /Every non-fork spawn_agent call/);
-    assert.match(context, /default to model=\"gpt-5\.6-terra\"/);
-    assert.match(context, /model=\"gpt-5\.6-luna\"/);
-    assert.match(context, /model=\"gpt-5\.6-terra\"/);
-    assert.match(context, /model=\"gpt-5\.6-sol\"/);
-    assert.match(context, /bounded locating/);
-    assert.match(context, /Luna must not own durable conclusions/);
-    assert.match(context, /tracing, diagnosis, synthesis/);
-    assert.match(context, /frontier judgment/);
-    assert.match(context, /Luna search contract/);
-    assert.match(context, /Luna must not own durable conclusions or broad synthesis/);
-    assert.match(context, /rg --max-count\/--max-filesize/);
+    assert.match(context, /explicitly select one of gpt-5\.6-luna, gpt-5\.6-terra, gpt-5\.6-sol/);
+    assert.match(context, /gpt-5\.6-terra as the daily default/);
+    assert.match(context, /bounded, high-throughput search, extraction/);
+    assert.match(context, /short evidence-led investigations/);
+    assert.match(context, /Start reasoning_effort at medium/);
+    assert.match(context, /hardest ambiguous architecture/);
+    assert.match(context, /Luna contracts need scope, output cap, and stop condition/);
     assert.match(context, /runtime 'agent type is currently not available'/);
-    assert.match(context, /If you cannot state the child output cap, stop condition, and bounded search shape, do not use Luna/);
+    assert.match(context, /bounded investigation contract, not a prohibition/);
     assert.match(context, /multi-spawn tool call must fit the current PreToolUse observed_free/);
-    assert.match(context, /large-context repos, first make a local module\/file map/);
+    assert.match(context, /large-context repos, give Luna bounded evidence slices/);
     assert.match(context, /This judgment step is mandatory/);
     assert.match(context, /inheritance can silently select the wrong 5\.6 family member/);
     assert.match(context, /must not override positive-capacity guidance/);
@@ -3571,7 +3589,7 @@ test("post-compact emits compact native spawn shape contract", async () => {
     assert.match(context, /gpt-5\.6-terra/);
     assert.match(context, /gpt-5\.6-sol/);
     assert.match(context, /Luna compaction rule/);
-    assert.match(context, /bounded search shape plus output cap\/stop condition/);
+    assert.match(context, /bounded investigation contract with output cap and stop condition/);
   });
 });
 
@@ -3839,7 +3857,7 @@ test("live-check detects real missing-model native spawn bypass evidence", async
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Test E2E','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Test E2E','explorer','gpt-5.6-sol','low','Mencius','/tmp',1779074894);",
     );
     const transcript = join(home, "parent.jsonl");
     await writeFile(
@@ -3863,7 +3881,7 @@ test("live-check detects real missing-model native spawn bypass evidence", async
     assert.equal(output.verdict, "native_spawn_missing_model_bypassed_advisor");
     assert.equal(output.spawn_calls[0].has_model, false);
     assert.equal(output.spawn_calls[0].created_agent_id, "child1");
-    assert.equal(output.spawn_calls[0].native_edge.model, "gpt-5.5");
+    assert.equal(output.spawn_calls[0].native_edge.model, "gpt-5.6-sol");
   });
 });
 
@@ -3873,7 +3891,7 @@ test("live-check treats blank model as missing model bypass evidence", async () 
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Blank Model','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Blank Model','explorer','gpt-5.6-sol','low','Mencius','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-blank-model.jsonl");
     await writeFile(
@@ -3904,7 +3922,7 @@ test("live-check allows boolean fork_context spawn without explicit model", asyn
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Fork Model','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Fork Model','explorer','gpt-5.6-sol','low','Mencius','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-fork-model.jsonl");
     await writeFile(
@@ -3967,7 +3985,7 @@ test("live-check detects fork_context role conflict that created a child", async
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','open');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Fork role conflict','debugger','gpt-5.4-mini','high','Hubble','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Fork role conflict','debugger','gpt-5.6-terra','high','Hubble','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-fork-role-conflict.jsonl");
     await writeFile(
@@ -3999,7 +4017,7 @@ test("live-check fails unsafe tool_search native schema before spawn without cor
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','open');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Missing model child','debugger','gpt-5.4-mini','high','Parfit','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Missing model child','debugger','gpt-5.6-terra','high','Parfit','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-tool-search-schema.jsonl");
     await writeFile(
@@ -4032,14 +4050,14 @@ test("live-check supports configurable forbidden explorer models", async () => {
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Mini Explorer','explorer','gpt-5.4-mini','medium','Scout','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Mini Explorer','explorer','gpt-5.6-terra','medium','Scout','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-forbid-mini.jsonl");
     await writeFile(
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"Mini explorer lane.\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"explorer\\",\\"model\\":\\"gpt-5.6-terra\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"Mini explorer lane.\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Scout\\"}"}}',
       ].join("\n"),
     );
@@ -4049,7 +4067,7 @@ test("live-check supports configurable forbidden explorer models", async () => {
       await runScript(liveCheckPath, home, [
         "--transcript", transcript,
         "--allow-missing-guidance",
-        "--forbid-explorer-model", "gpt-5.4-mini",
+        "--forbid-explorer-model", "gpt-5.6-terra",
       ]);
     } catch (caught) {
       error = caught;
@@ -4067,14 +4085,14 @@ test("live-check allows special native agent_type attempts by default", async ()
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Mini Researcher','researcher','gpt-5.4-mini','high','Feynman','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Mini Researcher','researcher','gpt-5.6-terra','high','Feynman','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-unsupported-agent-type.jsonl");
     await writeFile(
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"researcher\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"External reference research.\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"researcher\\",\\"model\\":\\"gpt-5.6-terra\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"External reference research.\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Feynman\\"}"}}',
       ].join("\n"),
     );
@@ -4095,7 +4113,7 @@ test("live-check rejects a successful special native agent_type without an expli
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Code Review','code-reviewer','gpt-5.5','high','Anscombe','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Code Review','code-reviewer','gpt-5.6-sol','high','Anscombe','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-code-reviewer-fixed-model.jsonl");
     await writeFile(
@@ -4159,7 +4177,7 @@ test("live-check detects unsupported probe followed by missing-model default fal
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','open');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Fallback Critic','default','gpt-5.5','high','Gibbs','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Fallback Critic','default','gpt-5.6-sol','high','Gibbs','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-unsupported-then-default-missing-model.jsonl");
     await writeFile(
@@ -4197,14 +4215,14 @@ test("live-check detects native model mismatch for explicit-model spawn", async 
     await sqlite(
       home,
       "insert into thread_spawn_edges values ('parent1','child1','closed');"
-        + "insert into threads values ('child1','/tmp/child.jsonl','Mismatch','explorer','gpt-5.5','low','Mencius','/tmp',1779074894);",
+        + "insert into threads values ('child1','/tmp/child.jsonl','Mismatch','explorer','gpt-5.6-sol','low','Mencius','/tmp',1779074894);",
     );
     const transcript = join(home, "parent-model-mismatch.jsonl");
     await writeFile(
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"explicit model test\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-luna\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"explicit model test\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Mencius\\"}"}}',
       ].join("\n"),
     );
@@ -4221,8 +4239,8 @@ test("live-check detects native model mismatch for explicit-model spawn", async 
     assert.equal(output.verdict, "native_spawn_model_mismatch");
     const check = output.checks.find((item) => item.name === "tool_model_matches_native");
     assert.equal(check.status, "fail");
-    assert.match(check.evidence, /tool_model=gpt-5\.3-codex-spark/);
-    assert.match(check.evidence, /native_model=gpt-5\.5/);
+    assert.match(check.evidence, /tool_model=gpt-5\.6-luna/);
+    assert.match(check.evidence, /native_model=gpt-5\.6-sol/);
   });
 });
 
@@ -4233,7 +4251,7 @@ test("live-check reports native DB unavailable instead of model mismatch", async
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.5\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"critic\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-sol\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"critic\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Critic\\"}"}}',
       ].join("\n"),
     );
@@ -4263,7 +4281,7 @@ test("live-check reports missing native edge separately from model mismatch", as
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.5\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"critic\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-sol\\",\\"reasoning_effort\\":\\"high\\",\\"message\\":\\"critic\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"{\\"agent_id\\":\\"child1\\",\\"nickname\\":\\"Critic\\"}"}}',
       ].join("\n"),
     );
@@ -4292,8 +4310,8 @@ test("live-check records same-response native spawn batches and fails runtime sp
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call2","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"two\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-luna\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call2","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-terra\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"two\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"collab spawn failed: agent thread limit reached"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call2","output":"collab spawn failed: agent thread limit reached"}}',
       ].join("\n"),
@@ -4322,8 +4340,8 @@ test("live-check parses nested multi-tool spawn calls", async () => {
       home,
       [
         "insert into thread_spawn_edges values ('parent1','child1','closed'),('parent1','child2','closed');",
-        "insert into threads values ('child1','/tmp/child1.jsonl','Nested One','explorer','gpt-5.3-codex-spark','low','One','/tmp',1779075987);",
-        "insert into threads values ('child2','/tmp/child2.jsonl','Nested Two','explorer','gpt-5.4-mini','medium','Two','/tmp',1779076009);",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Nested One','explorer','gpt-5.6-luna','low','One','/tmp',1779075987);",
+        "insert into threads values ('child2','/tmp/child2.jsonl','Nested Two','explorer','gpt-5.6-terra','medium','Two','/tmp',1779076009);",
       ].join(""),
     );
     const transcript = join(home, "parent-nested.jsonl");
@@ -4331,15 +4349,15 @@ test("live-check parses nested multi-tool spawn calls", async () => {
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"multi_tool_use.parallel","call_id":"wrap1","arguments":"{\\"tool_uses\\":[{\\"recipient_name\\":\\"functions.spawn_agent\\",\\"parameters\\":{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}},{\\"recipient_name\\":\\"functions.spawn_agent\\",\\"parameters\\":{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"two\\"}}]}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"multi_tool_use.parallel","call_id":"wrap1","arguments":"{\\"tool_uses\\":[{\\"recipient_name\\":\\"functions.spawn_agent\\",\\"parameters\\":{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-luna\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}},{\\"recipient_name\\":\\"functions.spawn_agent\\",\\"parameters\\":{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-terra\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"two\\"}}]}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"wrap1","output":"[{\\"agent_id\\":\\"child1\\"},{\\"agent_id\\":\\"child2\\"}]"}}',
       ].join("\n"),
     );
 
     const result = JSON.parse((await runScript(liveCheckPath, home, [
       "--transcript", transcript,
-      "--expect-model", "gpt-5.3-codex-spark",
-      "--expect-model", "gpt-5.4-mini",
+      "--expect-model", "gpt-5.6-luna",
+      "--expect-model", "gpt-5.6-terra",
       "--allow-missing-guidance",
     ])).stdout);
 
@@ -4360,7 +4378,7 @@ test("live-check treats close_agent not-found release evidence as closed", async
       home,
       [
         "insert into thread_spawn_edges values ('parent1','child1','closed');",
-        "insert into threads values ('child1','/tmp/child1.jsonl','Close Fail','explorer','gpt-5.3-codex-spark','low','One','/tmp',1779075987);",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Close Fail','explorer','gpt-5.6-luna','low','One','/tmp',1779075987);",
       ].join(""),
     );
     const transcript = join(home, "parent-close-fail.jsonl");
@@ -4368,7 +4386,7 @@ test("live-check treats close_agent not-found release evidence as closed", async
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-luna\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"{\\"agent_id\\":\\"child1\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child1\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"agent with id child1 not found"}}',
@@ -4393,7 +4411,7 @@ test("live-check still rejects endpoint-not-found close failures", async () => {
       home,
       [
         "insert into thread_spawn_edges values ('parent1','child1','closed');",
-        "insert into threads values ('child1','/tmp/child1.jsonl','Endpoint Fail','explorer','gpt-5.3-codex-spark','low','One','/tmp',1779075987);",
+        "insert into threads values ('child1','/tmp/child1.jsonl','Endpoint Fail','explorer','gpt-5.6-luna','low','One','/tmp',1779075987);",
       ].join(""),
     );
     const transcript = join(home, "parent-endpoint-fail.jsonl");
@@ -4401,7 +4419,7 @@ test("live-check still rejects endpoint-not-found close failures", async () => {
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spawn1","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-luna\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"one\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"spawn1","output":"{\\"agent_id\\":\\"child1\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close1","arguments":"{\\"target\\":\\"child1\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close1","output":"transport error: endpoint not found"}}',
@@ -4459,9 +4477,9 @@ test("live-check verifies explicit model routes, closes, and current open count"
       home,
       [
         "insert into thread_spawn_edges values ('parent1','spark1','closed'),('parent1','mini1','closed'),('parent1','frontier1','closed');",
-        "insert into threads values ('spark1','/tmp/spark.jsonl','SPARK_LANE_OK','explorer','gpt-5.3-codex-spark','low','Franklin','/tmp',1779075987);",
-        "insert into threads values ('mini1','/tmp/mini.jsonl','MINI_LANE_OK','explorer','gpt-5.4-mini','medium','Gibbs','/tmp',1779076009);",
-        "insert into threads values ('frontier1','/tmp/frontier.jsonl','FRONTIER_LANE_OK','default','gpt-5.5','low','Mendel','/tmp',1779076031);",
+        "insert into threads values ('spark1','/tmp/spark.jsonl','SPARK_LANE_OK','explorer','gpt-5.6-luna','low','Franklin','/tmp',1779075987);",
+        "insert into threads values ('mini1','/tmp/mini.jsonl','MINI_LANE_OK','explorer','gpt-5.6-terra','medium','Gibbs','/tmp',1779076009);",
+        "insert into threads values ('frontier1','/tmp/frontier.jsonl','FRONTIER_LANE_OK','default','gpt-5.6-sol','low','Mendel','/tmp',1779076031);",
       ].join(""),
     );
     const transcript = join(home, "parent-models.jsonl");
@@ -4469,15 +4487,15 @@ test("live-check verifies explicit model routes, closes, and current open count"
       transcript,
       [
         '{"type":"session_meta","payload":{"id":"parent1"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spark","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.3-codex-spark\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"SPARK_LANE_OK\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"spark","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-luna\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"SPARK_LANE_OK\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"spark","output":"{\\"agent_id\\":\\"spark1\\",\\"nickname\\":\\"Franklin\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close-spark","arguments":"{\\"target\\":\\"spark1\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close-spark","output":"{\\"previous_status\\":{\\"completed\\":\\"SPARK_LANE_OK\\"}}"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"mini","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.4-mini\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"MINI_LANE_OK\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"mini","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-terra\\",\\"reasoning_effort\\":\\"medium\\",\\"message\\":\\"MINI_LANE_OK\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"mini","output":"{\\"agent_id\\":\\"mini1\\",\\"nickname\\":\\"Gibbs\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close-mini","arguments":"{\\"target\\":\\"mini1\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close-mini","output":"{\\"previous_status\\":{\\"completed\\":\\"MINI_LANE_OK\\"}}"}}',
-        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"frontier","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.5\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"FRONTIER_LANE_OK\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"frontier","arguments":"{\\"agent_type\\":\\"default\\",\\"model\\":\\"gpt-5.6-sol\\",\\"reasoning_effort\\":\\"low\\",\\"message\\":\\"FRONTIER_LANE_OK\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"frontier","output":"{\\"agent_id\\":\\"frontier1\\",\\"nickname\\":\\"Mendel\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call","name":"close_agent","call_id":"close-frontier","arguments":"{\\"target\\":\\"frontier1\\"}"}}',
         '{"type":"response_item","payload":{"type":"function_call_output","call_id":"close-frontier","output":"{\\"previous_status\\":{\\"completed\\":\\"FRONTIER_LANE_OK\\"}}"}}',
@@ -4486,9 +4504,9 @@ test("live-check verifies explicit model routes, closes, and current open count"
 
     const result = JSON.parse((await runScript(liveCheckPath, home, [
       "--transcript", transcript,
-      "--expect-model", "gpt-5.3-codex-spark",
-      "--expect-model", "gpt-5.4-mini",
-      "--expect-model", "gpt-5.5",
+      "--expect-model", "gpt-5.6-luna",
+      "--expect-model", "gpt-5.6-terra",
+      "--expect-model", "gpt-5.6-sol",
       "--expect-current-open", "0",
       "--expect-all-closed",
       "--allow-missing-guidance",
@@ -4497,7 +4515,7 @@ test("live-check verifies explicit model routes, closes, and current open count"
     assert.equal(result.ok, true);
     assert.equal(result.check_status, "passed");
     assert.equal(result.model_routes.length, 3);
-    assert.equal(result.checks.find((check) => check.name === "model_recorded:gpt-5.4-mini").status, "pass");
+    assert.equal(result.checks.find((check) => check.name === "model_recorded:gpt-5.6-terra").status, "pass");
     assert.equal(result.checks.find((check) => check.name === "current_parent_open_count").evidence, "open=0, expected=0");
   });
 });
@@ -4569,8 +4587,8 @@ test("parent reset archives visible child threads before deleting edges", async 
       [
         "insert into thread_spawn_edges values ('parent1','child1','open'),('parent2','child2','open');",
         "insert into threads values",
-        `('child1','/tmp/child1.jsonl','child one','default','gpt-5.4-mini','high','One','/tmp',${nowSeconds},'${subagentSource("parent1", "One")}','subagent',0,null),`,
-        `('child2','/tmp/child2.jsonl','child two','default','gpt-5.4-mini','high','Two','/tmp',${nowSeconds},'${subagentSource("parent2", "Two")}','subagent',0,null);`,
+        `('child1','/tmp/child1.jsonl','child one','default','gpt-5.6-terra','high','One','/tmp',${nowSeconds},'${subagentSource("parent1", "One")}','subagent',0,null),`,
+        `('child2','/tmp/child2.jsonl','child two','default','gpt-5.6-terra','high','Two','/tmp',${nowSeconds},'${subagentSource("parent2", "Two")}','subagent',0,null);`,
       ].join(" "),
     );
 

@@ -45,8 +45,8 @@ const DEFAULT_STATE_DB_NAME = "state_5.sqlite";
 const DEFAULT_EXPLORER_MODEL = "gpt-5.6-luna";
 const DEFAULT_EXPLORER_FALLBACK_MODEL = "gpt-5.6-terra";
 const DEFAULT_EXPLORER_FORBIDDEN_MODELS = ["gpt-5.6-sol"];
+const DEFAULT_SUBAGENT_MODELS = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
 const DEFAULT_ALLOWED_AGENT_TYPES = [];
-const DEFAULT_MODEL_FIXED_AGENT_TYPES = [];
 const execFileAsync = promisify(execFile);
 const LOCK_UNAVAILABLE = Symbol("native-agent-pool-advisor-lock-unavailable");
 let runtimeOptionsCache = {
@@ -58,7 +58,6 @@ let runtimeOptionsCache = {
   explorerFallbackModel: DEFAULT_EXPLORER_FALLBACK_MODEL,
   explorerForbiddenModels: [...DEFAULT_EXPLORER_FORBIDDEN_MODELS],
   allowedAgentTypes: [...DEFAULT_ALLOWED_AGENT_TYPES],
-  modelFixedAgentTypes: [...DEFAULT_MODEL_FIXED_AGENT_TYPES],
   closedEdgeRetentionMs: NATIVE_EDGE_CLOSED_RETENTION_MS,
   orphanVisibleRetentionMs: NATIVE_ORPHAN_VISIBLE_RETENTION_MS,
   staleOpenEdgeRetentionMs: NATIVE_STALE_OPEN_EDGE_RETENTION_MS,
@@ -255,13 +254,6 @@ async function loadRuntimeOptions() {
       ?? models.nativeAgentTypes
       ?? DEFAULT_ALLOWED_AGENT_TYPES,
   ).map((role) => normalizeAgentRole(role)).filter(Boolean);
-  const configuredModelFixedAgentTypes = parseStringList(
-    process.env.NATIVE_AGENT_POOL_MODEL_FIXED_AGENT_TYPES
-      ?? models.model_fixed_agent_types
-      ?? models.modelFixedAgentTypes
-      ?? DEFAULT_MODEL_FIXED_AGENT_TYPES,
-  ).map((role) => normalizeAgentRole(role)).filter(Boolean);
-
   runtimeOptionsCache = {
     defaultAgentCap: readFirstPositiveInteger(
       DEFAULT_AGENT_CAP,
@@ -295,9 +287,6 @@ async function loadRuntimeOptions() {
     allowedAgentTypes: configuredAgentTypes.length > 0
       ? [...new Set(configuredAgentTypes)]
       : [...DEFAULT_ALLOWED_AGENT_TYPES],
-    modelFixedAgentTypes: configuredModelFixedAgentTypes.length > 0
-      ? [...new Set(configuredModelFixedAgentTypes)]
-      : [...DEFAULT_MODEL_FIXED_AGENT_TYPES],
     closedEdgeRetentionMs: readFirstPositiveInteger(
       Math.floor(NATIVE_EDGE_CLOSED_RETENTION_MS / (60 * 60 * 1000)),
       process.env.NATIVE_AGENT_POOL_CLOSED_EDGE_RETENTION_HOURS,
@@ -356,26 +345,16 @@ function explorerForbiddenModels() {
   return models.length > 0 ? models : [...DEFAULT_EXPLORER_FORBIDDEN_MODELS];
 }
 
+function supportedSubagentModels() {
+  return [...DEFAULT_SUBAGENT_MODELS];
+}
+
 function allowedAgentTypes() {
   const configured = Array.isArray(runtimeOptionsCache.allowedAgentTypes)
     ? runtimeOptionsCache.allowedAgentTypes
     : [];
   const roles = configured.map((role) => normalizeAgentRole(role)).filter(Boolean);
   return roles.length > 0 ? [...new Set(roles)] : [...DEFAULT_ALLOWED_AGENT_TYPES];
-}
-
-function modelFixedAgentTypes() {
-  const configured = Array.isArray(runtimeOptionsCache.modelFixedAgentTypes)
-    ? runtimeOptionsCache.modelFixedAgentTypes
-    : [];
-  const roles = configured.map((role) => normalizeAgentRole(role)).filter(Boolean);
-  return roles.length > 0 ? [...new Set(roles)] : [...DEFAULT_MODEL_FIXED_AGENT_TYPES];
-}
-
-function operationUsesModelFixedNativeType(operation) {
-  const role = operationAgentRole(operation);
-  if (!role) return false;
-  return new Set(modelFixedAgentTypes()).has(role);
 }
 
 function closedEdgeRetentionMs() {
@@ -2973,9 +2952,21 @@ function hasMissingSpawnModelInOperations(operations) {
   return operations.some((operation) => {
     if (operation.name !== "spawn_agent") return false;
     if (operationForkContext(operation)) return false;
-    if (operationUsesModelFixedNativeType(operation)) return false;
     return !operationModel(operation);
   });
+}
+
+function unsupportedSubagentModelViolations(operations) {
+  const supported = new Set(supportedSubagentModels().map((model) => model.toLowerCase()));
+  return operations.filter((operation) => {
+    if (operation.name !== "spawn_agent" || operationForkContext(operation)) return false;
+    const model = operationModel(operation).toLowerCase();
+    return Boolean(model) && !supported.has(model);
+  });
+}
+
+function hasUnsupportedSubagentModelInOperations(operations) {
+  return unsupportedSubagentModelViolations(operations).length > 0;
 }
 
 function unsupportedAgentTypeViolations(operations) {
@@ -3641,18 +3632,18 @@ function buildSubagentModelSelectionGuidance() {
     "SUBAGENT_MODEL_SELECTION_REQUIRED=true. SUBAGENT_MODEL_DECISION_REQUIRED=true. Choose native agent_type deliberately and include an explicit model for every non-fork spawn.",
     "The hook does not own native agent_type availability. If this runtime accepts a special native agent_type, use it with the already-selected explicit model; otherwise use agent_type=default plus the semantic role in the message without calling that a downgrade.",
     "Before any spawn_agent call, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}.",
-    `Every non-fork spawn_agent call must include an explicit gpt-5.6 model. If there is no stronger reason, default to model="${explorerFallbackModel()}" with reasoning_effort="medium".`,
-    `Use model="${explorerModel()}" with reasoning_effort="low" only for bounded locating: exact file/symbol maps, grep anchors, log filters, DB row anchors, and candidate file:line evidence. Luna must not own durable conclusions or broad synthesis.`,
-    `Luna search contract: require exact paths, rg --max-count/--max-filesize, head/tail, SQLite LIMIT, output<=80 lines, and a stop condition. Escalate multi-hop reasoning to ${explorerFallbackModel()}.`,
-    `Use model="${explorerFallbackModel()}" with reasoning_effort="medium" for tracing, diagnosis, synthesis, bounded verification, config/test interpretation, and normal implementation.`,
-    "Use model=\"gpt-5.6-sol\" with reasoning_effort=\"high\" for critic, code review, architecture, security, high-risk implementation, live-money/destructive judgment, and final approval.",
+    `Every non-fork spawn_agent call must explicitly select one of ${supportedSubagentModels().join(", ")}; never inherit the parent model or reasoning effort. Use ${explorerFallbackModel()} as the daily default.`,
+    `Use ${explorerModel()} for bounded, high-throughput search, extraction, exact anchors, log/DB inspection, mechanical checks, and short evidence-led investigations. Luna may return a bounded finding from direct evidence; it does not own architecture, broad synthesis, or an absence verdict.`,
+    `Luna contracts need scope, output cap, and stop condition, but may cover several related read-only slices. Escalate only when synthesis, edits, or unresolved multi-hop judgment becomes the work.`,
+    `Use ${explorerFallbackModel()} for normal tracing, diagnosis, research synthesis, implementation, review preparation, and verification. Start reasoning_effort at medium; lower it for straightforward mechanical work and raise it only when the task contract needs it.`,
+    "Use gpt-5.6-sol only for the hardest ambiguous architecture, security, live-money/destructive decisions, adversarial critique, or final approval. Choose reasoning_effort from the task; high is not a default for ordinary review or investigation.",
     "Native agent_type is a runtime capability, not hook authority. Choose its semantic role independently from the explicit model route.",
     "Do not waste a long prompt on repeated unavailable-type probes. After a runtime 'agent type is currently not available' response, retry only once with agent_type=default, the same semantic role in the message/title, and the chosen explicit model.",
-    `Do not use native agent_type=explorer with gpt-5.6-sol. Use ${explorerModel()} only for locator work, ${explorerFallbackModel()} for reasoning-level child work, and Sol for frontier judgment.`,
+    `Do not use native agent_type=explorer with gpt-5.6-sol. Use ${explorerModel()} for bounded fast evidence work, ${explorerFallbackModel()} for daily engineering work, and Sol only for the highest-level judgment.`,
     "Do not combine fork_context=true with agent_type or model. If you need explicit Luna/Terra/Sol routing or a named semantic role, remove fork_context and pass a compact context packet in message/items. Use fork_context=true only when exact full-history context matters more than role/model routing.",
-    "If you cannot state the child output cap, stop condition, and bounded search shape, do not use Luna; slice locally first or choose Terra.",
+    "For Luna, state a useful scope, output cap, and stop condition; this is a bounded investigation contract, not a prohibition on normal search, extraction, or mechanical verification.",
     "Capacity is a separate decision: a multi-spawn tool call must fit the current PreToolUse observed_free and must be followed by PostToolUse/native-state resampling before another spawn batch.",
-    "For broad, compiled, vendor, or large-context repos, first make a local module/file map; then give Luna exact slices only to locate anchors, use Terra for reasoning/synthesis, and use Sol for parallel high-risk critique or architecture.",
+    "For broad, compiled, vendor, or large-context repos, give Luna bounded evidence slices and mechanical checks, use Terra for normal reasoning/synthesis, and use Sol only for an independent highest-risk critique or decision.",
     "This judgment step is mandatory; never omit model on a non-fork native type, because inheritance can silently select the wrong 5.6 family member.",
     "This is a spawn-shape guard only. It must not override positive-capacity guidance: for complex investigation, review, verification, live-state diagnosis, or broad implementation planning, default to a multi-agent shape when observed_free>0: leader integrates, scout maps evidence, verifier/critic attacks the likely conclusion.",
   ].join(" ");
@@ -3668,8 +3659,8 @@ function buildCompactSpawnShapeGuidance() {
     "If this turn uses spawn_agent without fork_context, make model selection explicit. Native agent_type availability belongs to Codex runtime, not this hook.",
     "If a special native agent_type is unavailable, retry only once with agent_type=default, the same semantic role in the message/title, and the same explicit model.",
     "Tool-schema text saying model is optional/inherited is unsafe for this install: omitted non-fork model can inherit the wrong parent model.",
-    `Model routing: ${explorerModel()} with reasoning_effort="low" only for bounded locating; ${explorerFallbackModel()} with reasoning_effort="medium" for normal reasoning and implementation; gpt-5.6-sol with reasoning_effort="high" for frontier judgment.`,
-    "Luna compaction rule: do not send Luna broad grep/log/DB dumps, compiled/vendor trees, repeated follow-ups, or persistent frontier tasks. Luna prompts must include bounded search shape plus output cap/stop condition; otherwise choose Terra.",
+    `Model routing: ${explorerFallbackModel()} is the daily default and starts at medium; ${explorerModel()} handles bounded fast evidence work and mechanical checks, normally low; gpt-5.6-sol is reserved for the hardest judgment. Choose effort from the actual task rather than inheriting a global Sol/xhigh setting.`,
+    "Luna compaction rule: do not send unbounded dumps or persistent frontier tasks. Give it a bounded investigation contract with output cap and stop condition; use Terra when the task becomes synthesis, editing, or deep multi-hop reasoning.",
     "Put semantic role in message/title. fork_context=true is only for exact full-history inheritance and cannot be combined with agent_type or model.",
   ].join(" ");
 }
@@ -3959,6 +3950,7 @@ function shouldBlockSpawn(eventName, name, summary, cap, isChildSession, payload
   if (hasForkContextRoleConflictInOperations(ops)) return true;
   if (hasForkContextModelConflictInOperations(ops)) return true;
   if (hasMissingSpawnModelInOperations(ops)) return true;
+  if (hasUnsupportedSubagentModelInOperations(ops)) return true;
   if (hasExplorerForbiddenModelInOperations(ops)) return true;
   if (summary.native_edge_failed) return true;
   if (summary.occupied + requestedSpawns > cap) return true;
@@ -3991,6 +3983,8 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
   const ops = operations ?? agentOperations(payload ?? {}, "");
   const checkSpawnShape = !isChildSession;
   const missingSpawnModel = checkSpawnShape && hasMissingSpawnModelInOperations(ops);
+  const unsupportedSubagentModels = checkSpawnShape ? unsupportedSubagentModelViolations(ops) : [];
+  const unsupportedSubagentModel = unsupportedSubagentModels.length > 0;
   const forkContextRoleConflict = checkSpawnShape && hasForkContextRoleConflictInOperations(ops);
   const forkContextModelConflict = checkSpawnShape && hasForkContextModelConflictInOperations(ops);
   const forkContextModelInheritance = checkSpawnShape && hasForkContextModelInheritanceInOperations(ops);
@@ -4033,8 +4027,13 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
       : null,
     missingSpawnModel
       ? (blockSpawn
-        ? `Subagent spawn is blocked until non-fork tool input includes an explicit model from the gpt-5.6 family. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} for reasoning-level child work; use ${explorerModel()} only for bounded locating; use gpt-5.6-sol for critic, code-review, architecture, security, high-risk implementation, live-money/destructive judgment, or final approval.`
+        ? `Subagent spawn is blocked until non-fork tool input explicitly selects one of ${supportedSubagentModels().join(", ")}. Before retrying, decide task_contract={output,risk,state_depth,context_size,edit_permission,final_authority,output_cap,stop_condition}. Default to ${explorerFallbackModel()} for daily engineering; use ${explorerModel()} for bounded fast evidence work or mechanical checks; reserve gpt-5.6-sol for the hardest architecture, security, live-money, adversarial, or final-approval judgment.`
         : "Missing model route violation observed after tool execution: spawn_agent ran without an explicit model. Treat this child as a failed routing decision unless fork_context=true was intentionally used for exact full-history inheritance. Future non-fork spawns must include the model field in the tool input.")
+      : null,
+    unsupportedSubagentModel
+      ? (blockSpawn
+        ? `Subagent spawn is blocked because model="${unsupportedSubagentModels.map((operation) => operationModel(operation)).join("|")}" is retired for this install. Non-fork lanes must explicitly use one of ${supportedSubagentModels().join(", ")}; Spark, 5.4, and 5.5 routes are not accepted.`
+        : `Retired subagent model observed after tool execution: ${unsupportedSubagentModels.map((operation) => operationModel(operation)).join(", ")}. This install accepts only explicit ${supportedSubagentModels().join(", ")} routes for non-fork lanes.`)
       : null,
     explorerForbiddenModel
       ? (blockSpawn
@@ -4058,9 +4057,11 @@ function buildAdvisory(eventName, summary, cap, blockSpawn, isChildSession, payl
         : unsupportedAgentType
         ? "Retry only after refreshing capacity; agent_type policy is advisory here and must not preempt Codex runtime availability."
         : missingSpawnModel
-        ? "Retry only after making model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and the corrected call must still fit observed_free."
+        ? "Retry only after making model-selection judgment explicit; Analyze/read-only/bounded labels are not enough, and the corrected call must still fit observed_free. Start with Terra/medium for normal work; use Luna for a bounded fast investigation; reserve Sol for the hardest judgment."
+        : unsupportedSubagentModel
+        ? `Retry with explicit ${explorerModel()}, ${explorerFallbackModel()}, or gpt-5.6-sol. Do not substitute a legacy model or rely on inherited parent Sol/xhigh.`
         : explorerForbiddenModel
-        ? "Retry only after correcting the role/model shape: Luna only for locating anchors, Terra for reasoning-level child work, or default with explicit Sol for critic/architecture/high-risk judgment. Do not re-label a frontier critic lane as explorer."
+        ? "Retry only after correcting the role/model shape: Luna for bounded fast evidence work, Terra as the normal worker, or default with explicit Sol only for the hardest judgment. Do not re-label a frontier critic lane as explorer."
         : multiSpawnOverBudget
         ? "Retry only with requested_spawns<=observed_free, or close/resample first; do not restate every child prompt after a batch block."
         : isChildSession
