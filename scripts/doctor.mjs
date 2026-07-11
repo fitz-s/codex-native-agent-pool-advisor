@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { ROUTE_CARRIERS, renderRouteCarrier, routeCarrierFilename } from "../hooks/native-agent-route-profiles.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -78,10 +79,24 @@ async function nativeEdgeCount(dbPath) {
   }
 }
 
+async function routeCarrierChecks(home) {
+  const checks = {};
+  for (const carrier of ROUTE_CARRIERS) {
+    const path = join(home, "agents", routeCarrierFilename(carrier));
+    try {
+      checks[carrier.name] = (await readFile(path, "utf-8")) === renderRouteCarrier(carrier);
+    } catch {
+      checks[carrier.name] = false;
+    }
+  }
+  return checks;
+}
+
 async function main() {
   const home = codexHome();
   const hooksPath = join(home, "hooks.json");
   const installedHook = join(home, "hooks", "native-agent-pool-advisor.mjs");
+  const installedRouteProfiles = join(home, "hooks", "native-agent-route-profiles.mjs");
   const dbPath = join(home, "state_5.sqlite");
   let config = {};
   try {
@@ -92,11 +107,14 @@ async function main() {
   const registrations = Object.fromEntries(ACTIVE_EVENTS.map((eventName) => [eventName, countHookCommand(config, eventName)]));
   const retiredRegistrations = Object.fromEntries(RETIRED_EVENTS.map((eventName) => [eventName, countHookCommand(config, eventName)]));
   const legacyHooks = legacyOrchestrationHooks(config);
+  const installedRouteCarriers = await routeCarrierChecks(home);
   const checks = {
     codex_home: home,
     hooks_json_exists: await pathExists(hooksPath),
     installed_hook_exists: await pathExists(installedHook),
     installed_hook_matches_repo: (await sha256(installedHook)) === (await sha256(sourceHook)),
+    installed_route_profiles_exists: await pathExists(installedRouteProfiles),
+    installed_route_profiles_match_repo: (await sha256(installedRouteProfiles)) === (await sha256(join(repoRoot, "hooks", "native-agent-route-profiles.mjs"))),
     registrations,
     retired_registrations: retiredRegistrations,
     legacy_orchestration_hooks: legacyHooks,
@@ -106,13 +124,17 @@ async function main() {
     thread_spawn_edges_count: await nativeEdgeCount(dbPath),
     native_db_write_policy: "read_only",
     legacy_global_state_watcher: "retired",
+    route_carriers: installedRouteCarriers,
   };
   const ok = checks.hooks_json_exists
     && checks.installed_hook_exists
     && checks.installed_hook_matches_repo
+    && checks.installed_route_profiles_exists
+    && checks.installed_route_profiles_match_repo
     && ACTIVE_EVENTS.every((eventName) => registrations[eventName] === 1)
     && RETIRED_EVENTS.every((eventName) => retiredRegistrations[eventName] === 0)
-    && legacyHooks.length === 0;
+    && legacyHooks.length === 0
+    && Object.values(installedRouteCarriers).every(Boolean);
   process.stdout.write(`${JSON.stringify({
     ok,
     checks,

@@ -5,10 +5,9 @@ import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { ROUTE_CARRIER_BY_NAME } from "../hooks/native-agent-route-profiles.mjs";
 
 const execFileAsync = promisify(execFile);
-const MODELS = new Set(["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]);
-const EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
 
 function usage() {
   return [
@@ -106,6 +105,7 @@ function embeddedSpawnArguments(source) {
     const property = (name) => header.match(new RegExp(`\\b${name}\\s*:\\s*["']([^"']+)["']`))?.[1] ?? "";
     const fork = header.match(/\bfork_context\s*:\s*(true|false)/)?.[1];
     calls.push({
+      agent_type: property("agent_type"),
       model: property("model"),
       reasoning_effort: property("reasoning_effort"),
       ...(fork ? { fork_context: fork === "true" } : {}),
@@ -197,10 +197,12 @@ async function main() {
       }
     }
   }
-  const invalid = spawns.filter((call) => {
-    const model = explicit(call.args.model);
-    const effort = explicit(call.args.reasoning_effort ?? call.args.reasoningEffort);
-    return forkContext(call.args) || !MODELS.has(model) || !EFFORTS.has(effort);
+  const invalid = spawns.filter((call) => forkContext(call.args)
+    || !explicit(call.args.model)
+    || !explicit(call.args.reasoning_effort ?? call.args.reasoningEffort));
+  const carrierViolations = spawns.filter((call) => {
+    const carrier = ROUTE_CARRIER_BY_NAME.get(explicit(call.args.agent_type ?? call.args.agentType));
+    return !carrier || explicit(call.args.model) !== carrier.model;
   });
   const successful = spawns.filter((call) => call.output && !outputFailed(call.output) && outputAgentId(call.output));
   const unattributed = spawns.filter((call) => call.unattributed === true);
@@ -215,6 +217,7 @@ async function main() {
   const checks = [
     buildCheck("no_legacy_followup_failure", legacyFailures.length === 0, legacyFailures.length ? `lines ${legacyFailures.join(",")}` : "none"),
     buildCheck("all_spawn_routes_explicit", invalid.length === 0, invalid.length ? `lines ${invalid.map((call) => call.line).join(",")}` : "all explicit"),
+    buildCheck("carrier_route_contract", carrierViolations.length === 0, carrierViolations.length ? `lines ${carrierViolations.map((call) => call.line).join(",")}` : "all carriers match their model"),
     buildCheck("all_embedded_spawns_attributed", unattributed.length === 0, unattributed.length ? `lines ${unattributed.map((call) => call.line).join(",")}` : "all attributed"),
     buildCheck("no_runtime_spawn_failure", spawns.every((call) => !call.output || !outputFailed(call.output)), "runtime output inspected"),
     buildCheck("native_route_matches_transcript", routeMatches, !routeProofAvailable ? "native DB unavailable for successful spawn" : (routeMismatches.length ? `children ${routeMismatches.map((call) => outputAgentId(call.output)).join(",")}` : "all matched")),
@@ -225,7 +228,7 @@ async function main() {
   const open = db.rows.filter((row) => explicit(row?.status) !== "closed").length;
   if (Number.isInteger(args.expectCurrentOpen)) checks.push(buildCheck("expected_current_open", db.available && open === args.expectCurrentOpen, `actual=${db.available ? open : "unavailable"}`));
   const ok = checks.every((check) => check.ok);
-  process.stdout.write(`${JSON.stringify({ ok, parent: parent || null, checks, spawns: spawns.map((call) => ({ line: call.line, embedded: call.embedded === true, model: call.args.model ?? null, reasoning_effort: call.args.reasoning_effort ?? call.args.reasoningEffort ?? null, child_id: outputAgentId(call.output) || null })), current_parent_open: db.available ? open : null }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ ok, parent: parent || null, checks, spawns: spawns.map((call) => ({ line: call.line, embedded: call.embedded === true, agent_type: call.args.agent_type ?? call.args.agentType ?? null, model: call.args.model ?? null, reasoning_effort: call.args.reasoning_effort ?? call.args.reasoningEffort ?? null, child_id: outputAgentId(call.output) || null })), current_parent_open: db.available ? open : null }, null, 2)}\n`);
   if (!ok) process.exitCode = 1;
 }
 

@@ -15,18 +15,20 @@ Every non-fork child dispatch must carry both fields explicitly:
 
 ```text
 model: gpt-5.6-luna | gpt-5.6-terra | gpt-5.6-sol
-reasoning_effort: low | medium | high | xhigh
+reasoning_effort: an explicit value accepted by the live runtime catalog
 ```
 
-Choose them from the actual task, not the parent, role, tier, or a default matrix.
+Choose both from the actual task, not the parent, a role, tier, or default matrix. The installed carrier fixes the model while the explicit call chooses the effort:
 
-| Model | Appropriate work |
+| Carrier | Model | Appropriate work |
 | --- | --- |
-| `gpt-5.6-luna` | Bounded search, extraction, exact anchors, logs/DB inspection, and mechanical checks. |
-| `gpt-5.6-terra` | General tracing, implementation, debugging, verification, and synthesis. |
-| `gpt-5.6-sol` | Hardest judgment: ambiguous architecture, security, destructive/live-money decisions, and adversarial critique. |
+| `explorer` | `gpt-5.6-luna` | Bounded search, extraction, exact anchors, logs/DB inspection, and mechanical checks. |
+| `worker` | `gpt-5.6-terra` | General tracing, implementation, debugging, verification, and synthesis. |
+| `default` | `gpt-5.6-sol` | Hardest judgment: ambiguous architecture, security, destructive/live-money decisions, and adversarial critique. |
 
-`agent_type` is transport metadata only. It never chooses or restricts model or effort. A role named `explorer` may use Sol when the task warrants it.
+The carrier names are already registered native agent types, so their custom configuration layers are applied by the current dispatcher. They are route transport only: the task message, not `explorer`, `worker`, or `default`, defines the child's responsibility. This avoids the native dispatcher's parent-route preference while leaving effort task-specific. The hook requires a non-empty effort but deliberately defers catalog acceptance to the live runtime; `live-check` then proves the persisted result.
+
+The installer refuses to overwrite an unmanaged profile with one of these names. That makes the route layer explicit instead of silently replacing a user's agent configuration.
 
 `fork_context=true` is blocked because it inherits the parent route. A rejected dispatch is a source-contract error: repair the intended call, not by trying alternate agent types, a legacy continuation tool, or `codex exec` fallback.
 
@@ -107,4 +109,4 @@ npm run check
 npm test
 ```
 
-The tests cover explicit route selection, role-independent Sol use, batch admission, exact-ID close validation, no SQLite mutation after `not found`, transcript hygiene, legacy-hook retirement, embedded route-mismatch detection, and read-only inspection.
+The tests cover explicit model and task-effort selection through registered carriers, batch admission, exact-ID close validation, no SQLite mutation after `not found`, transcript hygiene, legacy-hook retirement, embedded route-mismatch detection, and read-only inspection.

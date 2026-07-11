@@ -41,13 +41,17 @@ close another thread.
 
 ## Routing
 
-The parent chooses model and effort independently for each task. Roles describe responsibility only.
+The parent chooses model family and effort independently for each task. The native dispatcher prefers the parent's route even when those two call fields are present, so an installed custom configuration layer is required to make the model selection effective.
 
-- Luna: bounded evidence.
-- Terra: general engineering.
-- Sol: hardest independent judgment.
+The three registered builtin types are dedicated route carriers:
 
-No role, capability name, parent setting, or project default selects either field. A dispatch surface without both fields is not dynamically routed.
+- `explorer` fixes Luna for bounded evidence.
+- `worker` fixes Terra for general engineering.
+- `default` fixes Sol for hardest independent judgment.
+
+The task message alone names the child's responsibility. A carrier name is not a role decision. Every dispatch still passes the carrier's matching `model` plus task-selected `reasoning_effort`. The hook requires that effort to be explicit but leaves catalog acceptance to the live runtime, then `live-check` compares the persisted child route with the request.
+
+This is intentionally three profiles, not a role-by-model matrix or one profile per effort. The profile supplies the model layer that the runtime honors; effort remains an explicit per-child choice.
 
 ## Context Hygiene
 

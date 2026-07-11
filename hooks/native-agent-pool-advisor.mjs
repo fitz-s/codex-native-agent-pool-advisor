@@ -5,12 +5,11 @@ import { existsSync } from "node:fs";
 import { readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { ROUTE_CARRIER_BY_NAME } from "./native-agent-route-profiles.mjs";
 
 const DEFAULT_AGENT_CAP = 6;
 const MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
 const MAX_GLOBAL_STATE_BYTES = 16 * 1024 * 1024;
-const SUPPORTED_MODELS = new Set(["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]);
-const SUPPORTED_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
 const execFileAsync = promisify(execFile);
 
 function safeString(value) {
@@ -152,6 +151,10 @@ function explicitEffort(input) {
   return safeString(input.reasoning_effort ?? input.reasoningEffort).trim().toLowerCase();
 }
 
+function explicitRouteCarrier(input) {
+  return ROUTE_CARRIER_BY_NAME.get(safeString(input.agent_type ?? input.agentType).trim().toLowerCase()) ?? null;
+}
+
 function closeTarget(input) {
   return safeString(input.target ?? input.agent_id ?? input.agentId).trim();
 }
@@ -194,11 +197,18 @@ async function handlePreToolUse(payload, home) {
     }
     const model = explicitModel(operation.input);
     const effort = explicitEffort(operation.input);
-    if (!model || !SUPPORTED_MODELS.has(model)) {
-      return block("spawn_agent is blocked: model must explicitly be gpt-5.6-luna, gpt-5.6-terra, or gpt-5.6-sol. agent_type and role never select a model.");
+    const carrier = explicitRouteCarrier(operation.input);
+    if (!carrier) {
+      return block("spawn_agent is blocked: agent_type must be the registered route carrier explorer (Luna), worker (Terra), or default (Sol). It is configuration transport only; put the responsibility in the task message.");
     }
-    if (!effort || !SUPPORTED_EFFORTS.has(effort)) {
-      return block("spawn_agent is blocked: reasoning_effort must explicitly be low, medium, high, or xhigh. It may not inherit from the parent or role.");
+    if (!model) {
+      return block("spawn_agent is blocked: model must explicitly be gpt-5.6-luna, gpt-5.6-terra, or gpt-5.6-sol.");
+    }
+    if (model !== carrier.model) {
+      return block(`spawn_agent is blocked: agent_type ${carrier.name} requires model=${carrier.model}.`);
+    }
+    if (!effort) {
+      return block("spawn_agent is blocked: reasoning_effort must be explicitly selected from the live runtime catalog. It may not inherit from the parent or role.");
     }
   }
   const cap = await readAgentCap(home);

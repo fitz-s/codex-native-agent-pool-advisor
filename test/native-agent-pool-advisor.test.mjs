@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+import { ROUTE_CARRIERS, renderRouteCarrier, routeCarrierFilename } from "../hooks/native-agent-route-profiles.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -42,8 +43,8 @@ async function createNativeTables(home) {
   ].join(" "));
 }
 
-async function runHook(home, payload) {
-  const child = spawn(process.execPath, [hookPath], { env: { ...process.env, CODEX_HOME: home }, stdio: ["pipe", "pipe", "pipe"] });
+async function runHook(home, payload, path = hookPath) {
+  const child = spawn(process.execPath, [path], { env: { ...process.env, CODEX_HOME: home }, stdio: ["pipe", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf-8");
@@ -76,7 +77,7 @@ function spawnPayload(overrides = {}) {
     tool_name: "spawn_agent",
     session_id: "parent1",
     tool_input: {
-      agent_type: "explorer",
+      agent_type: "default",
       model: "gpt-5.6-sol",
       reasoning_effort: "xhigh",
       message: "independent hardest judgment",
@@ -85,10 +86,43 @@ function spawnPayload(overrides = {}) {
   };
 }
 
-test("explicit Sol route is accepted for any role", async () => {
+test("matching route carrier, model, and effort is accepted", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     assert.equal(await runHook(home, spawnPayload()), null);
+  });
+});
+
+test("route carrier is mandatory and must agree with explicit model", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    const missingCarrier = await runHook(home, spawnPayload({ agent_type: "analyst" }));
+    assert.equal(missingCarrier.decision, "block");
+    assert.match(missingCarrier.reason, /agent_type must be the registered route carrier/);
+    const mismatch = await runHook(home, spawnPayload({ agent_type: "explorer" }));
+    assert.equal(mismatch.decision, "block");
+    assert.match(mismatch.reason, /explorer requires model=gpt-5.6-luna/);
+    assert.equal(await runHook(home, spawnPayload({
+      agent_type: "explorer",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "low",
+    })), null);
+  });
+});
+
+test("effort is explicit but validated by the live runtime catalog", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    assert.equal(await runHook(home, spawnPayload({
+      agent_type: "default",
+      model: "gpt-5.6-sol",
+      reasoning_effort: "ultra",
+    })), null);
+    assert.equal(await runHook(home, spawnPayload({
+      agent_type: "explorer",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "ultra",
+    })), null);
   });
 });
 
@@ -100,7 +134,7 @@ test("spawn requires explicit model and effort", async () => {
     assert.match(missingModel.reason, /model must explicitly/);
     const missingEffort = await runHook(home, spawnPayload({ reasoning_effort: "" }));
     assert.equal(missingEffort.decision, "block");
-    assert.match(missingEffort.reason, /reasoning_effort must explicitly/);
+    assert.match(missingEffort.reason, /reasoning_effort must be explicitly/);
   });
 });
 
@@ -136,7 +170,7 @@ test("batch admission counts every native spawn in the same tool call", async ()
       tool_input: {
         tool_uses: [
           { recipient_name: "functions.spawn_agent", parameters: spawnPayload().tool_input },
-          { recipient_name: "functions.spawn_agent", parameters: { ...spawnPayload().tool_input, model: "gpt-5.6-luna", reasoning_effort: "low" } },
+          { recipient_name: "functions.spawn_agent", parameters: { ...spawnPayload().tool_input, agent_type: "explorer", model: "gpt-5.6-luna", reasoning_effort: "low" } },
         ],
       },
     });
@@ -251,13 +285,38 @@ test("install retires watcher and conflicting orchestration hooks", async () => 
       },
     }));
     await runScript(installPath, home);
+    assert.equal(await runHook(home, spawnPayload(), join(home, "hooks", "native-agent-pool-advisor.mjs")), null);
     const doctor = JSON.parse((await runScript(doctorPath, home)).stdout);
     assert.equal(doctor.ok, true);
     assert.deepEqual(doctor.checks.registrations, { SessionStart: 1, UserPromptSubmit: 1, PreToolUse: 1, PostCompact: 1, SubagentStop: 1 });
     assert.deepEqual(doctor.checks.retired_registrations, { PostToolUse: 0, PreCompact: 0 });
     assert.deepEqual(doctor.checks.legacy_orchestration_hooks, []);
+    assert.deepEqual(doctor.checks.route_carriers, Object.fromEntries(ROUTE_CARRIERS.map((carrier) => [carrier.name, true])));
+    for (const carrier of ROUTE_CARRIERS) {
+      assert.equal(await readFile(join(home, "agents", routeCarrierFilename(carrier)), "utf-8"), renderRouteCarrier(carrier));
+    }
     const hooks = await readFile(join(home, "hooks.json"), "utf-8");
     assert.doesNotMatch(hooks, /PostToolUse|PreCompact|oh-my-codex|quiet-omx-status-self-heal/);
+  });
+});
+
+test("install preserves an unmanaged builtin carrier and doctor fails a missing carrier", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await mkdir(join(home, "agents"), { recursive: true });
+    await writeFile(join(home, "agents", "worker.toml"), "name = \"worker\"\n");
+    await assert.rejects(
+      runScript(installPath, home),
+      (error) => /Refusing to replace unmanaged built-in agent profile/.test(error.stderr),
+    );
+    await assert.rejects(readFile(join(home, "hooks", "native-agent-pool-advisor.mjs")));
+    await assert.rejects(readFile(join(home, "agents", "explorer.toml")));
+    await rm(join(home, "agents", "worker.toml"));
+    await runScript(installPath, home);
+    await rm(join(home, "agents", "worker.toml"));
+    const doctor = JSON.parse((await runScript(doctorPath, home)).stdout);
+    assert.equal(doctor.ok, false);
+    assert.equal(doctor.checks.route_carriers.worker, false);
   });
 });
 
@@ -271,18 +330,40 @@ test("reset command is an inspection and cannot mutate native edges", async () =
   });
 });
 
-test("live check proves explicit route and native row agreement without role restrictions", async () => {
+test("live check proves explicit carrier route and native row agreement", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);
     await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open'); insert into threads values ('child1','gpt-5.6-sol','xhigh',0);");
     const transcript = join(home, "live.jsonl");
     await writeFile(transcript, [
       JSON.stringify({ type: "session_meta", payload: { id: "parent1" } }),
-      JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "spawn_agent", call_id: "spawn1", arguments: '{"agent_type":"explorer","model":"gpt-5.6-sol","reasoning_effort":"xhigh"}' } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "spawn_agent", call_id: "spawn1", arguments: '{"agent_type":"default","model":"gpt-5.6-sol","reasoning_effort":"xhigh"}' } }),
       JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "spawn1", output: '{"agent_id":"child1"}' } }),
     ].join("\n"));
     const result = JSON.parse((await runScript(liveCheckPath, home, ["--transcript", transcript, "--expect-model", "gpt-5.6-sol", "--expect-current-open", "1"])).stdout);
     assert.equal(result.ok, true);
+  });
+});
+
+test("live check rejects a carrier/model mismatch even when the native row agrees", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open'); insert into threads values ('child1','gpt-5.6-sol','xhigh',0);");
+    const transcript = join(home, "carrier-mismatch.jsonl");
+    await writeFile(transcript, [
+      JSON.stringify({ type: "session_meta", payload: { id: "parent1" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "spawn_agent", call_id: "spawn1", arguments: '{"agent_type":"explorer","model":"gpt-5.6-sol","reasoning_effort":"xhigh"}' } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call_output", call_id: "spawn1", output: '{"agent_id":"child1"}' } }),
+    ].join("\n"));
+    await assert.rejects(
+      runScript(liveCheckPath, home, ["--transcript", transcript]),
+      (error) => {
+        const result = JSON.parse(error.stdout);
+        assert.equal(result.checks.find((check) => check.name === "native_route_matches_transcript").ok, true);
+        assert.equal(result.checks.find((check) => check.name === "carrier_route_contract").ok, false);
+        return true;
+      },
+    );
   });
 });
 

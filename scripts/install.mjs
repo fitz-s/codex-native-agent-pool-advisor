@@ -6,10 +6,12 @@ import { access, copyFile, mkdir, readFile, rename, writeFile } from "node:fs/pr
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { ROUTE_CARRIERS, renderRouteCarrier, routeCarrierFilename } from "../hooks/native-agent-route-profiles.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sourceHook = join(repoRoot, "hooks", "native-agent-pool-advisor.mjs");
+const sourceRouteProfiles = join(repoRoot, "hooks", "native-agent-route-profiles.mjs");
 const ACTIVE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostCompact", "SubagentStop"];
 const RETIRED_EVENTS = ["PostToolUse", "PreCompact"];
 const WATCHER_LABEL = "com.fitz.codex-native-agent-pool-global-state-watch";
@@ -63,6 +65,40 @@ async function writeJsonAtomic(path, value) {
   const temporary = `${path}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`);
   await rename(temporary, path);
+}
+
+async function writeTextAtomic(path, value) {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${process.pid}.tmp`;
+  await writeFile(temporary, value);
+  await rename(temporary, path);
+}
+
+async function assertRouteCarrierOwnership(home) {
+  const agentsDirectory = join(home, "agents");
+  for (const carrier of ROUTE_CARRIERS) {
+    const path = join(agentsDirectory, routeCarrierFilename(carrier));
+    const expected = renderRouteCarrier(carrier);
+    if (await pathExists(path)) {
+      const existing = await readFile(path, "utf-8");
+      if (existing !== expected && !existing.startsWith("# managed by codex-native-agent-pool-advisor\n")) {
+        throw new Error(`Refusing to replace unmanaged built-in agent profile: ${path}`);
+      }
+    }
+  }
+}
+
+async function installRouteCarriers(home) {
+  const agentsDirectory = join(home, "agents");
+  const paths = [];
+  await assertRouteCarrierOwnership(home);
+  for (const carrier of ROUTE_CARRIERS) {
+    const path = join(agentsDirectory, routeCarrierFilename(carrier));
+    const expected = renderRouteCarrier(carrier);
+    await writeTextAtomic(path, expected);
+    paths.push(path);
+  }
+  return paths;
 }
 
 function isAdvisorHookCommand(hook) {
@@ -181,9 +217,13 @@ async function retireLegacySelfHeal(home) {
 
 async function main() {
   const home = codexHome();
+  await assertRouteCarrierOwnership(home);
   const targetHook = join(home, "hooks", "native-agent-pool-advisor.mjs");
+  const targetRouteProfiles = join(home, "hooks", "native-agent-route-profiles.mjs");
   await mkdir(dirname(targetHook), { recursive: true });
+  await copyFile(sourceRouteProfiles, targetRouteProfiles);
   await copyFile(sourceHook, targetHook);
+  const installedRouteCarriers = await installRouteCarriers(home);
   const watcher = await retireLegacyWatcher(home);
   const selfHeal = await retireLegacySelfHeal(home);
   const hooksPath = join(home, "hooks.json");
@@ -194,7 +234,7 @@ async function main() {
   for (const eventName of ACTIVE_EVENTS) changed = ensureHook(config, eventName, command) || changed;
   for (const eventName of RETIRED_EVENTS) changed = removeAdvisorHooks(config, eventName) || changed;
   if (changed || !(await pathExists(hooksPath))) await writeJsonAtomic(hooksPath, config);
-  process.stdout.write(`${JSON.stringify({ installed: targetHook, active_events: ACTIVE_EVENTS, retired_legacy_watcher: watcher, retired_legacy_self_heal: selfHeal, removed_legacy_hooks: removedLegacyHooks }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ installed: targetHook, installed_route_profiles_module: targetRouteProfiles, installed_route_carriers: installedRouteCarriers, active_events: ACTIVE_EVENTS, retired_legacy_watcher: watcher, retired_legacy_self_heal: selfHeal, removed_legacy_hooks: removedLegacyHooks }, null, 2)}\n`);
 }
 
 main().catch((error) => {
