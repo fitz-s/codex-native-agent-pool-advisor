@@ -51,7 +51,8 @@ function normalizeToolName(value) {
 }
 
 function toolInput(payload) {
-  return safeObject(payload.tool_input ?? payload.toolInput ?? payload.input) ?? {};
+  const value = payload.tool_input ?? payload.toolInput ?? payload.input;
+  return safeObject(value) ?? (typeof value === "string" ? { source: value } : {});
 }
 
 function nestedOperationInput(value) {
@@ -80,6 +81,43 @@ function agentOperations(payload) {
   };
   visit(toolInput(payload));
   return operations;
+}
+
+function embeddedOperationInput(source, method) {
+  const marker = `tools.multi_agent_v1__${method}`;
+  if (!source.includes(marker)) return [];
+  const pattern = new RegExp(`tools\\.multi_agent_v1__${method}\\s*\\(\\s*\\{`, "g");
+  const operations = [];
+  for (const match of source.matchAll(pattern)) {
+    const object = source.slice(match.index, match.index + 4096);
+    const property = (name) => object.match(new RegExp(`\\b${name}\\s*:\\s*["']([^"']+)["']`))?.[1] ?? "";
+    if (method === "spawn_agent") {
+      const fork = object.match(/\bfork_context\s*:\s*(true|false)/)?.[1];
+      operations.push({
+        name: "spawn_agent",
+        input: {
+          agent_type: property("agent_type"),
+          model: property("model"),
+          reasoning_effort: property("reasoning_effort"),
+          ...(fork ? { fork_context: fork === "true" } : {}),
+        },
+      });
+    } else {
+      operations.push({ name: "close_agent", input: { target: property("target") } });
+    }
+  }
+  return operations.length > 0 ? operations : [{ name: method, input: {} }];
+}
+
+function embeddedAgentOperations(payload) {
+  if (normalizeToolName(payload.tool_name ?? payload.toolName) !== "exec") return [];
+  const input = toolInput(payload);
+  const source = safeString(input.source ?? input.code ?? input.script ?? input.command);
+  if (!source) return [];
+  return [
+    ...embeddedOperationInput(source, "spawn_agent"),
+    ...embeddedOperationInput(source, "close_agent"),
+  ];
 }
 
 function sqlString(value) {
@@ -174,7 +212,7 @@ function externalWorkerGuard(eventName, payload) {
 }
 
 async function handlePreToolUse(payload, home) {
-  const operations = agentOperations(payload);
+  const operations = [...agentOperations(payload), ...embeddedAgentOperations(payload)];
   if (operations.length === 0) return null;
   const parentId = parentThreadId(payload);
   if (!parentId) {

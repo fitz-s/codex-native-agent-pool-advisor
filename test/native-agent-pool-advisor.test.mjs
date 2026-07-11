@@ -147,6 +147,31 @@ test("fork context is blocked because it inherits parent routing", async () => {
   });
 });
 
+test("embedded native operations are parsed from exec source and fail closed", async () => {
+  await withHome(async (home) => {
+    await createNativeTables(home);
+    await sqlite(home, "insert into thread_spawn_edges values ('parent1','child1','open');");
+    const payload = (source) => ({
+      hook_event_name: "PreToolUse",
+      tool_name: "functions.exec",
+      session_id: "parent1",
+      tool_input: source,
+    });
+    const validSpawn = await runHook(home, payload('await tools.multi_agent_v1__spawn_agent({ agent_type: "explorer", model: "gpt-5.6-luna", reasoning_effort: "low", fork_context: false, message: "proof" });'));
+    assert.equal(validSpawn, null);
+    const mismatchedSpawn = await runHook(home, payload('await tools.multi_agent_v1__spawn_agent({ agent_type: "explorer", model: "gpt-5.6-sol", reasoning_effort: "low", message: "proof" });'));
+    assert.equal(mismatchedSpawn.decision, "block");
+    assert.match(mismatchedSpawn.reason, /explorer requires model=gpt-5.6-luna/);
+    const dynamicSpawn = await runHook(home, payload("await tools.multi_agent_v1__spawn_agent(route);"));
+    assert.equal(dynamicSpawn.decision, "block");
+    assert.match(dynamicSpawn.reason, /agent_type must be the registered route carrier/);
+    const invalidClose = await runHook(home, payload('await tools.multi_agent_v1__close_agent({ target: "not-a-child" });'));
+    assert.equal(invalidClose.decision, "block");
+    assert.match(invalidClose.reason, /target must be the exact ID/);
+    assert.equal(await runHook(home, payload('await tools.multi_agent_v1__close_agent({ target: "child1" });')), null);
+  });
+});
+
 test("admission uses only current-parent native edges and honors the six-slot cap", async () => {
   await withHome(async (home) => {
     await createNativeTables(home);

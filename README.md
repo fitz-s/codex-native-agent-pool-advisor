@@ -32,6 +32,8 @@ The installer refuses to overwrite an unmanaged profile with one of these names.
 
 `fork_context=true` is blocked because it inherits the parent route. A rejected dispatch is a source-contract error: repair the intended call, not by trying alternate agent types, a legacy continuation tool, or `codex exec` fallback.
 
+When native calls are wrapped in `functions.exec`, the guard parses static `multi_agent_v1__spawn_agent` and `close_agent` object literals under the same rules. A dynamic route object is rejected: the guard cannot prove its model, effort, or close target before execution.
+
 ## Installation
 
 ```bash

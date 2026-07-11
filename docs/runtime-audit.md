@@ -10,6 +10,7 @@ Current acceptance criteria:
 6. A failed close or unavailable continuation leaves `thread_spawn_edges` unchanged.
 7. No assistant-origin `live agent path ... not found` or lane-operation narrative survives into reusable transcript context.
 8. A completed child is closed only through Codex after its result is integrated; a `SubagentStop` event causes no DB mutation or inferred close.
+9. Static native operations embedded in `functions.exec` obey the same carrier, effort, capacity, and exact-close checks; dynamic embedded operations are blocked.
 
 Run:
 

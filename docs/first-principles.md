@@ -23,6 +23,11 @@ When, and only when, the runtime emits `PreToolUse` for native `spawn_agent`, th
 - a close target that is not an exact current-parent open child ID;
 - `codex exec` used as an unsupported child-dispatch fallback.
 
+Wrapped `functions.exec` native calls are part of the same boundary. Static
+`multi_agent_v1__spawn_agent` and `close_agent` object literals are parsed before
+execution; a dynamic object is blocked because its route or close authority
+cannot be proved at admission time.
+
 The check is parent-scoped. Rows belonging to another parent do not consume this parent's budget.
 
 ## Release
